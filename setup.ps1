@@ -71,7 +71,20 @@
 
 .PARAMETER NonInteractive
     Never prompt. Ports and TLS must then be fully specified, and the
-    administrator credential is generated rather than typed.
+    administrator credential is generated rather than typed. On a registered
+    installation this prints the management status once and exits instead of
+    drawing a menu nobody can answer.
+
+.PARAMETER Reconfigure
+    Run the installation flow against a registered installation instead of
+    opening the management utility.
+
+    The mode is otherwise chosen automatically and there is no -Install /
+    -Manage switch (A section 17.1): a complete installation opens the
+    management utility, anything else installs. This switch exists for the one
+    thing management mode deliberately does not do - re-resolving ports, TLS
+    and the generated artefacts - and it is as non-destructive as any other
+    rerun: existing secrets, data, certificates and image pins are preserved.
 
 .NOTES
     Exit codes:
@@ -100,7 +113,8 @@ param(
     [string]$CertificateKeyPath,
     [string]$ComposeProject,
     [string]$PgDataVolume,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$Reconfigure
 )
 
 $ErrorActionPreference = 'Stop'
@@ -123,7 +137,7 @@ $Script:DeltaLibraries = [ordered]@{
     'Delta.Docker.ps1'  = 'Invoke-DeltaRuntimeStage'
     'Delta.Stack.ps1'   = 'Invoke-DeltaStackStage'
     'Delta.Network.ps1' = 'Invoke-DeltaNetworkStage'
-    'Delta.Manage.ps1'  = 'Invoke-DeltaAdminPasswordReset'
+    'Delta.Manage.ps1'  = 'Invoke-DeltaManagementMode'
 }
 
 foreach ($library in $Script:DeltaLibraries.Keys) {
@@ -553,31 +567,54 @@ try {
         else {
             $state = Show-DeltaInstallationState -Path $InstallRoot
 
-            $runtime = Invoke-DeltaRuntimeStage `
-                -InstallRoot $InstallRoot `
-                -ScriptRoot $Script:DeltaScriptRoot `
-                -DockerInstallerPath $DockerInstallerPath `
-                -AllowDownload:$AllowDockerDownload
-
-            $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
-
-            if ($runtime.Outcome -eq 'ready') {
-                $stack = Invoke-DeltaStackStage `
+            # Mode dispatch (A section 17.1). A registered, complete
+            # installation opens the management utility; anything else installs.
+            # The choice is made from the detected state and never from a
+            # switch, and it is made here - before the runtime stage - so that
+            # rerunning setup.ps1 on a working installation does not repeat the
+            # prerequisite checks, the Docker setup, the port and TLS
+            # resolution, the artefact generation or the fresh-install
+            # orchestration. Management mode does its own read-only engine
+            # probe; it does not need this stage to have run.
+            if ($state.State -eq 'installed' -and -not $Reconfigure) {
+                $exitCode = Invoke-DeltaManagementMode `
                     -InstallRoot $InstallRoot `
                     -ScriptRoot $Script:DeltaScriptRoot `
-                    -PendingFacts $runtime.PendingFacts `
-                    -Runtime $runtime `
-                    -HttpPort $HttpPort `
-                    -HttpsPort $HttpsPort `
-                    -HostName $Hostname `
-                    -TlsMode $TlsMode `
-                    -CertificatePath $CertificatePath `
-                    -CertificateKeyPath $CertificateKeyPath `
-                    -ComposeProject $ComposeProject `
-                    -PgDataVolume $PgDataVolume `
                     -AllowPrompt (-not $NonInteractive)
+            }
+            else {
+                if ($state.State -eq 'installed') {
+                    Write-Step 'Reconfiguring an existing installation'
+                    Write-Detail '-Reconfigure was supplied, so the installation flow runs instead of the management'
+                    Write-Detail 'utility. Existing secrets, data, certificates and image pins are preserved.'
+                }
 
-                $exitCode = Show-DeltaStackOutcome -Stack $stack
+                $runtime = Invoke-DeltaRuntimeStage `
+                    -InstallRoot $InstallRoot `
+                    -ScriptRoot $Script:DeltaScriptRoot `
+                    -DockerInstallerPath $DockerInstallerPath `
+                    -AllowDownload:$AllowDockerDownload
+
+                $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
+
+                if ($runtime.Outcome -eq 'ready') {
+                    $stack = Invoke-DeltaStackStage `
+                        -InstallRoot $InstallRoot `
+                        -ScriptRoot $Script:DeltaScriptRoot `
+                        -PendingFacts $runtime.PendingFacts `
+                        -Runtime $runtime `
+                        -HttpPort $HttpPort `
+                        -HttpsPort $HttpsPort `
+                        -HostName $Hostname `
+                        -TlsMode $TlsMode `
+                        -CertificatePath $CertificatePath `
+                        -CertificateKeyPath $CertificateKeyPath `
+                        -ComposeProject $ComposeProject `
+                        -PgDataVolume $PgDataVolume `
+                        -AllowPrompt (-not $NonInteractive)
+
+                    $exitCode = Show-DeltaStackOutcome -Stack $stack
+                }
             }
         }
     }

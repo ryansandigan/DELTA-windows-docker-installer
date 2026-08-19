@@ -183,19 +183,144 @@ Do not disable your antivirus. The exclusions above are enough.
 
 ---
 
-## Running setup.ps1 again
+## Running setup.ps1 again — the management utility
 
-It is safe. Re-running is the normal way to apply a changed setting, bring the
-stack back up, or repair an installation that stopped half-way.
+Once DELTA is installed, running `setup.ps1` again does **not** install it a
+second time. It opens the management utility instead:
 
-A re-run **never**:
+```powershell
+.\setup.ps1
+```
 
-- deletes the database, uploads, certificates or configuration,
-- regenerates the session secret or the database password,
-- changes the administrator credential again,
-- reports a port that this installation already uses as a conflict.
+There is no `-Install` or `-Manage` switch to remember. The script looks at what
+is on disk and decides: a complete installation gets the menu, anything else
+gets the installer. Re-running is safe either way — it never deletes the
+database, uploads, certificates or configuration, never regenerates the session
+secret or the database password, and never changes the administrator credential
+again. If a previous install stopped part-way, the next run picks up from there.
 
-If a previous run stopped part-way, the next one picks up from there.
+### Status
+
+The menu opens with what is actually true right now, read in one query:
+
+```
+Status
+  DELTA          installed     C:\DELTA  installed 2026-08-19T15:43:04Z, DELTA schema 0.2.3
+  Docker         Running       engine 29.6.2, linux containers, backend wsl-2
+  db             Running       healthy
+  delta          Running       healthy   image prod-latest @aa180b0
+  nginx          Running       healthy
+  Access                       http://localhost
+                               reachable - GET http://localhost/ returned HTTP 200
+  Restart        Configured    startup-task - CONFIGURED but NOT YET PROVEN by a real restart
+```
+
+"Reachable" is not a guess: the utility requests the configured address and
+reports what came back. If DELTA is not answering it says so, even when all
+three containers are up — containers running and an application serving are
+different claims.
+
+### The menu
+
+```
+  1. Update DELTA                  (a later version of this installer)
+  2. Backup Database               (a later version of this installer)
+  3. Stop DELTA
+  4. Restart DELTA
+  5. Configure SMTP                (a later version of this installer)
+  6. Reset Administrator Password  (a later version of this installer)
+  7. Certificate Management        (a later version of this installer)
+  8. DELTA Access Guide
+  9. View Logs
+  S. Start DELTA                   (shown when something is not running)
+  0. Exit
+```
+
+The entries marked *later* are placeholders in this build: choosing one says so
+and returns to the menu without changing anything. Pressing Enter refreshes the
+status.
+
+- **Start DELTA** starts Docker Desktop if it is not running, checks the
+  database volume is still there, brings the three containers up in order, and
+  confirms DELTA answers. It is the same code the startup task runs after a
+  reboot, so recovering by hand and recovering automatically cannot behave
+  differently.
+- **Stop DELTA** stops the containers. It does not remove them, the network, the
+  data volume, the uploads or anything else — starting again brings the same
+  installation back.
+- **Restart DELTA** is a stop followed by a start, with all the same checks. It
+  reports success only after the database, the application and NGINX are healthy
+  *and* the configured address has answered.
+- **DELTA Access Guide** shows the real URLs for this installation, tests the
+  endpoint, and tells you plainly if it did not answer.
+
+### If Docker is not running
+
+The utility still opens, and stays useful. It shows the installation, its
+configuration, the addresses it is set up to serve, and what it can tell you
+about why Docker is not answering — and it offers **Start DELTA**, which starts
+Docker Desktop first. The operations that cannot work without the engine are not
+offered rather than offered and then failing. Nothing about the installation is
+changed because Docker happens to be down.
+
+### View Logs
+
+```
+  1. DELTA Application Logs      docker compose logs -f delta
+  2. NGINX Access Log            C:\DELTA\logs\nginx\access.log
+  3. NGINX Error Log             docker compose logs -f nginx
+  4. PostgreSQL Logs             docker compose logs -f db
+  5. All Container Logs          docker compose logs -f
+  S. Installer / startup log     C:\DELTA\logs\installer\startup.log
+  0. Back
+```
+
+NGINX's **access** log is a file on Windows you can also open in any editor;
+its **error** output goes to `docker compose logs nginx`. That split is
+deliberate: the request log is worth keeping on disk, and errors are worth
+having where you look when something is broken.
+
+> **Ctrl+C stops the log view, not DELTA.** Following a log is something your
+> machine does to a stream — the containers are not involved and are not
+> signalled. Press Ctrl+C (or Q) to go back to the menu; the utility then runs
+> `docker compose ps` and shows you the containers still running, so you do not
+> have to take its word for it.
+
+### NGINX access-log rotation
+
+`C:\DELTA\logs\nginx\access.log` would otherwise grow forever — NGINX rotates
+only when it is told to, and a full system volume takes the database down with
+it. So the management utility registers one scheduled task:
+
+```
+DELTA (Docker) - <project> - NGINX log rotation
+   trigger   daily at 03:30
+   runs as   the account that installed DELTA, whether or not it is signed in
+   action    rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
+```
+
+It renames the current log to `access.log.<timestamp>`, tells NGINX to reopen
+its log so writing continues at the same path, and keeps the seven most recent
+rotations. It touches nothing else in that folder, and an empty log is simply
+nothing to do. Run it by hand at any time:
+
+```powershell
+.\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
+```
+
+### Changing ports, hostname or TLS
+
+Those are settled during installation, and the management utility deliberately
+does not re-ask. To change them, run the installer flow again against the
+existing installation:
+
+```powershell
+.\setup.ps1 -Reconfigure -HttpPort 8080
+```
+
+That re-resolves ports and TLS and regenerates the generated files. It is as
+non-destructive as any other re-run: your data, secrets, certificates and image
+pins are preserved.
 
 ---
 
@@ -257,9 +382,12 @@ Two things worth knowing:
   Docker comes back only if its own restart policy says so.
 
 If you would rather DELTA did not start by itself, disable or delete that one
-scheduled task — nothing else depends on it. Note that running `.\setup.ps1`
-again will re-register it, because the installer treats "nothing starts Docker
-at boot" as something to fix.
+scheduled task — nothing else depends on it. Opening the management utility does
+not put it back; `.\setup.ps1 -Reconfigure` does, because the installer treats
+"nothing starts Docker at boot" as something to fix.
+
+The management utility shows the same distinction on its status line: it says
+*configured but not yet proven* until a real restart has confirmed it.
 
 ---
 
