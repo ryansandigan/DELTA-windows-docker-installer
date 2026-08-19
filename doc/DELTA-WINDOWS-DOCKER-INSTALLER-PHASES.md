@@ -789,7 +789,7 @@ docker compose ps                    # all containers still Up
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · **Acceptance gate: met.** Every item in the gate was demonstrated against the operator's live installation at `C:\DELTA` (project `delta`, volume `delta_pgdata`, HTTP 80, TLS off), with one qualification stated in full below: the Ctrl+C contract was exercised through the keyboard-reading function rather than by a human keypress.
+**Status: COMPLETE** · 2026-08-20 · commit `279c2ff` · **Acceptance gate: met.** Every item in the gate was demonstrated against the operator's live installation at `C:\DELTA` (project `delta`, volume `delta_pgdata`, HTTP 80, TLS off), with one qualification stated in full below: the Ctrl+C contract was exercised through the keyboard-reading function rather than by a human keypress.
 
 Delivered: the Phase 7 section of `lib\Delta.Manage.ps1` (`Get-DeltaManagementStatus`, `Show-DeltaManagementStatus`, `Write-DeltaStatusRow`, `Stop-DeltaInstallation`, `Restart-DeltaInstallation`, `Show-DeltaAccessGuide`, `Stop-DeltaProcessTree`, `Test-DeltaViewerInterrupt`, `Show-DeltaTailBanner`, `Watch-DeltaComposeLogs`, `Watch-DeltaFileTail`, `Confirm-DeltaStackUnaffected`, `Invoke-DeltaLogsMenu`, `Get-DeltaNginxAccessLogPath`, `Invoke-DeltaNginxLogRotation`, the rotation-task functions, `Initialize-DeltaLogRotation`, `Show-DeltaPhasePlaceholder`, `Show-DeltaUnavailableOperation`, `Show-DeltaManagementMenu`, `Invoke-DeltaManagementMode`); the mode dispatch in `setup.ps1`; `rotate-nginx-logs.ps1`; the management section of `README.md`.
 
