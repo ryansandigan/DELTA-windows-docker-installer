@@ -11,6 +11,9 @@
 # Three services, one private network, one published service. Ports 3000 and
 # 5432 are never published to Windows: NGINX reaches DELTA over the Compose
 # network, and the installer reaches PostgreSQL through `docker compose exec`.
+#
+# The #__IF_TLS__ region is kept by the installer only when HTTPS is enabled,
+# so a plain-HTTP installation never publishes a port it does not serve.
 # =============================================================================
 
 services:
@@ -112,16 +115,36 @@ services:
         condition: service_healthy
     ports:
       - "${HTTP_PORT}:80"
+#__IF_TLS__
+      - "${HTTPS_PORT}:443"
+#__END_TLS__
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./certs:/etc/nginx/certs:ro
       - ./logs/nginx:/var/log/nginx
+    # The probe goes through the proxy to DELTA, so a healthy NGINX means the
+    # whole chain answers - not merely that the process is up.
+    #
+    # It has to follow the protocol the site actually serves. With TLS on,
+    # port 80 answers 301 and BusyBox wget does not follow redirects, so an
+    # HTTP probe reports the container unhealthy while the site is perfectly
+    # fine - measured. The HTTPS probe also proves TLS termination works.
+#__IF_NO_TLS__
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 5
       start_period: 30s
+#__END_NO_TLS__
+#__IF_TLS__
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -qO- https://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+#__END_TLS__
     logging:
       driver: json-file
       options:

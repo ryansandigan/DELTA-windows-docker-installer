@@ -141,6 +141,37 @@ function Get-DeltaTemplatePath {
     return $path
 }
 
+function Expand-DeltaTemplateRegions {
+    <#
+      Keeps or removes the #__IF_TLS__ / #__IF_NO_TLS__ regions of a template
+      and strips the marker lines themselves, so the generated file contains
+      only what applies to this installation.
+
+      A marker-region template rather than two parallel template files: the
+      HTTP and HTTPS server blocks share their proxy configuration almost
+      exactly, and two files would drift apart the first time one of them was
+      corrected.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][bool]$TlsEnabled
+    )
+
+    $keep   = if ($TlsEnabled) { 'TLS' }    else { 'NO_TLS' }
+    $remove = if ($TlsEnabled) { 'NO_TLS' } else { 'TLS' }
+
+    # ${remove} and ${keep}, not $remove/$keep: an underscore is a valid
+    # variable-name character, so "$remove__" would be read as a variable
+    # called remove__ and expand to nothing.
+    $pattern = "(?ms)^[ \t]*#__IF_${remove}__[ \t]*\r?\n.*?^[ \t]*#__END_${remove}__[ \t]*\r?\n"
+    $result = [regex]::Replace($Text, $pattern, '')
+
+    # ...then drop the surviving region's own marker lines.
+    $result = [regex]::Replace($result, "(?m)^[ \t]*#__(IF|END)_${keep}__[ \t]*\r?\n", '')
+
+    return $result
+}
+
 function New-DeltaEnvironmentFile {
     <#
       Generates <InstallRoot>\.env from templates\env.template.
@@ -159,7 +190,7 @@ function New-DeltaEnvironmentFile {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$ScriptRoot,
-        [int]$HttpPort
+        [Parameter(Mandatory)][object]$Network
     )
 
     Write-Step 'Generating configuration'
@@ -222,17 +253,14 @@ function New-DeltaEnvironmentFile {
     $postgresUser = & $resolve 'POSTGRES_USER' 'delta'
     $postgresDb   = & $resolve 'POSTGRES_DB'   'delta'
 
-    $port = & $resolve 'HTTP_PORT' '80'
-    if ($PSBoundParameters.ContainsKey('HttpPort') -and $HttpPort -gt 0) {
-        $port = "$HttpPort"
-    }
-
     $databaseUrl = New-DeltaDatabaseUrl -Username $postgresUser -Password $postgresPassword -DatabaseName $postgresDb
     Register-DeltaSecretValue -Value $databaseUrl
 
-    # Standard ports are omitted from the URL, non-standard ports included.
-    # Phase 4 replaces this with the single shared URL helper.
-    $publicUrl = if ($port -eq '80') { 'http://localhost' } else { "http://localhost:$port" }
+    # Ports, hostname, TLS state and the public URL are all settled by the
+    # network stage before generation runs, and PUBLIC_URL comes from the one
+    # URL helper - never formatted here.
+    $port      = "$($Network.HttpPort)"
+    $publicUrl = $Network.PublicUrl
 
     $values['COMPOSE_PROJECT_NAME'] = & $resolve 'COMPOSE_PROJECT_NAME' $Script:DeltaComposeProjectDefault
     $values['DELTA_IMAGE']          = & $resolve 'DELTA_IMAGE'     'ghcr.io/preventionweb/delta-country:prod-latest'
@@ -241,6 +269,10 @@ function New-DeltaEnvironmentFile {
     $values['NGINX_IMAGE']          = & $resolve 'NGINX_IMAGE'     'nginx:1.29-alpine'
     $values['PGDATA_VOLUME']        = & $resolve 'PGDATA_VOLUME'   'delta_pgdata'
     $values['HTTP_PORT']            = $port
+    $values['HTTPS_PORT']           = "$($Network.HttpsPort)"
+    $values['TLS_ENABLED']          = if ($Network.TlsEnabled) { 'true' } else { 'false' }
+    $values['TLS_MODE']             = $Network.TlsMode
+    $values['DELTA_HOSTNAME']       = $Network.HostName
     $values['POSTGRES_USER']        = $postgresUser
     $values['POSTGRES_DB']          = $postgresDb
     $values['POSTGRES_PASSWORD']    = $postgresPassword
@@ -261,6 +293,10 @@ function New-DeltaEnvironmentFile {
         Path           = $envPath
         ProjectName    = $values['COMPOSE_PROJECT_NAME']
         HttpPort       = $port
+        HttpsPort      = $values['HTTPS_PORT']
+        TlsEnabled     = $Network.TlsEnabled
+        TlsMode        = $Network.TlsMode
+        HostName       = $Network.HostName
         PublicUrl      = $publicUrl
         PostgresUser   = $postgresUser
         PostgresDb     = $postgresDb
@@ -283,12 +319,14 @@ function New-DeltaComposeFile {
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][string]$ScriptRoot
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [bool]$TlsEnabled = $false
     )
 
     $templatePath = Get-DeltaTemplatePath -ScriptRoot $ScriptRoot -RelativePath 'docker-compose.yml.template'
     $target = Join-Path -Path $InstallRoot -ChildPath 'docker-compose.yml'
     $text = [System.IO.File]::ReadAllText($templatePath, (New-Object System.Text.UTF8Encoding($false)))
+    $text = Expand-DeltaTemplateRegions -Text $text -TlsEnabled $TlsEnabled
     Write-DeltaFileAtomic -Path $target -Content ($text -replace "`r`n", "`n")
     Write-Detail "Wrote $target"
     return $target
@@ -297,25 +335,51 @@ function New-DeltaComposeFile {
 function New-DeltaNginxConfiguration {
     <#
       Renders the NGINX site configuration into
-      <InstallRoot>\nginx\conf.d\delta.conf.
+      <InstallRoot>\nginx\conf.d\delta.conf, selecting the HTTP-only or the
+      redirect-plus-TLS shape.
 
-      Phase 3 serves HTTP only and answers on any hostname, so the server name
-      is the catch-all. The TLS server block and a real hostname arrive with
-      certificate handling.
+      Returns the previous contents alongside the path, so a caller can put
+      them back if `nginx -t` rejects what was just written - the rule is that
+      an invalid configuration never stays in the live path.
+
+      server_name is the configured hostname, and both server blocks are also
+      default_server, so the installation still answers when it is reached by
+      IP or by a name nobody configured.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$ScriptRoot,
-        [string]$ServerName = '_'
+        [Parameter(Mandatory)][object]$Network
     )
 
     $templatePath = Get-DeltaTemplatePath -ScriptRoot $ScriptRoot -RelativePath 'nginx\delta.conf.template'
     $target = Join-Path -Path $InstallRoot -ChildPath 'nginx\conf.d\delta.conf'
+
+    $previous = $null
+    if (Test-Path -LiteralPath $target -PathType Leaf) {
+        $previous = [System.IO.File]::ReadAllText($target, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    $serverName = if ($Network.HostName) { $Network.HostName } else { '_' }
+
     $text = [System.IO.File]::ReadAllText($templatePath, (New-Object System.Text.UTF8Encoding($false)))
-    $text = $text.Replace('__DELTA_SERVER_NAME__', $ServerName)
+    $text = Expand-DeltaTemplateRegions -Text $text -TlsEnabled ([bool]$Network.TlsEnabled)
+    $text = $text.Replace('__DELTA_SERVER_NAME__', $serverName)
+
+    if ($Network.TlsEnabled) {
+        # $host keeps the redirect correct for a hostname or a bare IP; the
+        # port comes from the single URL helper, which omits 443 and includes
+        # anything else.
+        $redirectPrefix = (Get-DeltaPublicUrl -Scheme 'https' -HostName '$host' -Port ([int]$Network.HttpsPort))
+        $text = $text.Replace('__DELTA_HTTPS_REDIRECT_PREFIX__', $redirectPrefix)
+        $text = $text.Replace('__DELTA_CERT_FILE__', $Network.CertificateFile)
+        $text = $text.Replace('__DELTA_KEY_FILE__', $Network.KeyFile)
+    }
+
     Write-DeltaFileAtomic -Path $target -Content ($text -replace "`r`n", "`n")
     Write-Detail "Wrote $target"
-    return $target
+
+    return [PSCustomObject]@{ Path = $target; Previous = $previous }
 }
 
 # ---------------------------------------------------------------------------
@@ -869,36 +933,88 @@ function Test-DeltaHttpEndpoint {
     <#
       A real request through NGINX. HttpWebRequest rather than
       Invoke-WebRequest so a 3xx or 4xx is a status code to report rather than
-      a terminating error, and so redirects are not followed silently.
+      a terminating error, and so redirects are not followed silently - the
+      HTTP->HTTPS redirect has to be observable, not swallowed.
+
+      For an HTTPS endpoint the certificate the server presents is captured and
+      returned. Its trust is deliberately not enforced: this is a reachability
+      check against a host that may legitimately be serving a self-signed
+      certificate, and refusing to look would mean the installer could not
+      verify the very certificate it just installed. What it must never do is
+      leave that relaxed check in place afterwards, so the previous callback is
+      restored in a finally block.
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
         [int]$TimeoutSeconds = 30
     )
 
-    $result = [PSCustomObject]@{ Url = $Url; StatusCode = 0; Succeeded = $false; Error = $null }
+    $result = [PSCustomObject]@{
+        Url                 = $Url
+        StatusCode          = 0
+        Succeeded           = $false
+        Error               = $null
+        RedirectLocation    = $null
+        PresentedCertificate = $null
+    }
+
+    $isHttps = $Url.StartsWith('https://', [System.StringComparison]::OrdinalIgnoreCase)
+    $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    $previousProtocol = [System.Net.ServicePointManager]::SecurityProtocol
+    $captured = $null
 
     try {
-        $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.Method = 'GET'
-        $request.Timeout = $TimeoutSeconds * 1000
-        $request.AllowAutoRedirect = $false
-        $request.UserAgent = 'DELTA-installer'
-        $response = $request.GetResponse()
-        $result.StatusCode = [int]$response.StatusCode
-        $response.Close()
-    }
-    catch [System.Net.WebException] {
-        if ($_.Exception.Response) {
-            $result.StatusCode = [int]$_.Exception.Response.StatusCode
-            $_.Exception.Response.Close()
+        if ($isHttps) {
+            [System.Net.ServicePointManager]::SecurityProtocol =
+                [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
+            # The certificate's native handle is released as soon as the
+            # request completes, so its details are read here, inside the
+            # callback, rather than kept for later - reading them afterwards
+            # fails with "m_safeCertContext is an invalid handle".
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
+                param($senderObject, $certificate, $chain, $errors)
+                $script:DeltaLastPresentedCertificate = [PSCustomObject]@{
+                    Subject    = $certificate.Subject
+                    Issuer     = $certificate.Issuer
+                    Thumbprint = $certificate.GetCertHashString()
+                    NotAfter   = $certificate.GetExpirationDateString()
+                    ChainValid = ($errors -eq [System.Net.Security.SslPolicyErrors]::None)
+                }
+                return $true
+            }
         }
-        else {
+
+        try {
+            $request = [System.Net.HttpWebRequest]::Create($Url)
+            $request.Method = 'GET'
+            $request.Timeout = $TimeoutSeconds * 1000
+            $request.AllowAutoRedirect = $false
+            $request.UserAgent = 'DELTA-installer'
+            $response = $request.GetResponse()
+            $result.StatusCode = [int]$response.StatusCode
+            $result.RedirectLocation = $response.Headers['Location']
+            $response.Close()
+        }
+        catch [System.Net.WebException] {
+            if ($_.Exception.Response) {
+                $result.StatusCode = [int]$_.Exception.Response.StatusCode
+                $result.RedirectLocation = $_.Exception.Response.Headers['Location']
+                $_.Exception.Response.Close()
+            }
+            else {
+                $result.Error = $_.Exception.Message
+            }
+        }
+        catch {
             $result.Error = $_.Exception.Message
         }
+
+        $result.PresentedCertificate = $script:DeltaLastPresentedCertificate
     }
-    catch {
-        $result.Error = $_.Exception.Message
+    finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previousCallback
+        [System.Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        $script:DeltaLastPresentedCertificate = $null
     }
 
     $result.Succeeded = ($result.StatusCode -ge 200 -and $result.StatusCode -lt 400)
@@ -932,6 +1048,7 @@ function Start-DeltaStack {
         Migration = $null
         Database  = $null
         Http      = $null
+        Redirect  = $null
     }
 
     # --- db ---------------------------------------------------------------
@@ -1021,7 +1138,16 @@ function Start-DeltaStack {
     $result.Stage = 'verify'
     Write-Step 'Verifying the stack end to end'
 
-    $url = "http://localhost:$($Configuration.HttpPort)/"
+    # The probe always goes to localhost, whatever hostname is configured: it
+    # is testing that this machine's published port reaches DELTA, not that
+    # DNS elsewhere resolves.
+    $url = if ($Configuration.TlsEnabled) {
+        "https://localhost:$($Configuration.HttpsPort)/"
+    }
+    else {
+        "http://localhost:$($Configuration.HttpPort)/"
+    }
+
     $result.Http = Test-DeltaHttpEndpoint -Url $url
     if (-not $result.Http.Succeeded) {
         Write-DeltaFailure ''
@@ -1034,6 +1160,20 @@ function Start-DeltaStack {
     }
 
     Write-Detail "[ ok ]     GET $url returned $($result.Http.StatusCode)"
+    if ($result.Http.PresentedCertificate) {
+        Write-Detail "[ ok ]     served certificate $($result.Http.PresentedCertificate.Subject) (thumbprint $($result.Http.PresentedCertificate.Thumbprint))"
+    }
+
+    if ($Configuration.TlsEnabled) {
+        $redirectUrl = "http://localhost:$($Configuration.HttpPort)/"
+        $result.Redirect = Test-DeltaHttpEndpoint -Url $redirectUrl
+        if ($result.Redirect.StatusCode -eq 301 -and $result.Redirect.RedirectLocation) {
+            Write-Detail "[ ok ]     GET $redirectUrl returned 301 to $($result.Redirect.RedirectLocation)"
+        }
+        else {
+            Write-DeltaWarning "The HTTP endpoint $redirectUrl returned $($result.Redirect.StatusCode) instead of a 301 redirect to HTTPS."
+        }
+    }
 
     $result.Succeeded = $true
     return $result
@@ -1062,6 +1202,12 @@ function Invoke-DeltaStackStage {
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$ScriptRoot,
         [int]$HttpPort,
+        [int]$HttpsPort,
+        [string]$HostName,
+        [string]$TlsMode,
+        [string]$CertificatePath,
+        [string]$CertificateKeyPath,
+        [bool]$AllowPrompt = $true,
         [System.Collections.IDictionary]$PendingFacts,
         [object]$Runtime
     )
@@ -1070,6 +1216,7 @@ function Invoke-DeltaStackStage {
         Outcome       = 'blocked'
         Reason        = $null
         Configuration = $null
+        Network       = $null
         Pins          = $null
         Start         = $null
     }
@@ -1090,22 +1237,65 @@ function Invoke-DeltaStackStage {
     }
     $null = Write-DeltaInstallState -InstallRoot $InstallRoot -Properties $facts
 
+    # --- ports and TLS ----------------------------------------------------
+    # Resolved before anything is generated: PUBLIC_URL, the NGINX server
+    # blocks and the published ports all derive from these answers.
+    $envPath = Join-Path -Path $InstallRoot -ChildPath '.env'
+    $projectName = Get-DeltaEnvValue -Path $envPath -Key 'COMPOSE_PROJECT_NAME'
+    if (-not $projectName) { $projectName = $Script:DeltaComposeProjectDefault }
+    $openSslImage = Get-DeltaEnvValue -Path $envPath -Key 'DB_IMAGE'
+    if (-not $openSslImage) { $openSslImage = 'postgis/postgis:17-3.5' }
+
+    $network = Invoke-DeltaNetworkStage -InstallRoot $InstallRoot -ProjectName $projectName -OpenSslImage $openSslImage `
+        -HttpPort $HttpPort -HttpsPort $HttpsPort -HostName $HostName -TlsMode $TlsMode `
+        -CertificatePath $CertificatePath -CertificateKeyPath $CertificateKeyPath -AllowPrompt $AllowPrompt
+    $result.Network = $network
+    if (-not $network.Succeeded) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'Ports and TLS could not be settled.'
+        Write-Detail $network.Reason
+        $result.Reason = $network.Reason
+        return $result
+    }
+
     # --- configuration ----------------------------------------------------
-    $configuration = if ($PSBoundParameters.ContainsKey('HttpPort') -and $HttpPort -gt 0) {
-        New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -HttpPort $HttpPort
-    }
-    else {
-        New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot
-    }
+    $configuration = New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Network $network
     $result.Configuration = $configuration
 
-    $null = New-DeltaComposeFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot
-    $null = New-DeltaNginxConfiguration -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot
+    $null = New-DeltaComposeFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -TlsEnabled ([bool]$network.TlsEnabled)
+    $nginxConfiguration = New-DeltaNginxConfiguration -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Network $network
 
     $config = Test-DeltaComposeConfiguration -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName
     if (-not $config.Succeeded) {
         $result.Reason = 'The generated Compose file is not valid.'
         return $result
+    }
+
+    # --- nginx -t gate ----------------------------------------------------
+    # Against the running container, because `proxy_pass http://delta:3000`
+    # makes nginx resolve the upstream at test time. If the test fails, the
+    # previous configuration goes straight back: an invalid file never stays
+    # in the live path.
+    $nginxTest = Test-DeltaNginxConfiguration -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName
+    if ($nginxTest.Tested -and -not $nginxTest.Succeeded) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'The generated NGINX configuration was rejected by nginx -t.'
+        foreach ($line in ($nginxTest.Output -split "`r?`n")) { Write-Detail "  $line" }
+        if ($null -ne $nginxConfiguration.Previous) {
+            Write-DeltaFileAtomic -Path $nginxConfiguration.Path -Content $nginxConfiguration.Previous
+            Write-Detail 'The previous NGINX configuration has been put back.'
+        }
+        $result.Reason = 'The generated NGINX configuration failed nginx -t and was not installed.'
+        return $result
+    }
+    if ($nginxTest.Tested) {
+        Write-Detail '[ ok ]     nginx -t accepted the generated configuration.'
+        if (Invoke-DeltaNginxReload -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName) {
+            Write-Detail '[ ok ]     NGINX reloaded.'
+        }
+    }
+    else {
+        Write-Detail $nginxTest.Reason
     }
 
     # --- persistent data --------------------------------------------------
@@ -1154,7 +1344,15 @@ function Invoke-DeltaStackStage {
         postgresMajor  = [int]$result.Start.Database.PostgresMajor
         pgDataVolume   = $configuration.PgDataVolume
         httpPort       = [int]$configuration.HttpPort
-        tlsEnabled     = $false
+        httpsPort      = [int]$configuration.HttpsPort
+        tlsEnabled     = [bool]$network.TlsEnabled
+        tlsMode        = $network.TlsMode
+        hostname       = $network.HostName
+        publicUrl      = $network.PublicUrl
+        # Non-secret certificate identity only: never the key, never a path
+        # outside the installation.
+        certificateThumbprint = if ($network.Certificate) { $network.Certificate.Thumbprint } else { $null }
+        certificateNotAfter   = if ($network.Certificate) { $network.Certificate.NotAfter.ToString('yyyy-MM-dd') } else { $null }
         # Not 'schemaVersion': that field describes the format of the state
         # file itself, and overwriting it with the database's schema version
         # makes the file unreadable to the installer that wrote it.

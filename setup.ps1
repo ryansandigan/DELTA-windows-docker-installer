@@ -37,11 +37,29 @@
     after the licence disclosure is accepted.
 
 .PARAMETER HttpPort
-    Publish NGINX on this Windows port instead of the configured default.
-    Intended for bringing a second, isolated installation up on a host that is
-    already using port 80. Intelligent port resolution - detecting a conflict,
-    naming its owner and offering an alternative - arrives with the port and
-    TLS work; this is the plain override until then.
+    Publish NGINX's HTTP port on this Windows port. Without it the installer
+    uses the value already in .env, or 80, and resolves a conflict with the
+    operator. Supplying it makes the choice non-interactive: a conflict is
+    reported and refused rather than prompted.
+
+.PARAMETER HttpsPort
+    The same, for HTTPS. Defaults to 443.
+
+.PARAMETER Hostname
+    The hostname this installation is reached by. Becomes NGINX's server_name
+    and the host part of PUBLIC_URL. Defaults to localhost.
+
+.PARAMETER TlsMode
+    none         plain HTTP only
+    supplied     use -CertificatePath and -CertificateKeyPath
+    self-signed  generate a certificate for -Hostname
+    Without it the installer asks, or keeps what .env already records.
+
+.PARAMETER CertificatePath
+.PARAMETER CertificateKeyPath
+    PEM certificate and private key for -TlsMode supplied. Both are validated -
+    including that the key actually matches the certificate - before anything
+    is written into the live configuration.
 
 .NOTES
     Exit codes:
@@ -61,7 +79,13 @@ param(
     [string]$LogDirectory,
     [string]$DockerInstallerPath,
     [switch]$AllowDockerDownload,
-    [int]$HttpPort
+    [int]$HttpPort,
+    [int]$HttpsPort,
+    [string]$Hostname,
+    [ValidateSet('none', 'supplied', 'self-signed')][string]$TlsMode,
+    [string]$CertificatePath,
+    [string]$CertificateKeyPath,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,7 +96,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 
-foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1')) {
+foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1', 'Delta.Network.ps1')) {
     $libraryPath = Join-Path -Path $Script:DeltaScriptRoot -ChildPath "lib\$library"
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         Write-Host "Required library not found: $libraryPath" -ForegroundColor Red
@@ -261,13 +285,21 @@ function Show-DeltaStackOutcome {
             Write-Detail "Administrator    $($Stack.Configuration.PublicUrl)/en/admin/login"
             Write-Detail "Installation     $($Stack.Configuration.Path | Split-Path -Parent)"
             Write-Detail ''
-            Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only. Session cookies are marked Secure,'
-            Write-DeltaWarning 'so users reaching this server by hostname over plain HTTP will not stay signed in.'
+            if ($Stack.Network -and $Stack.Network.TlsEnabled) {
+                Write-Detail "HTTPS is enabled on port $($Stack.Network.HttpsPort); HTTP on $($Stack.Network.HttpPort) redirects to it."
+                if ($Stack.Network.TlsMode -eq 'self-signed') {
+                    Write-DeltaWarning 'The certificate is self-signed, so browsers will warn until it is trusted or replaced.'
+                }
+            }
+            else {
+                Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only. Session cookies are marked Secure,'
+                Write-DeltaWarning 'so users reaching this server by hostname over plain HTTP will not stay signed in.'
+            }
             Write-Detail ''
-            Write-Detail 'Still to come: port and certificate handling, the administrator credential reset'
-            Write-Detail 'that closes the published default, firewall rules, unattended restart and the'
-            Write-Detail 'management menu. The default administrator has NOT been reset yet - do not expose'
-            Write-Detail 'this installation beyond this machine until it has.'
+            Write-Detail 'Still to come: the administrator credential reset that closes the published'
+            Write-Detail 'default, firewall rules, unattended restart and the management menu. The default'
+            Write-Detail 'administrator has NOT been reset yet - do not expose this installation beyond'
+            Write-Detail 'this machine until it has.'
             return $Script:DeltaExitSuccess
         }
         'migration' {
@@ -322,14 +354,19 @@ try {
             $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
 
             if ($runtime.Outcome -eq 'ready') {
-                $stack = if ($PSBoundParameters.ContainsKey('HttpPort')) {
-                    Invoke-DeltaStackStage -InstallRoot $InstallRoot -ScriptRoot $Script:DeltaScriptRoot `
-                        -PendingFacts $runtime.PendingFacts -Runtime $runtime -HttpPort $HttpPort
-                }
-                else {
-                    Invoke-DeltaStackStage -InstallRoot $InstallRoot -ScriptRoot $Script:DeltaScriptRoot `
-                        -PendingFacts $runtime.PendingFacts -Runtime $runtime
-                }
+                $stack = Invoke-DeltaStackStage `
+                    -InstallRoot $InstallRoot `
+                    -ScriptRoot $Script:DeltaScriptRoot `
+                    -PendingFacts $runtime.PendingFacts `
+                    -Runtime $runtime `
+                    -HttpPort $HttpPort `
+                    -HttpsPort $HttpsPort `
+                    -HostName $Hostname `
+                    -TlsMode $TlsMode `
+                    -CertificatePath $CertificatePath `
+                    -CertificateKeyPath $CertificateKeyPath `
+                    -AllowPrompt (-not $NonInteractive)
+
                 $exitCode = Show-DeltaStackOutcome -Stack $stack
             }
         }
