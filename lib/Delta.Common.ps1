@@ -24,10 +24,17 @@ $Script:DeltaBannerWidth = 72
 
 # Exit codes. setup.ps1 owns exactly one top-level try/catch and is the only
 # place that calls exit; functions raise terminating errors via Stop-Setup.
-$Script:DeltaExitSuccess           = 0
-$Script:DeltaExitFailure           = 1
-$Script:DeltaExitNotElevated       = 2
+$Script:DeltaExitSuccess            = 0
+$Script:DeltaExitFailure            = 1
+$Script:DeltaExitNotElevated        = 2
 $Script:DeltaExitInvalidInstallRoot = 3
+# Phase 2 outcomes. A blocked prerequisite and a required-but-declined
+# disclosure are distinct from a crash, and "restart Windows and run this
+# again" is not a failure at all - it is the documented next step, so it gets
+# its own code rather than being flattened into 1.
+$Script:DeltaExitPrerequisiteFailed = 4
+$Script:DeltaExitRebootRequired     = 5
+$Script:DeltaExitOperatorDeclined   = 6
 
 # UTF-8 *without* a byte-order mark. Every file this installer writes that is
 # later read by a Linux container (.env above all) must not carry a BOM -
@@ -268,6 +275,38 @@ function Write-DeltaFailure {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
     Write-Host $Message -ForegroundColor Red
     Write-DeltaLogLine -Message $Message -Level 'ERROR'
+}
+
+function Read-DeltaYesNoConfirmation {
+    <#
+      The shared shape behind every Y/N confirmation in this installer,
+      adapted from the reference installer's function of the same name: a
+      rule, the caller-supplied body, a '[y/N]' prompt, a closing rule.
+
+      Bare Enter - or anything other than Y/y - always means No. Every
+      confirmation in this project follows that "blank means the safe choice"
+      convention, which is what makes a disclosure the operator did not read
+      fail closed rather than open.
+
+      $Body is a scriptblock that writes the question-specific text. It is
+      invoked with & so it can still read the local variables of the scope it
+      was written in.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Body)
+
+    $rule = '-' * $Script:DeltaBannerWidth
+    Write-Host ''
+    Write-Host $rule
+    Write-Host ''
+    & $Body
+    Write-Host ''
+    $choice = Read-Host -Prompt '[y/N]'
+    Write-Host ''
+    Write-Host $rule
+
+    $confirmed = ($choice -and $choice.Trim() -in @('Y', 'y'))
+    Write-DeltaLogLine -Message "Confirmation prompt answered: $(if ($confirmed) { 'yes' } else { 'no' })" -Level 'DETAIL'
+    return $confirmed
 }
 
 function Stop-Setup {

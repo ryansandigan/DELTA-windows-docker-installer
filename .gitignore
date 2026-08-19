@@ -36,6 +36,15 @@ backups/
 *.sql.gz
 
 # -----------------------------------------------------------------------------
+# Vendor installer binaries staged for an offline install (Docker Desktop).
+# Resolve-DeltaDockerInstaller looks here; the binaries are never committed.
+# -----------------------------------------------------------------------------
+
+installers/
+*.exe
+*.msi
+
+# -----------------------------------------------------------------------------
 # Local test artefacts and scratch output
 # -----------------------------------------------------------------------------
 

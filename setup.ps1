@@ -7,11 +7,14 @@
     One entry point for both installation and management; the mode is chosen
     from the detected installation state, never from a switch (A§17.1).
 
-    This is the Phase 1 skeleton. It verifies elevation, classifies the
-    installation state from evidence on disk, writes a redacted transcript and
-    exits. Docker interaction, prerequisite checks, Compose artefacts and the
-    management menu arrive in later phases and are not implemented here - the
-    script says so rather than implying otherwise.
+    It verifies elevation, classifies the installation state from evidence on
+    disk, and then proves the host can run Linux containers - disclosing the
+    caveats it is obliged to disclose, installing Docker Desktop when it is
+    absent, and validating that the engine and Compose are usable.
+
+    Compose artefacts, image pulls, the stack itself and the management menu
+    arrive in later phases and are not implemented here - the script says so
+    rather than implying otherwise.
 
 .PARAMETER InstallRoot
     Installation root to inspect. Defaults to C:\DELTA (A§9.1).
@@ -23,17 +26,32 @@
     it, and until then this script writes nothing into an installation root it
     does not yet own.
 
+.PARAMETER DockerInstallerPath
+    Path to "Docker Desktop Installer.exe", for sites that stage the binary
+    themselves. Used only when Docker is absent. Without it the installer
+    looks in installers\ next to setup.ps1.
+
+.PARAMETER AllowDockerDownload
+    Permit downloading Docker Desktop from Docker's documented URL when it is
+    absent and no local installer was found. The download still happens only
+    after the licence disclosure is accepted.
+
 .NOTES
     Exit codes:
       0  success
       1  unhandled failure
       2  not elevated
       3  the installation root is not a usable path
+      4  a prerequisite cannot be met, or Docker is unusable
+      5  Windows must restart; run setup.ps1 again afterwards
+      6  the operator declined a required disclosure
 #>
 [CmdletBinding()]
 param(
     [string]$InstallRoot = 'C:\DELTA',
-    [string]$LogDirectory
+    [string]$LogDirectory,
+    [string]$DockerInstallerPath,
+    [switch]$AllowDockerDownload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,7 +62,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 
-foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1')) {
+foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1')) {
     $libraryPath = Join-Path -Path $Script:DeltaScriptRoot -ChildPath "lib\$library"
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         Write-Host "Required library not found: $libraryPath" -ForegroundColor Red
@@ -156,34 +174,71 @@ function Show-DeltaInstallationState {
     return $state
 }
 
-function Show-DeltaPhaseNotice {
+function Show-DeltaRuntimeOutcome {
     <#
-      States plainly what this build does not yet do. An installer that
-      exited 0 without installing anything must never leave the operator
-      believing it installed something.
+      Turns the runtime stage's outcome into what the operator sees and the
+      code the process exits with. "Restart Windows and run this again" is
+      reported as the next step it is, not as a failure.
+
+      When the engine is unusable over an otherwise-registered installation,
+      the classification is re-reported with that evidence supplied - the
+      `docker-unavailable` state of A§28, which Phase 1 built the seam for and
+      this phase is the first that can actually fill in.
     #>
-    param([Parameter(Mandatory)][object]$State)
+    param(
+        [Parameter(Mandatory)][object]$Runtime,
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+
+    if ($Runtime.Outcome -ne 'ready' -and $State.State -eq 'installed') {
+        $refined = Get-DeltaInstallationState -InstallRoot $InstallRoot -DockerStatus 'unavailable'
+        Write-Detail ''
+        Write-Success "state = $($refined.State)"
+        Write-Detail $refined.Reason
+    }
 
     Write-Step 'Next steps'
 
-    switch ($State.State) {
-        'none' {
-            Write-Detail 'No DELTA Docker installation was found. A full installation would run from here.'
+    switch ($Runtime.Outcome) {
+        'ready' {
+            Write-Success 'This host can run DELTA.'
+            Write-Detail $Runtime.Reason
+
+            switch ($State.State) {
+                'none'    { Write-Detail 'No DELTA Docker installation was found. A full installation would run from here.' }
+                'partial' { Write-Detail 'An incomplete installation was found. Resume or repair would run from here.' }
+                default   { Write-Detail 'A registered installation was found. The management menu would open from here.' }
+            }
+
+            Write-Detail ''
+            Write-Detail 'This build covers the foundation and the Docker runtime: elevation, state'
+            Write-Detail 'detection, redacted logging, Windows prerequisites, caveat disclosure and'
+            Write-Detail 'Docker validation. The Compose stack, ports and TLS, the install flow and the'
+            Write-Detail 'management menu are not implemented yet, so nothing was installed, started or'
+            Write-Detail 'changed by this run beyond what is reported above.'
+            return $Script:DeltaExitSuccess
         }
-        'partial' {
-            Write-Detail 'An incomplete installation was found. Resume or repair would run from here.'
-            Write-Detail 'Nothing under the installation root has been read for modification, and nothing was changed.'
+        'reboot-required' {
+            Write-DeltaWarning 'Windows must restart before installation can continue.'
+            Write-Detail $Runtime.Reason
+            Write-Detail ''
+            Write-Detail 'Restart this machine, sign in, then run this installer again:'
+            Write-Detail "  cd `"$Script:DeltaScriptRoot`"  then  .\setup.ps1"
+            Write-Detail 'Nothing else needs to be repeated - the installer picks up where it left off.'
+            return $Script:DeltaExitRebootRequired
+        }
+        'declined' {
+            Write-Detail $Runtime.Reason
+            Write-Detail 'Nothing was installed or changed. Run this installer again if you change your mind.'
+            return $Script:DeltaExitOperatorDeclined
         }
         default {
-            Write-Detail 'A registered installation was found. The management menu would open from here.'
+            Write-Detail 'Installation cannot continue until the problem reported above is resolved.'
+            Write-Detail 'Nothing was installed or changed.'
+            return $Script:DeltaExitPrerequisiteFailed
         }
     }
-
-    Write-Detail ''
-    Write-Detail 'This build is the Phase 1 foundation: elevation, state detection, configuration'
-    Write-Detail 'primitives and redacted logging. Windows prerequisite checks, Docker, the Compose'
-    Write-Detail 'stack and the management menu are not implemented yet, so nothing was installed,'
-    Write-Detail 'started, or changed by this run.'
 }
 
 # ---------------------------------------------------------------------------
@@ -212,7 +267,14 @@ try {
         }
         else {
             $state = Show-DeltaInstallationState -Path $InstallRoot
-            Show-DeltaPhaseNotice -State $state
+
+            $runtime = Invoke-DeltaRuntimeStage `
+                -InstallRoot $InstallRoot `
+                -ScriptRoot $Script:DeltaScriptRoot `
+                -DockerInstallerPath $DockerInstallerPath `
+                -AllowDownload:$AllowDockerDownload
+
+            $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
         }
     }
 
