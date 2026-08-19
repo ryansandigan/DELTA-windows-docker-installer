@@ -488,6 +488,41 @@ curl.exe -s  -o NUL -w "%{http_code} %{redirect_url}" http://localhost:8080/   #
 
 **Documentation update.** None.
 
+#### Implementation status
+
+**Status: COMPLETE** · 2026-08-19 · Commit `14c295b` · **Acceptance gate: PASS**
+
+Delivered: `lib\Delta.Network.ps1`; TLS regions in all three templates; `setup.ps1` gains `-HttpsPort`, `-Hostname`, `-TlsMode`, `-CertificatePath`, `-CertificateKeyPath`, `-NonInteractive`.
+
+**Implementation notes**
+
+- **Port ownership is tied to the container's `com.docker.compose.project.config_files` label, not to the project name.** `docker compose ps --project-name X` returns whatever carries that label regardless of which compose file was passed — measured by pointing this installer's compose file at `apc-2026` and getting that project's container back. Without the label check, any installation sharing a project name would be adopted as ours.
+- **Certificate cryptography runs in the database image's OpenSSL (1.1.1w).** `nginx:1.29-alpine` and the DELTA image ship **no `openssl` binary** — measured. Using an image the installation already requires avoids both a vendored BouncyCastle DLL and any Windows certificate-store involvement, which A§23 removes from this product. `X509Certificate2` still does the Windows-side parse (subject, issuer, expiry, thumbprint); the pair match compares `openssl x509 -pubkey` with `openssl pkey -pubout`, which is algorithm-agnostic.
+- **`nginx -t` must run inside the running project.** In a throwaway container it fails with *"host not found in upstream 'delta'"* because `proxy_pass` resolves the upstream at configuration-test time — measured. When NGINX is not running the result is reported as *not verified*, never as a pass; the configuration is then validated by NGINX at startup behind the health gate. On failure the previous `delta.conf` is written back byte-for-byte before the run stops.
+- **The NGINX healthcheck follows the protocol the site serves.** With TLS on, port 80 answers 301 and BusyBox `wget` does not follow redirects, so an HTTP probe reports the container unhealthy while the site is fine — measured on the first TLS run. The TLS variant probes `https://127.0.0.1/`, which also proves TLS termination. `ssl_client` is present in the image.
+- **Marker regions (`#__IF_TLS__` / `#__IF_NO_TLS__`) rather than parallel template files**, so the HTTP and HTTPS server blocks cannot drift apart. Beware `"$var__"` in the renderer: an underscore is a valid variable-name character, so `${var}__` is required.
+- **One URL helper.** `Get-DeltaPublicUrl` builds `PUBLIC_URL`, the completion summary and the NGINX redirect target — the redirect passes `$host` as the host so it works for a hostname or a bare IP while the port rule stays in one place. Phase 3's interim construction is gone.
+- Certificate private keys are staged as `certs\delta.key` with the same ACL as `.env` (Administrators + SYSTEM, inheritance off) and mounted read-only. `.delta-install.json` records only the thumbprint and expiry — never a path outside the installation, never key material.
+- A supplied port makes that choice non-interactive: a foreign conflict is reported and refused rather than prompted, because choosing a different port silently is the surprise this flow exists to prevent.
+
+**Validation observations**
+
+- **Physical, on the live installation** (`C:\DELTA-docker-test`, project `delta`): HTTP 18080 recognised as **owned** by `delta-nginx-1` on every rerun, never as a conflict; HTTPS 18443 free then owned; `https://localhost:18443/`, `/en/admin/login`, `/en/user/login` all **200**; `http://localhost:18080/…` returns **301** to `https://localhost:18443/…` carrying the path and the non-standard port; the certificate NGINX serves matches the staged file's thumbprint exactly (`2C53781D…`, TLS 1.3); `nginx -t` exit 0; published ports on **nginx only**, db 5432 and delta 3000 still internal.
+- **Foreign conflicts, physical:** the unrelated Docker project `apc-2026` on 8880 is reported **foreign** (naming `wslrelay` and `com.docker.backend` with PIDs), the incumbent keeps running and `.env` is unchanged; a non-Docker listener created for the test is likewise foreign and survives detection. Windows-service naming verified read-only against real services (`RpcEptMapper`, `TermService`).
+- **Defaults:** ports 80 and 443 are free on this host and are adopted **silently** — verified by direct invocation with a `Read-Host` that shouts if called. They were deliberately not published, so the fixture keeps its isolated ports.
+- **Certificates, physical:** matching pair accepted; **mismatched key rejected by name** (unit and through the full installer); missing certificate and missing key each named; unparseable file rejected; passphrase-protected key rejected with the `openssl rsa` fix; expired and not-yet-valid rejected; a certificate expiring in 20 days accepted **with** the 30-day warning. Expired/not-yet-valid fixtures were built with .NET `CertificateRequest` and split to PEM by OpenSSL, because OpenSSL 1.1.1 cannot backdate.
+- **`nginx -t` rollback, physical:** an invalid directive injected into the template was rejected verbatim, the previous configuration was restored (hash-identical) and the site never stopped serving 200.
+- **Rerun idempotency:** `.env`, the certificate and `delta.conf` are byte-identical afterwards, the nginx container is not recreated, `conf.d` holds exactly one file, and the site still answers 200/301.
+- **Seam-tested** (scripted `Read-Host`): the prompt loop rejects non-numeric input, out-of-range input and an occupied replacement, then accepts a free port; rejects an HTTP/HTTPS duplicate; and honours cancel. 60/60 Phase 4 assertions pass, alongside Phase 1 (101) and Phase 2 (99).
+- Database untouched: PostgreSQL 17.5, PostGIS 3.5.2, `pgcrypto` present, 39 tables, schema 0.2.3, `delta_pgdata` intact. Unrelated containers, images, networks, volumes, Compose projects and the native `C:\DELTA` are identical to the pre-phase snapshot. No secret value or key material in any transcript.
+
+**For Phase 5**
+
+- The fixture is left running with **TLS enabled**: `https://localhost:18443` (self-signed, CN=localhost), HTTP 18080 redirecting to it. Phase 5's firewall rules should open only the ports `.delta-install.json` records (`httpPort`, `httpsPort`, `tlsEnabled`).
+- `Get-DeltaPublicUrl` is the only URL builder — the access guide and completion summary must use it, not format their own.
+- The certificate-management primitives (`Test-DeltaCertificateMaterial`, `Install-DeltaCertificate`, `New-DeltaSelfSignedCertificate`, `Test-DeltaNginxConfiguration`, `Invoke-DeltaNginxReload`) are ready for Phase 10's menu entry; no menu was built.
+- The default administrator is **still not reset** — that is Phase 5's first security action, and the stack should not be exposed beyond this machine until it is.
+
 ---
 
 ### Phase 5 — Fresh-Install Orchestration & Security Bootstrap
