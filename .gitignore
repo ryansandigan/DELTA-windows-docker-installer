@@ -1,0 +1,67 @@
+# -----------------------------------------------------------------------------
+# Secrets and generated configuration
+#
+# .env is generated per installation and holds POSTGRES_PASSWORD,
+# SESSION_SECRET, SMTP_PASS and DATABASE_URL. It must never be committed,
+# and neither must the timestamped backups the installer writes next to it.
+# templates\env.template is deliberately NOT matched by these patterns.
+# -----------------------------------------------------------------------------
+
+.env
+*.env
+.env.*
+!.env.example
+.delta-install.json
+
+# -----------------------------------------------------------------------------
+# Certificates and private key material
+# -----------------------------------------------------------------------------
+
+certs/
+*.pfx
+*.p12
+*.key
+*.pem
+*.crt
+*.cer
+
+# -----------------------------------------------------------------------------
+# Installer transcripts, container logs, backups
+# -----------------------------------------------------------------------------
+
+logs/
+*.log
+backups/
+*.dump
+*.sql.gz
+
+# -----------------------------------------------------------------------------
+# Local test artefacts and scratch output
+# -----------------------------------------------------------------------------
+
+.scratch/
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.bak-*
+*.orig
+
+# -----------------------------------------------------------------------------
+# Editors / tooling
+# -----------------------------------------------------------------------------
+
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# -----------------------------------------------------------------------------
+# Windows / macOS shell artefacts
+# -----------------------------------------------------------------------------
+
+Thumbs.db
+Desktop.ini
+.DS_Store
