@@ -301,6 +301,36 @@ wsl.exe --version                                     # with WSL_UTF8=1
 
 **Documentation update.** Record in `.delta-install.json` which backend was selected. No document changes.
 
+#### Implementation status
+
+**Status: PARTIAL** · 2026-08-19 · Commit `8497fa0` · **Acceptance gate: Docker-present half PASS (measured on Server 2025); Docker-absent half implemented and seam-tested but never executed against a real installer.**
+
+Delivered: `lib\Delta.Docker.ps1`; `setup.ps1` runtime stage; `Read-DeltaYesNoConfirmation` and exit codes 4/5/6 in `lib\Delta.Common.ps1`; `installers\` ignored by git.
+
+**Implementation notes**
+
+- **`HypervisorPresent` is checked before the processor flags, and is conclusive.** On a host that is already virtualizing, Windows is itself a guest and `Win32_Processor` reports `VirtualizationFirmwareEnabled` and `SecondLevelAddressTranslationExtensions` as **False** — measured on this host, which runs Docker happily. Reading the processor flags first would block a working host. The firmware flags and the `systeminfo` cross-check only apply when no hypervisor is running.
+- **`wsl --install` always carries `--no-distribution`.** A bare `wsl --install` also installs Ubuntu and leaves the operator owning a Linux distribution, which A§5.2 says this product never does. Asserted by a test.
+- **WSL detection is version-first and localisation-safe.** `wsl --version` (with `WSL_UTF8=1`) decides ready/outdated/absent; the `Default Version` line from `--status` is parsed permissively and used only for display, because it is localised and gating on it would fail a healthy non-English host.
+- **C1 is disclosed on every server-SKU run but only *prompts* when Docker is about to be installed**, mirroring A§5.6's explicit treatment of C2 ("already present → log it, do not prompt"). This keeps reruns non-interactive. C2 prompts only on the install path, and `--accept-license` is passed only when it returned yes.
+- **Caveat/backend persistence is conditional, because Phase 2 must not create `C:\DELTA`.** `Save-DeltaRuntimeFacts` writes `.delta-install.json` only when the root already exists **and** is either empty or already holds a valid installer state file; a populated root that is not ours is left untouched (this host's `C:\DELTA` is an unrelated *native* DELTA install). When deferred, the facts are returned on the stage result as `PendingFacts` — **Phase 3 must persist them when it creates the root.** A§13 has the same ordering wrinkle: it discloses caveats before the "create root" stage.
+- **Argument quoting quotes shell metacharacters, not just whitespace.** `.NET Framework` has no `ProcessStartInfo.ArgumentList`, so the command line is built by hand; a `docker` that is a `.cmd`/`.bat` shim is launched through `cmd.exe`, which ate the `|` in `--format '{{.OSType}}|…'` during validation. Real `docker.exe` is unaffected either way.
+- **Backend is detected from `docker info`'s kernel string** (`…-microsoft-standard-WSL2` → `wsl-2`), which needs no settings file to be readable, and is recorded as `dockerBackend`.
+- **Installer acquisition:** `-DockerInstallerPath`, else `installers\Docker Desktop Installer.exe` beside `setup.ps1`, else Docker's documented URL — the download only with `-AllowDockerDownload` and only after C2.
+- Exit codes: `4` prerequisite/Docker unusable, `5` restart required (rerun afterwards), `6` operator declined a disclosure.
+
+**Validation observations**
+
+- **Physically executed on this host (Server 2025, build 26100, Docker Desktop 4.85 / engine 29.6.2 / Compose 5.3.1):** every prerequisite check green; docker CLI detected; engine reachable; `OSType = linux`; backend `wsl-2`; Compose v5.3.1 accepted; WSL reported `ready 2.7.11, default version 2`; C1 disclosed and `caveatsAcknowledged.serverSku` + `dockerBackend` persisted; stage exits 0. Container/image/network/WSL-distribution/context snapshots taken before and after are **identical** — the stage runs only read-only Docker commands on this path.
+- **Exercised end to end through a stub `docker` shim on PATH** (no host change): engine-down → `docker desktop start` attempted → still down → error reported verbatim → exit **4**; and over a seeded registered installation the same run re-reports `state = docker-unavailable`, filling the A§28 seam Phase 1 built.
+- **Exercised through controlled function seams** (99 assertions, all pass): unsupported/32-bit/untested Windows builds; virtualization unavailable; disk floor and warning; WSL absent / outdated / localised / missing-`--version`; `cli-absent`, `engine-down`, `wrong-mode`, timeout and unclassified engine errors; Compose v1 and missing plugin; installer exit 0 / 3010 / non-zero; the exact documented install arguments; `--accept-license` withheld without confirmation; declined C1/C2; WSL-install branch; installer-not-found branch.
+- **Not executed:** a real Docker Desktop silent install, a real `wsl --install`, and the reboot-and-rerun cycle. All three need a host without Docker (or without WSL) — this development host has both and must not be destabilised. This is what keeps the phase PARTIAL.
+
+**For Phase 3**
+
+- The stage returns `Outcome` (`ready` | `reboot-required` | `blocked` | `declined`), the Windows facts, the engine state (including `Backend`), the Compose state, and `PendingFacts` — which Phase 3 should write into `.delta-install.json` at the moment it creates the installation root.
+- This host runs **unrelated Docker workloads** (containers `deltaprobe-*`, `apc-2026`; networks `deltaprobe_default`, `proxy`; images including `ghcr.io/preventionweb/delta-country:prod-latest` and `postgis/postgis:17-3.5` already pulled). Phase 3 must scope everything to its own Compose project name and must never prune, reset, or operate on resources it did not create.
+
 ---
 
 ### Phase 3 — Compose Stack: Generation, Persistence, Health
