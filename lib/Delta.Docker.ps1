@@ -926,19 +926,14 @@ function Save-DeltaRuntimeFacts {
         return $result
     }
 
+    $ownership = Test-DeltaInstallRootOwned -InstallRoot $InstallRoot
+    if (-not $ownership.IsOwned) {
+        $result.Reason = $ownership.Reason
+        return $result
+    }
+
     $existing = Read-DeltaInstallState -InstallRoot $InstallRoot
     $isOurs = ($existing.Exists -and $existing.IsValid)
-    $isEmpty = (@(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue).Count -eq 0)
-
-    if ($existing.Exists -and -not $existing.IsValid) {
-        $result.Reason = "'$($existing.Path)' exists but could not be read ($($existing.Error)); it was not overwritten."
-        return $result
-    }
-
-    if (-not $isOurs -and -not $isEmpty) {
-        $result.Reason = "'$InstallRoot' already contains files that this installer did not create, so no state file was written into it."
-        return $result
-    }
 
     $properties = [ordered]@{}
     if (-not $isOurs) {

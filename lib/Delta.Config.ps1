@@ -622,6 +622,14 @@ function Write-DeltaInstallState {
     }
 
     foreach ($key in $Properties.Keys) {
+        if ([string]$key -eq 'schemaVersion') {
+            # schemaVersion describes the format of this file and belongs to
+            # the writer. A caller passing its own - the DELTA database schema
+            # version, say - would make the file unreadable to
+            # Read-DeltaInstallState and, through it, make the installer refuse
+            # its own installation root. Observed exactly that during Phase 3.
+            Stop-Setup "Refusing to overwrite the state file's own 'schemaVersion' field. Record a different kind of version under its own key."
+        }
         $merged[[string]$key] = $Properties[$key]
     }
 
@@ -643,6 +651,67 @@ function Write-DeltaInstallState {
 # state file over a populated installation root is a *partial* installation,
 # not an absent one.
 # ---------------------------------------------------------------------------
+
+function Test-DeltaInstallRootOwned {
+    <#
+      Decides whether it is safe for this installer to write into $InstallRoot.
+
+      Safe means one of three things: the directory does not exist yet, it
+      exists and is empty, or it already holds a valid .delta-install.json this
+      installer wrote. Anything else - a populated directory with no state file,
+      or a state file that cannot be read - is someone else's, and is left
+      completely alone.
+
+      This is not defensive decoration. On the development host C:\DELTA holds
+      an unrelated *native* DELTA installation; adopting it, writing a state
+      file into it, or generating a compose stack on top of it would all be
+      variations of the same mistake. An installer that cannot tell its own
+      directory from someone else's must stop, not guess.
+
+      Returns IsOwned plus Reason and the evidence the decision was made on.
+    #>
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $result = [PSCustomObject]@{
+        InstallRoot = $InstallRoot
+        IsOwned     = $false
+        Exists      = $false
+        IsEmpty     = $false
+        HasState    = $false
+        Reason      = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $InstallRoot -PathType Container)) {
+        $result.IsOwned = $true
+        $result.Reason  = "'$InstallRoot' does not exist yet and can be created."
+        return $result
+    }
+    $result.Exists = $true
+
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $result.HasState = $state.Exists
+
+    if ($state.Exists -and $state.IsValid) {
+        $result.IsOwned = $true
+        $result.Reason  = "'$InstallRoot' holds a valid $Script:DeltaInstallStateFileName written by this installer."
+        return $result
+    }
+
+    if ($state.Exists) {
+        $result.Reason = "'$($state.Path)' exists but could not be read ($($state.Error)). Refusing to write over an installation state this installer cannot understand."
+        return $result
+    }
+
+    $result.IsEmpty = (@(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue).Count -eq 0)
+    if ($result.IsEmpty) {
+        $result.IsOwned = $true
+        $result.Reason  = "'$InstallRoot' exists and is empty."
+        return $result
+    }
+
+    $result.Reason = "'$InstallRoot' already contains files that this installer did not create, and there is no $Script:DeltaInstallStateFileName to say otherwise."
+    return $result
+}
 
 function Get-DeltaInstallationState {
     <#

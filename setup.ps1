@@ -36,6 +36,13 @@
     absent and no local installer was found. The download still happens only
     after the licence disclosure is accepted.
 
+.PARAMETER HttpPort
+    Publish NGINX on this Windows port instead of the configured default.
+    Intended for bringing a second, isolated installation up on a host that is
+    already using port 80. Intelligent port resolution - detecting a conflict,
+    naming its owner and offering an alternative - arrives with the port and
+    TLS work; this is the plain override until then.
+
 .NOTES
     Exit codes:
       0  success
@@ -45,13 +52,16 @@
       4  a prerequisite cannot be met, or Docker is unusable
       5  Windows must restart; run setup.ps1 again afterwards
       6  the operator declined a required disclosure
+      7  the stack could not be generated or started
+      8  the database initialisation could not be verified
 #>
 [CmdletBinding()]
 param(
     [string]$InstallRoot = 'C:\DELTA',
     [string]$LogDirectory,
     [string]$DockerInstallerPath,
-    [switch]$AllowDockerDownload
+    [switch]$AllowDockerDownload,
+    [int]$HttpPort
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,7 +72,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 
-foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1')) {
+foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1')) {
     $libraryPath = Join-Path -Path $Script:DeltaScriptRoot -ChildPath "lib\$library"
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         Write-Host "Required library not found: $libraryPath" -ForegroundColor Red
@@ -198,27 +208,18 @@ function Show-DeltaRuntimeOutcome {
         Write-Detail $refined.Reason
     }
 
+    switch ($Runtime.Outcome) {
+        'ready' {
+            Write-Detail ''
+            Write-Success 'This host can run DELTA.'
+            Write-Detail $Runtime.Reason
+            return $Script:DeltaExitSuccess
+        }
+    }
+
     Write-Step 'Next steps'
 
     switch ($Runtime.Outcome) {
-        'ready' {
-            Write-Success 'This host can run DELTA.'
-            Write-Detail $Runtime.Reason
-
-            switch ($State.State) {
-                'none'    { Write-Detail 'No DELTA Docker installation was found. A full installation would run from here.' }
-                'partial' { Write-Detail 'An incomplete installation was found. Resume or repair would run from here.' }
-                default   { Write-Detail 'A registered installation was found. The management menu would open from here.' }
-            }
-
-            Write-Detail ''
-            Write-Detail 'This build covers the foundation and the Docker runtime: elevation, state'
-            Write-Detail 'detection, redacted logging, Windows prerequisites, caveat disclosure and'
-            Write-Detail 'Docker validation. The Compose stack, ports and TLS, the install flow and the'
-            Write-Detail 'management menu are not implemented yet, so nothing was installed, started or'
-            Write-Detail 'changed by this run beyond what is reported above.'
-            return $Script:DeltaExitSuccess
-        }
         'reboot-required' {
             Write-DeltaWarning 'Windows must restart before installation can continue.'
             Write-Detail $Runtime.Reason
@@ -237,6 +238,50 @@ function Show-DeltaRuntimeOutcome {
             Write-Detail 'Installation cannot continue until the problem reported above is resolved.'
             Write-Detail 'Nothing was installed or changed.'
             return $Script:DeltaExitPrerequisiteFailed
+        }
+    }
+}
+
+function Show-DeltaStackOutcome {
+    <#
+      Reports what the stack stage did and returns the process exit code. A
+      migration failure gets its own code and its own wording, because the
+      response to it is a restore rather than a retry.
+    #>
+    param([Parameter(Mandatory)][object]$Stack)
+
+    Write-Step 'Next steps'
+
+    switch ($Stack.Outcome) {
+        'ready' {
+            Write-Success 'DELTA is running.'
+            Write-Detail $Stack.Reason
+            Write-Detail ''
+            Write-Detail "Application      $($Stack.Configuration.PublicUrl)"
+            Write-Detail "Administrator    $($Stack.Configuration.PublicUrl)/en/admin/login"
+            Write-Detail "Installation     $($Stack.Configuration.Path | Split-Path -Parent)"
+            Write-Detail ''
+            Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only. Session cookies are marked Secure,'
+            Write-DeltaWarning 'so users reaching this server by hostname over plain HTTP will not stay signed in.'
+            Write-Detail ''
+            Write-Detail 'Still to come: port and certificate handling, the administrator credential reset'
+            Write-Detail 'that closes the published default, firewall rules, unattended restart and the'
+            Write-Detail 'management menu. The default administrator has NOT been reset yet - do not expose'
+            Write-Detail 'this installation beyond this machine until it has.'
+            return $Script:DeltaExitSuccess
+        }
+        'migration' {
+            Write-DeltaFailure 'The installation stopped after the database initialisation could not be verified.'
+            Write-Detail $Stack.Reason
+            Write-Detail ''
+            Write-Detail 'The stack was not published. Inspect the errors above before running this again -'
+            Write-Detail 'a failed migration is recovered by restoring the database, not by retrying.'
+            return $Script:DeltaExitMigrationFailed
+        }
+        default {
+            Write-Detail $Stack.Reason
+            Write-Detail 'Nothing was deleted. Resolve the problem above and run this installer again.'
+            return $Script:DeltaExitStackFailed
         }
     }
 }
@@ -275,6 +320,18 @@ try {
                 -AllowDownload:$AllowDockerDownload
 
             $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
+
+            if ($runtime.Outcome -eq 'ready') {
+                $stack = if ($PSBoundParameters.ContainsKey('HttpPort')) {
+                    Invoke-DeltaStackStage -InstallRoot $InstallRoot -ScriptRoot $Script:DeltaScriptRoot `
+                        -PendingFacts $runtime.PendingFacts -Runtime $runtime -HttpPort $HttpPort
+                }
+                else {
+                    Invoke-DeltaStackStage -InstallRoot $InstallRoot -ScriptRoot $Script:DeltaScriptRoot `
+                        -PendingFacts $runtime.PendingFacts -Runtime $runtime
+                }
+                $exitCode = Show-DeltaStackOutcome -Stack $stack
+            }
         }
     }
 

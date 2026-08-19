@@ -35,6 +35,11 @@ $Script:DeltaExitInvalidInstallRoot = 3
 $Script:DeltaExitPrerequisiteFailed = 4
 $Script:DeltaExitRebootRequired     = 5
 $Script:DeltaExitOperatorDeclined   = 6
+# Phase 3 outcomes. Migration verification gets its own code because it is the
+# highest-consequence stop in the product: it means the schema may be
+# half-migrated, and the response is a restore, not a retry.
+$Script:DeltaExitStackFailed        = 7
+$Script:DeltaExitMigrationFailed    = 8
 
 # UTF-8 *without* a byte-order mark. Every file this installer writes that is
 # later read by a Linux container (.env above all) must not carry a BOM -
