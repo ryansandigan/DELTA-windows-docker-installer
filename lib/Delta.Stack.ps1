@@ -1091,7 +1091,8 @@ function Start-DeltaStack {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][object]$Configuration,
-        [scriptblock]$SecurityBootstrap
+        [scriptblock]$SecurityBootstrap,
+        [bool]$AllowPrompt = $true
     )
 
     $result = [PSCustomObject]@{
@@ -1179,7 +1180,9 @@ function Start-DeltaStack {
     # wrong by a future caller that forgets it.
     if ($SecurityBootstrap) {
         $result.Stage = 'bootstrap'
-        $result.Bootstrap = & $SecurityBootstrap
+        # Everything the callback needs is passed in, so it never depends on
+        # what happens to be in scope where it runs.
+        $result.Bootstrap = & $SecurityBootstrap $InstallRoot $Configuration $AllowPrompt
         if (-not $result.Bootstrap -or -not $result.Bootstrap.Succeeded) {
             Write-DeltaFailure ''
             Write-DeltaFailure 'The administrator account could not be secured.'
@@ -1436,14 +1439,27 @@ function Invoke-DeltaStackStage {
     $bootstrap = $null
     $bootstrapBlock = $null
     if (-not $alreadyBootstrapped) {
+        # A plain scriptblock taking arguments, deliberately not a closure.
+        # GetNewClosure() rebinds a scriptblock to a new dynamic module, and
+        # what a scriptblock in that state can see depends on how the installer
+        # happens to have been loaded - which is a fragile thing to hang the
+        # single most important security step of the installation on. A plain
+        # scriptblock literal keeps the session state of the file it was
+        # written in, so the reset function resolves the same way every other
+        # call in this file does, and everything it needs arrives as an
+        # argument rather than as captured ambient state.
         $bootstrapBlock = {
-            $script:DeltaBootstrapResult = Invoke-DeltaAdminPasswordReset `
-                -InstallRoot $InstallRoot -Configuration $configuration -Automatic -AllowPrompt $AllowPrompt
-            $script:DeltaBootstrapResult
-        }.GetNewClosure()
+            param($BootstrapInstallRoot, $BootstrapConfiguration, $BootstrapAllowPrompt)
+            Invoke-DeltaAdminPasswordReset `
+                -InstallRoot $BootstrapInstallRoot `
+                -Configuration $BootstrapConfiguration `
+                -Automatic `
+                -AllowPrompt $BootstrapAllowPrompt
+        }
     }
 
-    $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration -SecurityBootstrap $bootstrapBlock
+    $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration `
+        -SecurityBootstrap $bootstrapBlock -AllowPrompt $AllowPrompt
 
     if (-not $result.Start.Succeeded) {
         $result.Reason = $result.Start.Reason

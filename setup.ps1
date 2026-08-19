@@ -111,7 +111,22 @@ $ErrorActionPreference = 'Stop'
 
 $Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 
-foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1', 'Delta.Network.ps1', 'Delta.Manage.ps1')) {
+# Each library, and one function it must have defined once it is loaded. The
+# check exists because a library that is missing, stale or half-loaded
+# otherwise announces itself as a CommandNotFoundException in the middle of an
+# installation - and the one that bit was the administrator reset, discovered
+# after the database was already initialised. A missing entry point is now a
+# refusal to start, before anything on the machine has been touched.
+$Script:DeltaLibraries = [ordered]@{
+    'Delta.Common.ps1'  = 'Write-Step'
+    'Delta.Config.ps1'  = 'Read-DeltaEnvFile'
+    'Delta.Docker.ps1'  = 'Invoke-DeltaRuntimeStage'
+    'Delta.Stack.ps1'   = 'Invoke-DeltaStackStage'
+    'Delta.Network.ps1' = 'Invoke-DeltaNetworkStage'
+    'Delta.Manage.ps1'  = 'Invoke-DeltaAdminPasswordReset'
+}
+
+foreach ($library in $Script:DeltaLibraries.Keys) {
     $libraryPath = Join-Path -Path $Script:DeltaScriptRoot -ChildPath "lib\$library"
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         Write-Host "Required library not found: $libraryPath" -ForegroundColor Red
@@ -119,6 +134,17 @@ foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1
         exit 1
     }
     . $libraryPath
+}
+
+foreach ($library in $Script:DeltaLibraries.Keys) {
+    $required = $Script:DeltaLibraries[$library]
+    if (-not (Get-Command -Name $required -CommandType Function -ErrorAction SilentlyContinue)) {
+        Write-Host "Required library did not load correctly: lib\$library" -ForegroundColor Red
+        Write-Host "It should define $required, and after loading it that function does not exist."
+        Write-Host 'This usually means lib\ and setup.ps1 come from different versions of the installer.'
+        Write-Host 'Nothing has been changed on this machine. Reinstall the installer files as a set.'
+        exit 1
+    }
 }
 
 if (-not $LogDirectory) {
