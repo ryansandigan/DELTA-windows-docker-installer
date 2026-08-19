@@ -583,6 +583,41 @@ docker compose ps                                                  # published p
 
 **Documentation update.** A short `README.md` covering install and first run. This is the first phase that produces an operator-facing product.
 
+#### Implementation status
+
+**Status: COMPLETE** · 2026-08-19 · Commit `2e3feea` · **Acceptance gate: PASS**, with one criterion proven at the database rather than over HTTP — see below.
+
+Delivered: `lib\Delta.Manage.ps1` (administrator reset primitive), firewall functions in `lib\Delta.Network.ps1`, the security-bootstrap hook and final state write in `lib\Delta.Stack.ps1`, the completion summary and exit code 9 in `setup.ps1`, `README.md`.
+
+**Implementation notes**
+
+- **The ordering is structural, not conventional.** `Start-DeltaStack` takes the bootstrap as a `-SecurityBootstrap` scriptblock invoked between "DELTA healthy" and `up -d nginx`, so a future caller cannot publish before securing. Measured sequence: `start:db > healthy:db > start:delta > healthy:delta > migration-verified > admin-reset > start:nginx`.
+- **The credential never touches a command line.** `docker compose exec -e NAME` (no `=value`) passes the caller's own environment variable through — verified on this host — and the SQL reaches `psql -f -` on stdin. The reference installer's SQL is otherwise unchanged: `\getenv`, `crypt(:'password', gen_salt('bf', 10))`, `RETURNING email`.
+- **Success is never inferred from an exit code.** Three independent conditions: `RETURNING` yields exactly the intended account, the md5 digest of the stored hash changes, and the new credential verifies via `password = crypt(candidate, password)`. A digest, never the hash, is what gets compared and printed.
+- **`adminBootstrap` in `.delta-install.json` is the rerun guard** — `{completed, at, email, method}`, never the credential. A rerun of a secured installation leaves the credential alone; if the marker is absent the bootstrap runs again. No "container exists therefore it was reset" heuristic.
+- **Firewall rules are per installation** (`DELTA (Docker) - <project> - HTTP/HTTPS`), inbound TCP allow, created for the published ports only and reconciled by replacement. Failure warns, names the port and never fails the install.
+- `state = installed` is written only after the schema is verified, the credential replaced and the stack has answered over HTTP.
+- **Two defects found by physical testing and fixed here.** (1) A fresh install adopted the existing project's containers and then failed authentication against its already-initialised cluster, because the template's default `COMPOSE_PROJECT_NAME`/`PGDATA_VOLUME` beat the supplied ones on a first run. Supplied names now win on a first run, existing values still win on a rerun, and `Test-DeltaComposeProjectConflict` refuses a project name whose containers came from a different compose file. (2) Firewall rules duplicated on every run: `-DisplayName` is a **wildcard** filter (so `[project]` was read as a character class) and `return @(x)` unrolls to a scalar `CimInstance`, which has no `.Count`.
+- `setup.ps1` gained `-ComposeProject`, `-PgDataVolume` and `-NonInteractive`; exit code **9** means the credential could not be secured and nothing was published.
+
+**Validation observations**
+
+- **Isolated fresh install** (`C:\Workspace\delta-fresh5`, project `delta5`, volume `delta5_pgdata`, ports 18090/18453, self-signed TLS) ran the complete first-run path in one command: root created, secrets generated once, `docker compose config` valid, db healthy 7 s, PostgreSQL 17.5 / PostGIS 3.5.2 / `pgcrypto`, DELTA healthy 13 s, **initialise** branch with 39 tables at schema 0.2.3, administrator secured, NGINX started afterwards, HTTPS 200 + HTTP 301, `state = installed`, credential shown once. Removed after validation.
+- **Administrator reset, physical:** seeded hash digest `66ca07ea…` (identical on both installations — the published default) became a per-installation value; a wrong credential does not verify; a non-existent account is reported rather than created; exactly one row affected.
+- **HTTP-level authentication could not be automated.** `POST /en/admin/login` returns HTTP 400 with an identical body for both a correct and a wrong credential through `curl`, because the application posts its login form from client-side JavaScript. The proof is therefore at the database: the stored bcrypt hash changed, and only the new credential verifies against it — which is exactly what the application checks. **Browser sign-in with the new credential still needs one manual confirmation.**
+- **Firewall, physical:** rules created for 18080/18443 and 18090/18453; a second run reports `replaced`, not a duplicate; no rule for 3000 or 5432; host rule count returned to baseline+2 after cleanup. The warning-only contract was proven **physically** (a real "Parameter set cannot be resolved" failure let the install finish with exit 0 and no false success) and again through a seam.
+- **Bootstrap failure, seam:** the run stops at stage `bootstrap`, NGINX is never started, nothing is registered.
+- **Partial/resume, controlled:** state reset to `partial` with the bootstrap marker removed; the rerun kept `.env`, both secrets and the certificate byte-identical, left the database untouched (0.2.3, 39 tables), re-ran the bootstrap and returned to `installed`.
+- `SESSION_SECRET`: 48 CSPRNG bytes, different per installation, never the reference `.env.example` value, unchanged across reruns. `.env` and `certs\delta.key` are Administrators + SYSTEM with inheritance disabled on both installations.
+- No secret **value** appears in any transcript. The `PASSWORD` tripwire does match two benign things: PostgreSQL's own *"password authentication failed"* error text, and the `md5(max(password))` **column name** in the lookup SQL. Neither is a credential.
+- Regressions: Phase 1 101/101, Phase 2 99/99, Phase 4 60/60, Phase 5 42/42; all seven scripts parse under PS 5.1; the native `C:\DELTA` is still refused (exit 7) and its contents are unchanged; unrelated containers, images, networks, volumes, Compose projects and WSL distributions match the pre-phase snapshot.
+
+**For Phase 6**
+
+- Retained fixture: `C:\DELTA-docker-test`, project `delta`, volume `delta_pgdata`, HTTP 18080 / HTTPS 18453→18443, **`state = installed`**, administrator secured, two firewall rules. It is now a complete registered installation, which is what a reboot test needs.
+- The completion summary already tells the operator the truth about restarts — Docker Desktop starts at interactive sign-in, so DELTA does not return after an unattended reboot. **Phase 6 must replace that text with what it actually measures**, in `Show-DeltaCompletionSummary` in `setup.ps1`.
+- Nothing in Phase 5 configures startup: no scheduled task, no service, no `AutoStart` change.
+
 ---
 
 ### Phase 6 — Unattended Startup & Reboot Recovery
