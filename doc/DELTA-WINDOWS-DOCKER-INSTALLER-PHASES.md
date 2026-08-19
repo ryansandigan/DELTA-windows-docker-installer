@@ -389,6 +389,43 @@ docker compose down; docker compose up -d               # data intact; log shows
 
 **Documentation update.** None — A§3, A§7, A§8, A§9 already specify this. Record resolved digests in `.delta-install.json`.
 
+#### Implementation status
+
+**Status: COMPLETE** · 2026-08-19 · Commit `db404e9` · **Acceptance gate: PASS** (every criterion demonstrated physically on Server 2025 / Docker 29.6.2 / Compose 5.3.1)
+
+Delivered: `templates\env.template`, `templates\docker-compose.yml.template`, `templates\nginx\delta.conf.template`, `lib\Delta.Stack.ps1`; `setup.ps1` stack stage with exit codes 7/8; `Test-DeltaInstallRootOwned` in `lib\Delta.Config.ps1`.
+
+**Implementation notes**
+
+- **The installer refuses to adopt a directory it did not create.** `Test-DeltaInstallRootOwned` accepts only a root that is absent, empty, or already holds a valid `.delta-install.json`. Phase 2's fact writer now shares it. Verified against this host's unrelated **native** `C:\DELTA`: the run stops with exit 7 and that directory is byte-for-byte unchanged.
+- **`schemaVersion` in the state file is reserved for the file format.** Phase 3 first wrote the *database* schema version into it, which made the state file unreadable and would have made the installer refuse its own root on the next run. Fixed at both ends: the fact is now `deltaSchemaVersion`, and `Write-DeltaInstallState` rejects a caller-supplied `schemaVersion`.
+- **Template/artefact split.** Templates are tracked; `.env`, `docker-compose.yml` and `nginx\conf.d\delta.conf` are generated per installation and gitignored. The compose template needs no installer-side substitution — everything that varies is a `${VAR}` Compose interpolates from `.env`, which is what makes the generated file reproducible from `.env` + template.
+- **`.env` generation preserves everything it does not own**: comments, ordering and hand edits survive, `__GENERATE__` placeholders are filled once, and secrets are never regenerated. The previous `.env` is backed up (ACL-hardened) before each rewrite.
+- **The volume is named explicitly** (`name: ${PGDATA_VOLUME}`, default `delta_pgdata`) rather than taking Compose's project prefix, so the volume in `docker volume ls` is the one recorded in `.delta-install.json`. It also gives an isolated test installation a way to use its own volume without editing templates.
+- **Every Compose call carries `--project-name`, `--project-directory`, `--file` and `--env-file`.** On a host running other Compose projects that scoping is what makes the operations safe; nothing in this phase can reach another project's resources.
+- **Migration verification requires three independent things**: a branch message in the log, no `psql:`/`ERROR:`/`FATAL:` lines, and a readable `dts_system_info.version_no`. Container health is explicitly not accepted as evidence.
+- **Persistent-data precheck fires on evidence, not on `state = installed`** — it triggers as soon as `.delta-install.json` records a `pgDataVolume`, which is the point from which data can go missing.
+- `-HttpPort` is a plain override for standing an isolated installation up on a busy host. The template default stays 80; intelligent resolution is Phase 4's.
+- NGINX: `error_log /dev/stderr` at http level plus `access_log` to the bind-mounted file; `client_max_body_size 64m`; `proxy_pass http://delta:3000`; the reference installer's proxy headers verbatim plus `X-Real-IP` and `proxy_read_timeout 300s`; `server_name _` until Phase 4 supplies a hostname.
+
+**Validation observations** (all physical unless marked)
+
+- Clean install on `C:\DELTA-docker-test` (port 18080): `docker compose config` validates; db healthy in **7 s**, delta in **13 s**, nginx in **7 s**; `GET /` = **200**, and `/en/admin/login`, `/en/user/login`, `/admin/login` all 200.
+- **PostgreSQL 17.5, PostGIS 3.5.2**; extensions after the schema load: `fuzzystrmatch, pgcrypto, plpgsql, postgis, postgis_tiger_geocoder, postgis_topology`. **39 tables** in `public`, `dts_system_info.version_no = 0.2.3`, DELTA's own `division.geom` / `division.bbox` geometry columns present.
+- Published ports on **nginx only** (`0.0.0.0:18080->80`); db and delta expose 5432/3000 internally with no host binding. Images pinned: DELTA to `@sha256:aa180b0d…`, db and nginx digests recorded in state.
+- **Persistence:** a marker row in a separate schema and a file in `uploads\` both survived `docker compose down` (no `-v`) followed by a full rerun; `delta_pgdata` persisted; the rerun took the **upgrade** branch, as the gate requires.
+- **Rerun idempotency:** third consecutive run on the live stack recreated nothing (all services stayed up), regenerated the artefacts, kept all four secret values byte-identical, and still returned 200.
+- **Injected migration failure** (isolated project `delta-inject`, own volume, removed afterwards): two tables created in `public` before first start pushed a virgin database down the upgrade path. The container reported **healthy in 7 s** while `psql` emitted 10 error lines; verification caught it, printed the errors verbatim, **did not start NGINX**, and exited **8**.
+- **Empty-data trap:** a root whose state file names a volume that does not exist stops before pulling or starting anything, exit 7, no containers created.
+- **Unrelated resources unchanged:** containers `deltaprobe-*` and `apc-2026`, networks `deltaprobe_default`/`proxy`, all images, WSL distributions and the Docker context are identical to the pre-Phase-3 snapshot. Only `delta_default`, `delta_pgdata` and the three `delta-*` containers were added.
+- Phase 1 (101) and Phase 2 (99) suites still pass. No secret value appears in any transcript; the fresh transcript has zero matches for `SESSION_SECRET|PASSWORD|postgresql://`.
+
+**For Phase 4**
+
+- A **running `delta` project is intentionally left up** on `C:\DELTA-docker-test`, publishing **18080**, with volume `delta_pgdata` — Phase 4 needs a live project to test its hardest branch, "the port's owner is our own stack".
+- `HTTP_PORT` is already persisted in `.env` and `httpPort`/`tlsEnabled` in `.delta-install.json`; Phase 4 replaces the two-line `PUBLIC_URL` construction in `New-DeltaEnvironmentFile` with its single shared URL helper, and adds the HTTPS port mapping to the compose template and the TLS block to the NGINX template.
+- The default administrator has **not** been reset — the stack must not be exposed beyond this machine until Phase 5 does that.
+
 ---
 
 ### Phase 4 — Intelligent Ports & HTTPS / Certificates
