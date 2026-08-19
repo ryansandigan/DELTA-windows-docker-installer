@@ -190,7 +190,9 @@ function New-DeltaEnvironmentFile {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$ScriptRoot,
-        [Parameter(Mandatory)][object]$Network
+        [Parameter(Mandatory)][object]$Network,
+        [string]$ComposeProject,
+        [string]$PgDataVolume
     )
 
     Write-Step 'Generating configuration'
@@ -262,12 +264,28 @@ function New-DeltaEnvironmentFile {
     $port      = "$($Network.HttpPort)"
     $publicUrl = $Network.PublicUrl
 
-    $values['COMPOSE_PROJECT_NAME'] = & $resolve 'COMPOSE_PROJECT_NAME' $Script:DeltaComposeProjectDefault
+    # The project name and the volume name identify a live installation's
+    # containers and its data, so they get their own precedence rule.
+    #
+    # On a first run a supplied name wins outright: the template has just been
+    # copied into place, so the value sitting in .env is the template's default
+    # rather than anybody's decision, and letting it win means a second
+    # installation silently adopts the first one's project and data volume.
+    # Measured the hard way - a fresh install on this host took over the
+    # existing project's containers and then failed authentication against its
+    # already-initialised cluster.
+    #
+    # On a rerun the existing value always wins, even against a parameter: by
+    # then it is the identity of a running installation, not a default.
+    $projectName = if ($isFirstRun -and $ComposeProject) { $ComposeProject } else { & $resolve 'COMPOSE_PROJECT_NAME' $(if ($ComposeProject) { $ComposeProject } else { $Script:DeltaComposeProjectDefault }) }
+    $volumeName  = if ($isFirstRun -and $PgDataVolume)   { $PgDataVolume }   else { & $resolve 'PGDATA_VOLUME'        $(if ($PgDataVolume)   { $PgDataVolume }   else { 'delta_pgdata' }) }
+
+    $values['COMPOSE_PROJECT_NAME'] = $projectName
     $values['DELTA_IMAGE']          = & $resolve 'DELTA_IMAGE'     'ghcr.io/preventionweb/delta-country:prod-latest'
     $values['DELTA_IMAGE_TAG']      = & $resolve 'DELTA_IMAGE_TAG' 'prod-latest'
     $values['DB_IMAGE']             = & $resolve 'DB_IMAGE'        'postgis/postgis:17-3.5'
     $values['NGINX_IMAGE']          = & $resolve 'NGINX_IMAGE'     'nginx:1.29-alpine'
-    $values['PGDATA_VOLUME']        = & $resolve 'PGDATA_VOLUME'   'delta_pgdata'
+    $values['PGDATA_VOLUME']        = $volumeName
     $values['HTTP_PORT']            = $port
     $values['HTTPS_PORT']           = "$($Network.HttpsPort)"
     $values['TLS_ENABLED']          = if ($Network.TlsEnabled) { 'true' } else { 'false' }
@@ -437,6 +455,40 @@ function Test-DeltaComposeConfiguration {
 
     Write-Detail 'docker compose config validates.'
     return [PSCustomObject]@{ Succeeded = $true; Rendered = $capture.StdOut; Reason = $null }
+}
+
+function Test-DeltaComposeProjectConflict {
+    <#
+      Whether containers already exist under this project name that were
+      created from a different compose file - that is, whether this project
+      name is already another installation's identity.
+
+      Containers this installation created are recognised by their
+      com.docker.compose.project.config_files label pointing at this
+      installation's own compose file.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ProjectName
+    )
+
+    $composeFile = Join-Path -Path $InstallRoot -ChildPath 'docker-compose.yml'
+    $result = [PSCustomObject]@{ HasConflict = $false; Reason = $null; Containers = @() }
+
+    $foreign = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($service in (Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $ProjectName)) {
+        if (-not $service.Name) { continue }
+        if (-not (Test-DeltaContainerFromInstallation -ContainerName $service.Name -ComposeFile $composeFile)) {
+            $null = $foreign.Add($service.Name)
+        }
+    }
+
+    if ($foreign.Count -gt 0) {
+        $result.HasConflict = $true
+        $result.Containers = $foreign.ToArray()
+        $result.Reason = "Compose project '$ProjectName' already contains container(s) $($foreign -join ', ') created from a different compose file. This installation would recreate them against its own configuration."
+    }
+    return $result
 }
 
 function Get-DeltaComposeServiceStatus {
@@ -1038,7 +1090,8 @@ function Start-DeltaStack {
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][object]$Configuration
+        [Parameter(Mandatory)][object]$Configuration,
+        [scriptblock]$SecurityBootstrap
     )
 
     $result = [PSCustomObject]@{
@@ -1047,6 +1100,7 @@ function Start-DeltaStack {
         Reason    = $null
         Migration = $null
         Database  = $null
+        Bootstrap = $null
         Http      = $null
         Redirect  = $null
     }
@@ -1114,6 +1168,29 @@ function Start-DeltaStack {
         Write-Detail 'exactly as it is so it can be inspected or restored.'
         $result.Reason = 'Database initialisation verification failed.'
         return $result
+    }
+
+    # --- security bootstrap ----------------------------------------------
+    # This runs between "DELTA is healthy" and "NGINX publishes host ports",
+    # and the ordering is the point: the schema seeds an administrator whose
+    # bcrypt hash is published in a public image, so the installation must
+    # never be externally reachable while that credential still works. Putting
+    # the hook here rather than in the caller means the ordering cannot be got
+    # wrong by a future caller that forgets it.
+    if ($SecurityBootstrap) {
+        $result.Stage = 'bootstrap'
+        $result.Bootstrap = & $SecurityBootstrap
+        if (-not $result.Bootstrap -or -not $result.Bootstrap.Succeeded) {
+            Write-DeltaFailure ''
+            Write-DeltaFailure 'The administrator account could not be secured.'
+            if ($result.Bootstrap -and $result.Bootstrap.Reason) { Write-Detail $result.Bootstrap.Reason }
+            Write-Detail ''
+            Write-Detail 'NGINX has deliberately NOT been started, so the application is not reachable from'
+            Write-Detail 'this machine or any other. The database and its data are untouched. Resolve the'
+            Write-Detail 'problem above and run this installer again - it will resume from here.'
+            $result.Reason = 'The administrator security bootstrap did not succeed.'
+            return $result
+        }
     }
 
     # --- nginx ------------------------------------------------------------
@@ -1207,6 +1284,8 @@ function Invoke-DeltaStackStage {
         [string]$TlsMode,
         [string]$CertificatePath,
         [string]$CertificateKeyPath,
+        [string]$ComposeProject,
+        [string]$PgDataVolume,
         [bool]$AllowPrompt = $true,
         [System.Collections.IDictionary]$PendingFacts,
         [object]$Runtime
@@ -1219,6 +1298,8 @@ function Invoke-DeltaStackStage {
         Network       = $null
         Pins          = $null
         Start         = $null
+        Bootstrap     = $null
+        Firewall      = $null
     }
 
     # --- installation root ------------------------------------------------
@@ -1242,6 +1323,7 @@ function Invoke-DeltaStackStage {
     # blocks and the published ports all derive from these answers.
     $envPath = Join-Path -Path $InstallRoot -ChildPath '.env'
     $projectName = Get-DeltaEnvValue -Path $envPath -Key 'COMPOSE_PROJECT_NAME'
+    if (-not $projectName -and $ComposeProject) { $projectName = $ComposeProject }
     if (-not $projectName) { $projectName = $Script:DeltaComposeProjectDefault }
     $openSslImage = Get-DeltaEnvValue -Path $envPath -Key 'DB_IMAGE'
     if (-not $openSslImage) { $openSslImage = 'postgis/postgis:17-3.5' }
@@ -1259,7 +1341,8 @@ function Invoke-DeltaStackStage {
     }
 
     # --- configuration ----------------------------------------------------
-    $configuration = New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Network $network
+    $configuration = New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Network $network `
+        -ComposeProject $ComposeProject -PgDataVolume $PgDataVolume
     $result.Configuration = $configuration
 
     $null = New-DeltaComposeFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -TlsEnabled ([bool]$network.TlsEnabled)
@@ -1268,6 +1351,25 @@ function Invoke-DeltaStackStage {
     $config = Test-DeltaComposeConfiguration -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName
     if (-not $config.Succeeded) {
         $result.Reason = 'The generated Compose file is not valid.'
+        return $result
+    }
+
+    # --- is this project name already somebody else's? --------------------
+    # A Compose project name is an identity. If containers already carry it but
+    # were created from a different compose file, continuing would recreate
+    # another installation's containers against this configuration and point
+    # its database container at a volume initialised with different
+    # credentials. Observed exactly that during Phase 5 development, which is
+    # why this check exists.
+    $foreign = Test-DeltaComposeProjectConflict -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName
+    if ($foreign.HasConflict) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'That Compose project name already belongs to another installation.'
+        Write-Detail $foreign.Reason
+        Write-Detail ''
+        Write-Detail 'Nothing was started. Give this installation its own project name and data volume,'
+        Write-Detail 'for example:  .\setup.ps1 -InstallRoot <root> -ComposeProject <name> -PgDataVolume <name>'
+        $result.Reason = $foreign.Reason
         return $result
     }
 
@@ -1320,18 +1422,58 @@ function Invoke-DeltaStackStage {
     # from the file that Compose will actually read.
     $configuration.DeltaImage = $result.Pins.DeltaImage
 
-    # --- start ------------------------------------------------------------
-    $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration
+    # --- start, with the security bootstrap wired into the right place -----
+    # The administrator reset runs once per installation. Its completion is
+    # recorded in the state file - a non-secret fact, never the credential -
+    # so an ordinary rerun of a secured installation does not silently replace
+    # a credential the operator is already using.
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $alreadyBootstrapped = $false
+    if ($state.Exists -and $state.IsValid -and (@($state.Data.PSObject.Properties.Name) -contains 'adminBootstrap')) {
+        $alreadyBootstrapped = [bool]$state.Data.adminBootstrap.completed
+    }
+
+    $bootstrap = $null
+    $bootstrapBlock = $null
+    if (-not $alreadyBootstrapped) {
+        $bootstrapBlock = {
+            $script:DeltaBootstrapResult = Invoke-DeltaAdminPasswordReset `
+                -InstallRoot $InstallRoot -Configuration $configuration -Automatic -AllowPrompt $AllowPrompt
+            $script:DeltaBootstrapResult
+        }.GetNewClosure()
+    }
+
+    $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration -SecurityBootstrap $bootstrapBlock
 
     if (-not $result.Start.Succeeded) {
         $result.Reason = $result.Start.Reason
-        if ($result.Start.Stage -eq 'migration') { $result.Outcome = 'migration' }
+        if ($result.Start.Stage -eq 'migration')  { $result.Outcome = 'migration' }
+        if ($result.Start.Stage -eq 'bootstrap')  { $result.Outcome = 'bootstrap' }
         return $result
     }
 
+    $bootstrap = $result.Start.Bootstrap
+    $result.Bootstrap = $bootstrap
+    if ($alreadyBootstrapped) {
+        Write-Detail 'The administrator account was secured by an earlier run; it is left as it is.'
+    }
+
+    # --- firewall ---------------------------------------------------------
+    # Only the ports this installation actually publishes, and a failure here
+    # warns rather than failing an installation that is otherwise complete.
+    $result.Firewall = Invoke-DeltaFirewallConfiguration -ProjectName $configuration.ProjectName `
+        -HttpPort ([int]$configuration.HttpPort) `
+        -HttpsPort ([int]$configuration.HttpsPort) -TlsEnabled ([bool]$network.TlsEnabled)
+
     # --- record what is running -------------------------------------------
+    # Everything mandatory has now succeeded - the schema is verified, the
+    # administrator credential is no longer the published default, and the
+    # stack answered over HTTP - so this is the point at which the
+    # installation is registered as complete. Anything earlier would have
+    # marked an installation "installed" while it was still insecure.
     $stateFacts = [ordered]@{
-        state          = 'partial'
+        state          = 'installed'
+        installedAt    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         installRoot    = $InstallRoot
         composeProject = $configuration.ProjectName
         deltaImage     = $configuration.DeltaImage
@@ -1358,6 +1500,20 @@ function Invoke-DeltaStackStage {
         # makes the file unreadable to the installer that wrote it.
         deltaSchemaVersion = $result.Start.Migration.SchemaVersion
     }
+
+    # Proof that the security bootstrap ran, and nothing more: when it
+    # happened, which account, and how the credential was chosen. Never the
+    # credential itself. This is what a rerun reads to know it must not
+    # replace a credential the operator is already using.
+    if ($bootstrap -and $bootstrap.Succeeded) {
+        $stateFacts['adminBootstrap'] = [ordered]@{
+            completed = $true
+            at        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            email     = $bootstrap.Email
+            method    = $bootstrap.Method
+        }
+    }
+
     $null = Write-DeltaInstallState -InstallRoot $InstallRoot -Properties $stateFacts
 
     $result.Outcome = 'ready'

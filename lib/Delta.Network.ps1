@@ -705,6 +705,185 @@ function Invoke-DeltaNginxReload {
 }
 
 # ---------------------------------------------------------------------------
+# Windows Firewall (A§24: rules only for the ports actually published)
+#
+# Two rules at most, named stably so they can be found and updated rather than
+# duplicated, and grouped so this installer can tell its own rules from
+# everybody else's. Nothing here touches a rule outside that group, and nothing
+# here disables a firewall profile.
+# ---------------------------------------------------------------------------
+
+$Script:DeltaFirewallGroup = 'DELTA (Docker)'
+
+function Get-DeltaFirewallRuleName {
+    <#
+      The rule name for one endpoint of one installation.
+
+      The Compose project name is part of it deliberately: two installations on
+      one machine publish different ports, and a globally-named rule would mean
+      the second installation silently repointing the first one's rule at its
+      own port. Measured during Phase 5 development, when exactly that
+      happened.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][ValidateSet('HTTP', 'HTTPS')][string]$Endpoint
+    )
+    # No brackets in the name: -DisplayName is matched as a wildcard pattern,
+    # so "[delta5]" would be read as a character class and never match the rule
+    # it names. Measured - it produced duplicate rules on every run.
+    return "DELTA (Docker) - $ProjectName - $Endpoint"
+}
+
+function Get-DeltaOwnedFirewallRule {
+    <#
+      Finds one of this installer's rules by exact display name.
+
+      The lookup is by group, then compared in PowerShell, because
+      -DisplayName is a wildcard filter: any project name containing a
+      wildcard metacharacter would silently fail to match its own rule.
+    #>
+    param([Parameter(Mandatory)][string]$DisplayName)
+
+    return @(Get-NetFirewallRule -Group $Script:DeltaFirewallGroup -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq $DisplayName })
+}
+
+function Set-DeltaFirewallRule {
+    <#
+      Ensures exactly one inbound allow rule exists for one TCP port,
+      idempotently.
+
+      An existing rule of ours is removed and recreated rather than edited.
+      Set-NetFirewallRule treats -Group as both a selector and a settable
+      property, so editing in place hits a parameter-set ambiguity ("Parameter
+      set cannot be resolved") - measured. Remove-and-recreate is unambiguous,
+      leaves exactly the intended rule, and only ever touches a rule that
+      carries this installer's own name and group.
+
+      Never fatal. A host where policy forbids local firewall rules still has a
+      working installation - it just is not reachable from other machines yet,
+      which is something to tell the operator, not a reason to fail an install
+      that otherwise succeeded (A§13).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $result = [PSCustomObject]@{ DisplayName = $DisplayName; Port = $Port; Succeeded = $false; Action = 'created'; Error = $null }
+
+    try {
+        # @(...) at the call site, not only inside the function: `return @(x)`
+        # unrolls a single-element array back to a scalar, and a lone
+        # CimInstance has no .Count at all - so the existing rule went
+        # unnoticed and every run added another duplicate. Measured.
+        $existing = @(Get-DeltaOwnedFirewallRule -DisplayName $DisplayName)
+        if ($existing.Count -gt 0) {
+            $existing | Remove-NetFirewallRule -ErrorAction Stop
+            $result.Action = 'replaced'
+        }
+
+        $null = New-NetFirewallRule -DisplayName $DisplayName -Group $Script:DeltaFirewallGroup `
+            -Description $Description -Direction Inbound -Action Allow -Enabled True `
+            -Protocol TCP -LocalPort $Port -Profile Any -ErrorAction Stop
+        $result.Succeeded = $true
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Remove-DeltaFirewallRule {
+    <#
+      Removes one of this installer's own rules by its stable name - used only
+      to retire the HTTPS rule when an installation stops serving HTTPS. It
+      never removes anything it did not create: the name is one of the two
+      constants above, and the rule must carry this installer's group.
+    #>
+    param([Parameter(Mandatory)][string]$DisplayName)
+
+    try {
+        $existing = @(Get-DeltaOwnedFirewallRule -DisplayName $DisplayName)
+        if ($existing.Count -eq 0) { return $false }
+        $existing | Remove-NetFirewallRule -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-DeltaFirewallConfiguration {
+    <#
+      Opens exactly the ports this installation publishes, and nothing else.
+
+      DELTA's 3000 and PostgreSQL's 5432 are never opened: they are not
+      published to Windows at all, so a rule for them would be a hole into
+      nothing. The HTTPS rule exists only while TLS is enabled, and is retired
+      when it is not.
+
+      Failure warns and names the port that could not be opened. The install
+      continues.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][int]$HttpPort,
+        [int]$HttpsPort,
+        [bool]$TlsEnabled = $false
+    )
+
+    Write-Step 'Configuring Windows Firewall'
+
+    $applied = New-Object 'System.Collections.Generic.List[object]'
+    $failures = New-Object 'System.Collections.Generic.List[object]'
+
+    $httpRule  = Get-DeltaFirewallRuleName -ProjectName $ProjectName -Endpoint 'HTTP'
+    $httpsRule = Get-DeltaFirewallRuleName -ProjectName $ProjectName -Endpoint 'HTTPS'
+
+    $http = Set-DeltaFirewallRule -DisplayName $httpRule -Port $HttpPort `
+        -Description "Inbound HTTP to the DELTA reverse proxy on port $HttpPort. Created by the DELTA Docker installer."
+    if ($http.Succeeded) {
+        $null = $applied.Add($http)
+        Write-Detail "[ ok ]     $httpRule $($http.Action) for TCP $HttpPort"
+    }
+    else {
+        $null = $failures.Add($http)
+    }
+
+    if ($TlsEnabled -and $HttpsPort -gt 0) {
+        $https = Set-DeltaFirewallRule -DisplayName $httpsRule -Port $HttpsPort `
+            -Description "Inbound HTTPS to the DELTA reverse proxy on port $HttpsPort. Created by the DELTA Docker installer."
+        if ($https.Succeeded) {
+            $null = $applied.Add($https)
+            Write-Detail "[ ok ]     $httpsRule $($https.Action) for TCP $HttpsPort"
+        }
+        else {
+            $null = $failures.Add($https)
+        }
+    }
+    else {
+        if (Remove-DeltaFirewallRule -DisplayName $httpsRule) {
+            Write-Detail "Removed $httpsRule - this installation does not serve HTTPS."
+        }
+    }
+
+    foreach ($failure in $failures) {
+        Write-DeltaWarning "Could not open TCP $($failure.Port) in Windows Firewall ($($failure.DisplayName)): $($failure.Error)"
+        Write-DeltaWarning "DELTA is installed and works on this machine, but other machines will not reach it on port $($failure.Port) until that port is allowed."
+    }
+
+    return [PSCustomObject]@{
+        Succeeded = ($failures.Count -eq 0)
+        Applied   = $applied.ToArray()
+        Failures  = $failures.ToArray()
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Stage orchestration
 # ---------------------------------------------------------------------------
 
@@ -757,7 +936,10 @@ function Invoke-DeltaNetworkStage {
         [int]$HttpPort,
         [int]$HttpsPort,
         [string]$HostName,
-        [ValidateSet('none', 'supplied', 'self-signed')][string]$TlsMode,
+        # The empty string is in the set on purpose: a caller that simply
+        # forwards an unsupplied -TlsMode passes '', and that has to mean
+        # "decide from .env or ask", not "invalid argument".
+        [ValidateSet('none', 'supplied', 'self-signed', '')][string]$TlsMode,
         [string]$CertificatePath,
         [string]$CertificateKeyPath,
         [bool]$AllowPrompt = $true

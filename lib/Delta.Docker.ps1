@@ -102,7 +102,8 @@ function Invoke-DeltaProcessCapture {
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [string[]]$Arguments = @(),
-        [int]$TimeoutSeconds = 120
+        [int]$TimeoutSeconds = 120,
+        [AllowNull()][string]$StandardInput
     )
 
     $result = [PSCustomObject]@{
@@ -123,6 +124,12 @@ function Invoke-DeltaProcessCapture {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError  = $true
     $startInfo.Arguments              = ConvertTo-DeltaCommandLine -Arguments $Arguments
+    if ($PSBoundParameters.ContainsKey('StandardInput')) {
+        # Used to feed SQL to `psql -f -`, which is how a script containing a
+        # \getenv meta-command reaches psql without being written to a file
+        # anywhere or passed as an argument.
+        $startInfo.RedirectStandardInput = $true
+    }
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -139,6 +146,13 @@ function Invoke-DeltaProcessCapture {
     try {
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if ($PSBoundParameters.ContainsKey('StandardInput')) {
+            # Written after the readers are attached and closed immediately, so
+            # the child sees EOF rather than waiting for more input.
+            if ($StandardInput) { $process.StandardInput.Write($StandardInput) }
+            $process.StandardInput.Close()
+        }
 
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $result.TimedOut = $true
@@ -168,7 +182,8 @@ function Invoke-DeltaDockerCommand {
     #>
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
-        [int]$TimeoutSeconds = 120
+        [int]$TimeoutSeconds = 120,
+        [AllowNull()][string]$StandardInput
     )
 
     $docker = Get-Command -Name 'docker' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -180,6 +195,9 @@ function Invoke-DeltaDockerCommand {
         }
     }
 
+    if ($PSBoundParameters.ContainsKey('StandardInput')) {
+        return (Invoke-DeltaProcessCapture -FilePath $docker.Source -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds -StandardInput $StandardInput)
+    }
     return (Invoke-DeltaProcessCapture -FilePath $docker.Source -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds)
 }
 

@@ -61,6 +61,18 @@
     including that the key actually matches the certificate - before anything
     is written into the live configuration.
 
+.PARAMETER ComposeProject
+.PARAMETER PgDataVolume
+    Names for this installation's Compose project and PostgreSQL volume,
+    used only when creating a new installation. They identify a live
+    installation's containers and its data, so an existing .env always wins:
+    a second installation on one machine needs its own names, and reusing
+    another installation's would point this one at that one's stack.
+
+.PARAMETER NonInteractive
+    Never prompt. Ports and TLS must then be fully specified, and the
+    administrator credential is generated rather than typed.
+
 .NOTES
     Exit codes:
       0  success
@@ -72,6 +84,7 @@
       6  the operator declined a required disclosure
       7  the stack could not be generated or started
       8  the database initialisation could not be verified
+      9  the administrator credential could not be secured; DELTA was not published
 #>
 [CmdletBinding()]
 param(
@@ -85,6 +98,8 @@ param(
     [ValidateSet('none', 'supplied', 'self-signed')][string]$TlsMode,
     [string]$CertificatePath,
     [string]$CertificateKeyPath,
+    [string]$ComposeProject,
+    [string]$PgDataVolume,
     [switch]$NonInteractive
 )
 
@@ -96,7 +111,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 
-foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1', 'Delta.Network.ps1')) {
+foreach ($library in @('Delta.Common.ps1', 'Delta.Config.ps1', 'Delta.Docker.ps1', 'Delta.Stack.ps1', 'Delta.Network.ps1', 'Delta.Manage.ps1')) {
     $libraryPath = Join-Path -Path $Script:DeltaScriptRoot -ChildPath "lib\$library"
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         Write-Host "Required library not found: $libraryPath" -ForegroundColor Red
@@ -266,6 +281,120 @@ function Show-DeltaRuntimeOutcome {
     }
 }
 
+function Show-DeltaCompletionSummary {
+    <#
+      What the operator sees when an installation succeeds: where DELTA is,
+      how to reach it, what was done to secure it, what to tell the antivirus,
+      and - stated exactly as it is today - what happens after a restart.
+
+      Every URL comes from Get-DeltaPublicUrl. The generated administrator
+      credential is shown here and only here, once, and is never written to the
+      transcript, .env or the state file.
+    #>
+    param([Parameter(Mandatory)][object]$Stack)
+
+    $network = $Stack.Network
+    $root = $Stack.Configuration.Path | Split-Path -Parent
+    $scheme = if ($network.TlsEnabled) { 'https' } else { 'http' }
+    $port = if ($network.TlsEnabled) { [int]$network.HttpsPort } else { [int]$network.HttpPort }
+    $baseUrl = Get-DeltaPublicUrl -Scheme $scheme -HostName $network.HostName -Port $port
+
+    Show-Section -Title 'DELTA is installed' -Subtitle $baseUrl
+
+    Write-Host 'Access'
+    Write-Detail "Application      $baseUrl"
+    Write-Detail "Administrator    $baseUrl/en/admin/login"
+    Write-Detail "Users            $baseUrl/en/user/login"
+    Write-Detail ''
+
+    Write-Host 'Configuration'
+    Write-Detail "Installed at     $root"
+    Write-Detail "Hostname         $($network.HostName)"
+    if ($network.TlsEnabled) {
+        Write-Detail "HTTPS            port $($network.HttpsPort) ($($network.TlsMode) certificate)"
+        Write-Detail "HTTP             port $($network.HttpPort), redirects to HTTPS"
+    }
+    else {
+        Write-Detail "HTTP             port $($network.HttpPort)"
+        Write-Detail 'HTTPS            not configured'
+    }
+    Write-Detail ''
+
+    Write-Host 'Security'
+    if ($Stack.Bootstrap -and $Stack.Bootstrap.Succeeded) {
+        Write-Detail "Administrator    $($Stack.Bootstrap.Email) - credential replaced and verified"
+        Write-Detail 'The credential published in the DELTA image no longer works on this installation.'
+    }
+    else {
+        Write-Detail 'Administrator    secured by an earlier run of this installer'
+    }
+    Write-Detail 'Session secret   generated for this installation only'
+    Write-Detail 'Database         reachable only from inside the Compose network; no host port'
+
+    if ($Stack.Firewall) {
+        if ($Stack.Firewall.Succeeded) {
+            $ports = ($Stack.Firewall.Applied | ForEach-Object { $_.Port }) -join ', '
+            Write-Detail "Firewall         inbound TCP $ports allowed"
+        }
+        else {
+            Write-Detail 'Firewall         see the warning above - other machines cannot reach DELTA yet'
+        }
+    }
+
+    if ($network.TlsEnabled -and $network.TlsMode -eq 'self-signed') {
+        Write-Detail ''
+        Write-DeltaWarning 'The certificate is self-signed, so browsers will warn until it is trusted or replaced.'
+    }
+    if (-not $network.TlsEnabled) {
+        Write-Detail ''
+        Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only. DELTA marks its session cookies'
+        Write-DeltaWarning 'Secure, so users reaching this server by hostname will not stay signed in.'
+    }
+
+    # Shown once, here, and nowhere else - not in the transcript, not in .env,
+    # not in the state file.
+    if ($Stack.Bootstrap -and $Stack.Bootstrap.Succeeded -and $Stack.Bootstrap.WasGenerated) {
+        $plain = ConvertTo-DeltaPlainText -SecureString $Stack.Bootstrap.Password
+        Write-Host ''
+        Write-Host ('-' * 72)
+        Write-Host ''
+        Write-Host '  ADMINISTRATOR CREDENTIAL - shown once, and not stored anywhere'
+        Write-Host ''
+        Write-Host "  Sign in at   $baseUrl/en/admin/login"
+        Write-Host "  Email        $($Stack.Bootstrap.Email)"
+        Write-Host "  Password     $plain" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  Record it now. This installer does not keep a copy, and nothing on this'
+        Write-Host '  machine can recover it - a lost credential is replaced, not retrieved.'
+        Write-Host ''
+        Write-Host ('-' * 72)
+        $plain = $null
+        Write-DeltaLogLine -Message 'The generated administrator credential was displayed to the operator (not logged).' -Level 'INFO'
+    }
+
+    Write-Host ''
+    Write-Host 'After a Windows restart'
+    Write-Detail 'DELTA returns when Docker Desktop is running. On this build that means signing in'
+    Write-Detail 'to Windows - Docker Desktop starts at interactive sign-in, so after an unattended'
+    Write-Detail 'restart DELTA stays down until somebody signs in. Automatic startup without a'
+    Write-Detail 'sign-in is not configured by this installer yet.'
+    Write-Detail 'Until then, running this installer again brings the stack back up.'
+
+    Write-Host ''
+    Write-Host 'Antivirus and backup software'
+    Write-Detail 'The database lives in a Docker-managed volume, out of reach of Windows-side'
+    Write-Detail 'scanners. What does sit on this disk, and what real-time scanning or a file-sync'
+    Write-Detail 'client can interfere with, is:'
+    Write-Detail "  $root\uploads"
+    Write-Detail "  $root\logs"
+    Write-Detail "  $root\backups"
+    Write-Detail 'Exclude those from real-time scanning if this machine runs an endpoint product,'
+    Write-Detail 'and keep the installation root out of any redirected or cloud-synced folder.'
+
+    Write-Host ''
+    return $Script:DeltaExitSuccess
+}
+
 function Show-DeltaStackOutcome {
     <#
       Reports what the stack stage did and returns the process exit code. A
@@ -274,33 +403,24 @@ function Show-DeltaStackOutcome {
     #>
     param([Parameter(Mandatory)][object]$Stack)
 
+    if ($Stack.Outcome -eq 'ready') {
+        return (Show-DeltaCompletionSummary -Stack $Stack)
+    }
+
     Write-Step 'Next steps'
 
     switch ($Stack.Outcome) {
-        'ready' {
-            Write-Success 'DELTA is running.'
+        'bootstrap' {
+            Write-DeltaFailure 'The installation stopped before publishing DELTA.'
             Write-Detail $Stack.Reason
             Write-Detail ''
-            Write-Detail "Application      $($Stack.Configuration.PublicUrl)"
-            Write-Detail "Administrator    $($Stack.Configuration.PublicUrl)/en/admin/login"
-            Write-Detail "Installation     $($Stack.Configuration.Path | Split-Path -Parent)"
+            Write-Detail 'This is deliberate. The database is initialised but its seeded administrator'
+            Write-Detail 'credential is published in the public DELTA image, so the application is not'
+            Write-Detail 'started on a host port until that credential has been replaced.'
             Write-Detail ''
-            if ($Stack.Network -and $Stack.Network.TlsEnabled) {
-                Write-Detail "HTTPS is enabled on port $($Stack.Network.HttpsPort); HTTP on $($Stack.Network.HttpPort) redirects to it."
-                if ($Stack.Network.TlsMode -eq 'self-signed') {
-                    Write-DeltaWarning 'The certificate is self-signed, so browsers will warn until it is trusted or replaced.'
-                }
-            }
-            else {
-                Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only. Session cookies are marked Secure,'
-                Write-DeltaWarning 'so users reaching this server by hostname over plain HTTP will not stay signed in.'
-            }
-            Write-Detail ''
-            Write-Detail 'Still to come: the administrator credential reset that closes the published'
-            Write-Detail 'default, firewall rules, unattended restart and the management menu. The default'
-            Write-Detail 'administrator has NOT been reset yet - do not expose this installation beyond'
-            Write-Detail 'this machine until it has.'
-            return $Script:DeltaExitSuccess
+            Write-Detail 'Nothing was deleted. Fix the problem above and run this installer again - it'
+            Write-Detail 'resumes from here and does not repeat what already succeeded.'
+            return $Script:DeltaExitSecurityBootstrapFailed
         }
         'migration' {
             Write-DeltaFailure 'The installation stopped after the database initialisation could not be verified.'
@@ -365,6 +485,8 @@ try {
                     -TlsMode $TlsMode `
                     -CertificatePath $CertificatePath `
                     -CertificateKeyPath $CertificateKeyPath `
+                    -ComposeProject $ComposeProject `
+                    -PgDataVolume $PgDataVolume `
                     -AllowPrompt (-not $NonInteractive)
 
                 $exitCode = Show-DeltaStackOutcome -Stack $stack

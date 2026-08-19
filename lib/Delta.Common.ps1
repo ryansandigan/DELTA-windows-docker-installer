@@ -40,6 +40,11 @@ $Script:DeltaExitOperatorDeclined   = 6
 # half-migrated, and the response is a restore, not a retry.
 $Script:DeltaExitStackFailed        = 7
 $Script:DeltaExitMigrationFailed    = 8
+# The install stopped before publishing DELTA because the seeded administrator
+# credential could not be replaced. Distinct from a generic stack failure: the
+# stack is fine, the security bootstrap is not, and nothing is externally
+# reachable.
+$Script:DeltaExitSecurityBootstrapFailed = 9
 
 # UTF-8 *without* a byte-order mark. Every file this installer writes that is
 # later read by a Linux container (.env above all) must not carry a BOM -
