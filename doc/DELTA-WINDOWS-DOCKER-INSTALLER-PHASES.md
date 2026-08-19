@@ -585,7 +585,15 @@ docker compose ps                                                  # published p
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-19 · Commit `2e3feea` · **Acceptance gate: PASS**, with one criterion proven at the database rather than over HTTP — see below.
+**Status: COMPLETE** · 2026-08-19 · Commits `2e3feea`, fix `42570b4` · **Acceptance gate: PASS**, with one criterion proven at the database rather than over HTTP — see below.
+
+> **Operator testing found a real defect after the phase was first marked complete.** A bare `.\setup.ps1` against the default root failed at the security bootstrap with *"The term 'Invoke-DeltaAdminPasswordReset' is not recognized"* — after the database was initialised and verified, and with the stack correctly still unpublished. Fixed in `42570b4`; the phase's functional contract was met and is re-proven, but the validation gap is recorded below because it matters more than the bug.
+
+**The defect, the fix, and why the tests missed it**
+
+- The bootstrap callback was built with `GetNewClosure()`, which rebinds a scriptblock to a new dynamic module — so what it can resolve depends on how the installer was loaded. It is now a plain scriptblock literal taking its inputs as arguments, which keeps the session state of the file it is written in.
+- `setup.ps1` now verifies after dot-sourcing that **each library defined the entry point it is loaded for**, and refuses to start otherwise, naming the file and the function, before anything on the machine is touched. That is the durable protection: whatever leaves a function undefined, it must not be discovered at the moment the published administrator credential is about to be replaced.
+- **Why automated validation missed it.** Every Phase 5 test loaded a complete, consistent library set from one working tree, and the seam tests passed a scriptblock written *in the test* — never the closure production used. Nothing exercised `setup.ps1` as a *package*. The regression suite now stages a copy with a gutted `Delta.Manage.ps1` and asserts the run is refused at startup with nothing created, and asserts `GetNewClosure` appears nowhere in the source.
 
 Delivered: `lib\Delta.Manage.ps1` (administrator reset primitive), firewall functions in `lib\Delta.Network.ps1`, the security-bootstrap hook and final state write in `lib\Delta.Stack.ps1`, the completion summary and exit code 9 in `setup.ps1`, `README.md`.
 
@@ -614,7 +622,7 @@ Delivered: `lib\Delta.Manage.ps1` (administrator reset primitive), firewall func
 
 **For Phase 6**
 
-- Retained fixture: `C:\DELTA-docker-test`, project `delta`, volume `delta_pgdata`, HTTP 18080 / HTTPS 18453→18443, **`state = installed`**, administrator secured, two firewall rules. It is now a complete registered installation, which is what a reboot test needs.
+- Retained fixture is now the **operator's real installation at `C:\DELTA`** — project `delta`, volume `delta_pgdata`, **HTTP only on port 80**, `state = installed`, administrator secured, one firewall rule (TCP 80), all three services healthy and serving 200. The earlier `C:\DELTA-docker-test` fixture was removed by the operator during their testing. Re-validated after the fix: rerun is idempotent, secrets and credential untouched, data intact (0.2.3, 39 tables).
 - The completion summary already tells the operator the truth about restarts — Docker Desktop starts at interactive sign-in, so DELTA does not return after an unattended reboot. **Phase 6 must replace that text with what it actually measures**, in `Show-DeltaCompletionSummary` in `setup.ps1`.
 - Nothing in Phase 5 configures startup: no scheduled task, no service, no `AutoStart` change.
 
