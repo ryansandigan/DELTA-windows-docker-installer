@@ -230,6 +230,33 @@ Select-String -Path .\logs\installer\*.log -Pattern 'SESSION_SECRET|PASSWORD|pos
 
 **Documentation update.** None. The assessment already covers this ground.
 
+#### Implementation status
+
+**Status: COMPLETE** · Completed 2026-08-19 · Commit `c075b52` · **Acceptance gate: PASS**
+
+Delivered: `setup.ps1`, `lib\Delta.Common.ps1`, `lib\Delta.Config.ps1`, `.gitignore`.
+
+**Implementation notes**
+
+- **Logging is a purpose-written redacting log, not `Start-Transcript`.** A PowerShell transcript captures raw console output and cannot be redacted, which A§24 forbids. Console output is *not* redacted (Phase 5 must show a generated password exactly once); the log file always is.
+- **Redaction replaces the whole match, key name included, and treats a bare key name as a match.** Two reasons: the acceptance grep forbids the key names themselves, and a `.env` line malformed enough to lose its `=` still carries a real secret on the right-hand side. Covers the keys A§24/Phase 1 name plus `PGPASSWORD`, any `postgres(ql)://` URI, and any literal registered through `Register-DeltaSecretValue` — which is how output the installer did not format itself gets covered in later phases.
+- **Phase 1 writes nothing under the installation root**, including its transcript, which goes to `<script root>\logs\installer\`. `Start-DeltaLog -Directory` takes the location as a parameter, so A§21.1's `C:\DELTA\logs\installer\` becomes the default once Phase 3 owns creating the root.
+- **`Get-DeltaInstallationState` performs no Docker interaction.** It classifies `none` / `partial` / `installed` from filesystem evidence and takes the two Docker-dependent classifications from an optional `-DockerStatus` (`unknown` | `unavailable` | `running` | `stopped`) supplied by the caller; `installed-stopped` and `docker-unavailable` are reachable only over an otherwise-`installed` installation. A§28's *installed-running*, *installed-unhealthy* and *data-missing* rows additionally need container-health and volume evidence and belong to Phases 3 and 7.
+- **`.env` writer** (new code — the reference installer has none): existing keys updated in place with their inline comments, untouched and unparseable lines kept verbatim, new keys appended, atomic replace, UTF-8 **without** BOM, existing newline style preserved, restrictive ACL re-applied after every write. A value containing both a single and a double quote is refused rather than escaped — `.env` has no escaping convention both PowerShell and Compose's parser honour, and a silently mangled password is worse than a refusal.
+- **`New-DeltaPassword` uses a `[A-Za-z0-9]` alphabet** (CSPRNG, rejection-sampled). `POSTGRES_PASSWORD` ends up inside `DATABASE_URL`, so a URL-safe alphabet removes a whole class of percent-encoding defect before Phase 3 assembles that string. `New-DeltaSecret` (base64, 48 bytes) is for `SESSION_SECRET`.
+- **Every `.ps1` is stored UTF-8 *with* BOM.** Windows PowerShell 5.1 decodes a BOM-less script as the ANSI code page, which turned `§` in an operator-facing message into mojibake at run time. Operator-visible strings are plain ASCII as well. `.env` and `.delta-install.json` remain BOM-less — Compose would otherwise read the BOM as part of the first key.
+- `setup.ps1` takes an `-InstallRoot` parameter (default `C:\DELTA`) so the `none` classification is exercisable on a host whose `C:\DELTA` is already occupied.
+
+**Validation observations**
+
+- 101 primitive assertions on Windows PowerShell 5.1 — `.env` round-trip (comments, key order, inline comments, quoting, newline style, no BOM, ACL), `.delta-install.json` round-trip (merge, invalid value refused, malformed/missing-field/future-schema all reported by field and never rewritten), secret generation, redaction including `DATABASE_URL`, all five Phase 1 states, path and port validation — **all pass**.
+- `setup.ps1`: elevated + absent root → `state=none`, exit 0; seeded partial root → `state=partial` with an evidence list, exit 0; non-elevated (`runas /trustlevel:0x20000`) → refusal, exit 2; UNC root → refusal naming the constraint, exit 3.
+- `Select-String -Path .\logs\installer\*.log -Pattern 'SESSION_SECRET|PASSWORD|postgresql://'` returns **nothing** across every transcript, including a run whose `.env` carried a deliberately seeded malformed `SESSION_SECRET` line — which appears in the transcript as `<redacted>`.
+
+**For Phase 2 and later**
+
+- The assessment host already carries an unrelated **native** DELTA installation at `C:\DELTA` (`build\`, `node_modules\`, `service\`, its own `.env`). Against the default root the classifier correctly reports `partial`. Later phases must not assume `C:\DELTA` is empty, and must not assume a populated `C:\DELTA` is theirs.
+
 ---
 
 ### Phase 2 — Windows Prerequisites & Docker Runtime
