@@ -327,6 +327,67 @@ function New-DeltaEnvironmentFile {
     }
 }
 
+function Get-DeltaStackConfiguration {
+    <#
+      Reconstructs the configuration object from an installation that already
+      exists, by reading .env - without generating, rewriting or regenerating
+      anything.
+
+      New-DeltaEnvironmentFile produces this shape as a by-product of writing
+      the file. Operations that only need to *act* on an installation - "start
+      DELTA", and the management operations after it - must not call that
+      function to obtain it: writing .env to find out what is in .env would
+      make reading the configuration a mutating act, on the one file that holds
+      every secret. So this reads, and returns the same shape.
+
+      Returns $null when there is no .env to read; the caller decides what an
+      unconfigured installation means.
+    #>
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $envPath = Join-Path -Path $InstallRoot -ChildPath '.env'
+    if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
+        return $null
+    }
+
+    $value = {
+        param($Key, $Default)
+        $read = Get-DeltaEnvValue -Path $envPath -Key $Key
+        if ($null -eq $read -or $read -eq '') { return $Default }
+        return $read
+    }
+
+    # Registered so that anything echoing them - a compose warning, a psql
+    # error - is redacted in the log, exactly as on the generation path.
+    foreach ($key in @('POSTGRES_PASSWORD', 'DELTA_DB_PASSWORD', 'SESSION_SECRET')) {
+        Register-DeltaSecretValue -Value (Get-DeltaEnvValue -Path $envPath -Key $key)
+    }
+
+    $httpPort  = 0
+    $httpsPort = 0
+    [void][int]::TryParse([string](& $value 'HTTP_PORT' '80'),   [ref]$httpPort)
+    [void][int]::TryParse([string](& $value 'HTTPS_PORT' '443'), [ref]$httpsPort)
+
+    return [PSCustomObject]@{
+        Path          = $envPath
+        ProjectName   = & $value 'COMPOSE_PROJECT_NAME' $Script:DeltaComposeProjectDefault
+        HttpPort      = $httpPort
+        HttpsPort     = $httpsPort
+        TlsEnabled    = ((& $value 'TLS_ENABLED' 'false') -eq 'true')
+        TlsMode       = & $value 'TLS_MODE' 'none'
+        HostName      = & $value 'DELTA_HOSTNAME' 'localhost'
+        PublicUrl     = & $value 'PUBLIC_URL' ''
+        PostgresUser  = & $value 'POSTGRES_USER' 'delta'
+        PostgresDb    = & $value 'POSTGRES_DB' 'delta'
+        PgDataVolume  = & $value 'PGDATA_VOLUME' 'delta_pgdata'
+        DeltaImage    = & $value 'DELTA_IMAGE' ''
+        DeltaImageTag = & $value 'DELTA_IMAGE_TAG' ''
+        DbImage       = & $value 'DB_IMAGE' 'postgis/postgis:17-3.5'
+        NginxImage    = & $value 'NGINX_IMAGE' 'nginx:1.29-alpine'
+        IsFirstRun    = $false
+    }
+}
+
 function New-DeltaComposeFile {
     <#
       Renders templates\docker-compose.yml.template into
@@ -455,6 +516,73 @@ function Test-DeltaComposeConfiguration {
 
     Write-Detail 'docker compose config validates.'
     return [PSCustomObject]@{ Succeeded = $true; Rendered = $capture.StdOut; Reason = $null }
+}
+
+function Test-DeltaComposeRestartPolicy {
+    <#
+      Reads the restart policy out of the rendered Compose model and confirms
+      every service carries the expected one.
+
+      It reads the model rather than the file: `docker compose config` is what
+      Compose itself will act on, after interpolation and after any override,
+      and it is the only artefact whose answer is not a guess about how the
+      template was rendered.
+
+      This verifies; it never sets. The policy belongs to
+      templates\docker-compose.yml.template, and a policy patched into the
+      generated file here would be silently lost the next time the file was
+      regenerated - which is exactly the failure mode that makes a reboot claim
+      untrue later (A§16.2).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [string]$Expected = 'unless-stopped'
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded = $false
+        Policy    = $Expected
+        Services  = @()
+        Reason    = $null
+    }
+
+    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('config', '--format', 'json') -TimeoutSeconds 120
+    if ($capture.ExitCode -ne 0 -or -not $capture.StdOut) {
+        $result.Reason = "The Compose model could not be rendered: $((($capture.StdErr + ' ' + $capture.StdOut)).Trim())"
+        return $result
+    }
+
+    $model = $null
+    try { $model = $capture.StdOut | ConvertFrom-Json }
+    catch {
+        $result.Reason = "The Compose model could not be parsed: $($_.Exception.Message)"
+        return $result
+    }
+
+    $services = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($property in $model.services.PSObject.Properties) {
+        $policy = $null
+        if (@($property.Value.PSObject.Properties.Name) -contains 'restart') { $policy = [string]$property.Value.restart }
+        $null = $services.Add([PSCustomObject]@{ Service = $property.Name; Restart = $policy })
+    }
+    $result.Services = $services.ToArray()
+
+    if ($result.Services.Count -eq 0) {
+        $result.Reason = 'The rendered Compose model declares no services.'
+        return $result
+    }
+
+    $wrong = @($result.Services | Where-Object { $_.Restart -ne $Expected })
+    if ($wrong.Count -gt 0) {
+        $result.Reason = "These services do not use restart: ${Expected} - " +
+            (($wrong | ForEach-Object { "$($_.Service)=$(if ($_.Restart) { $_.Restart } else { '(none)' })" }) -join ', ') +
+            ". Fix it in templates\docker-compose.yml.template and regenerate, not in the generated file."
+        return $result
+    }
+
+    $result.Succeeded = $true
+    return $result
 }
 
 function Test-DeltaComposeProjectConflict {
@@ -940,12 +1068,30 @@ function Test-DeltaMigrationOutcome {
 
     $logs = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('logs', '--no-color', 'delta') -TimeoutSeconds 120
     $logText = (($logs.StdOut + "`n" + $logs.StdErr))
+    $logLines = @($logText -split "`r?`n")
 
-    if ($logText -match [regex]::Escape($Script:DeltaNewDatabaseMarker)) { $result.Branch = 'initialise' }
-    elseif ($logText -match [regex]::Escape($Script:DeltaUpgradeDatabaseMarker)) { $result.Branch = 'upgrade' }
+    # `docker compose logs` returns everything the container has ever written,
+    # and the container re-runs its init/migration command on every start. So
+    # the question "which branch did it take" has to be asked of the *most
+    # recent* start, not of the whole file: a container that initialised a
+    # database once and has since been restarted a hundred times still carries
+    # that first "Initializing new database" line, and reading from the top
+    # would report it forever - and would also fail a perfectly good start
+    # because of an error line from a run that happened days ago. Phase 6 makes
+    # this routine: every reboot restarts the container.
+    $branchIndex = -1
+    for ($i = $logLines.Length - 1; $i -ge 0; $i--) {
+        if ($logLines[$i] -match [regex]::Escape($Script:DeltaNewDatabaseMarker)) {
+            $branchIndex = $i; $result.Branch = 'initialise'; break
+        }
+        if ($logLines[$i] -match [regex]::Escape($Script:DeltaUpgradeDatabaseMarker)) {
+            $branchIndex = $i; $result.Branch = 'upgrade'; break
+        }
+    }
 
-    $errorLines = @($logText -split "`r?`n" | Where-Object { $_ -match '(?i)^\s*(delta\S*\s*\|\s*)?(psql:|ERROR:|FATAL:|PANIC:)' })
-    $result.Errors = $errorLines
+    # Errors from the current start only, for the same reason.
+    $scanned = if ($branchIndex -ge 0) { $logLines[$branchIndex..($logLines.Length - 1)] } else { $logLines }
+    $result.Errors = @($scanned | Where-Object { $_ -match '(?i)^\s*(delta\S*\s*\|\s*)?(psql:|ERROR:|FATAL:|PANIC:)' })
 
     $version = Invoke-DeltaPsql -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -User $Configuration.PostgresUser -Database $Configuration.PostgresDb -Query 'select version_no from dts_system_info;' -TuplesOnly
     if ($version.ExitCode -eq 0 -and $version.StdOut) {
@@ -1303,6 +1449,7 @@ function Invoke-DeltaStackStage {
         Start         = $null
         Bootstrap     = $null
         Firewall      = $null
+        Startup       = $null
     }
 
     # --- installation root ------------------------------------------------
@@ -1531,6 +1678,16 @@ function Invoke-DeltaStackStage {
     }
 
     $null = Write-DeltaInstallState -InstallRoot $InstallRoot -Properties $stateFacts
+
+    # --- unattended startup ------------------------------------------------
+    # Last, and after the installation is registered: it configures what
+    # happens at the *next* boot, so it can neither help nor harm the
+    # installation that has just succeeded. The restart policy is verified here
+    # rather than inside the startup stage, so that the layer which owns
+    # Compose stays the only one that talks to it.
+    $restartPolicy = Test-DeltaComposeRestartPolicy -InstallRoot $InstallRoot -ProjectName $configuration.ProjectName
+    $result.Startup = Invoke-DeltaStartupConfiguration -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+        -ProjectName $configuration.ProjectName -RestartPolicy $restartPolicy
 
     $result.Outcome = 'ready'
     $result.Reason = "The stack is running and answered HTTP $($result.Start.Http.StatusCode) at $($configuration.PublicUrl)."

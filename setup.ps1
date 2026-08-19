@@ -307,6 +307,72 @@ function Show-DeltaRuntimeOutcome {
     }
 }
 
+function Show-DeltaRestartBehaviour {
+    <#
+      What actually happens after a Windows restart on THIS machine, stated at
+      the level of confidence the evidence supports and no higher (A§16.3
+      Layer 4).
+
+      There are exactly three things this can say, and which one it says is
+      decided by the state file, not by what was configured in the abstract:
+
+        - a mechanism is configured AND a real unattended restart has been
+          measured to bring DELTA back. Only then does this claim automatic
+          recovery.
+        - a mechanism is configured but no restart has confirmed it. It says
+          so, in those words. "Configured" is not "works".
+        - nothing is configured. It says DELTA stays down until somebody signs
+          in, because that is what will happen.
+
+      The wording matters more than it looks: an operator who reads "DELTA
+      starts automatically" and does not test it will find out during an
+      overnight patch reboot.
+    #>
+    param(
+        [object]$Startup,
+        [string]$ScriptRoot,
+        [string]$InstallRoot
+    )
+
+    $startupScript = Join-Path -Path $ScriptRoot -ChildPath 'start-delta.ps1'
+
+    if (-not $Startup -or -not $Startup.Succeeded) {
+        Write-Detail 'DELTA returns when Docker Desktop is running. Nothing on this machine starts Docker'
+        Write-Detail 'before somebody signs in to Windows, and unattended startup could not be configured,'
+        Write-Detail 'so after a restart that nobody signs in after, DELTA stays down.'
+        if ($Startup -and $Startup.Reason) { Write-Detail "Reason: $($Startup.Reason)" }
+        Write-Detail "To bring it back by hand:  .\start-delta.ps1 -InstallRoot $InstallRoot"
+        return
+    }
+
+    $mechanism = switch ($Startup.Mechanism) {
+        'startup-task' { "a scheduled task at Windows startup ($(if ($Startup.Task) { $Startup.Task.Name } else { 'DELTA startup task' }))" }
+        'vendor'       { "Docker's own startup mechanism on this host" }
+        default        { $Startup.Mechanism }
+    }
+
+    if ($Startup.BootTested) {
+        Write-Detail "DELTA starts automatically after a restart, with no sign-in, via $mechanism."
+        Write-Detail "Measured on this machine by a real unattended restart on $($Startup.BootTest.at)."
+        Write-Detail 'Recovery begins about a minute after boot and completes once Docker and the three'
+        Write-Detail 'containers are healthy.'
+    }
+    else {
+        Write-Detail "Unattended startup is CONFIGURED but NOT YET PROVEN on this machine."
+        Write-Detail "Mechanism: $mechanism."
+        Write-Detail 'It has not been demonstrated by a real restart here, so this installer will not tell'
+        Write-Detail 'you that DELTA comes back on its own. Test it the only way that counts: restart'
+        Write-Detail 'Windows, do NOT sign in, and request the URL above from another machine.'
+    }
+
+    Write-Detail ''
+    Write-Detail "Startup log       $InstallRoot\logs\installer\startup.log"
+    Write-Detail "Start by hand     .\start-delta.ps1 -InstallRoot $InstallRoot"
+    if (-not (Test-Path -LiteralPath $startupScript -PathType Leaf)) {
+        Write-DeltaWarning "The startup script is missing from $startupScript."
+    }
+}
+
 function Show-DeltaCompletionSummary {
     <#
       What the operator sees when an installation succeeds: where DELTA is,
@@ -400,11 +466,7 @@ function Show-DeltaCompletionSummary {
 
     Write-Host ''
     Write-Host 'After a Windows restart'
-    Write-Detail 'DELTA returns when Docker Desktop is running. On this build that means signing in'
-    Write-Detail 'to Windows - Docker Desktop starts at interactive sign-in, so after an unattended'
-    Write-Detail 'restart DELTA stays down until somebody signs in. Automatic startup without a'
-    Write-Detail 'sign-in is not configured by this installer yet.'
-    Write-Detail 'Until then, running this installer again brings the stack back up.'
+    Show-DeltaRestartBehaviour -Startup $Stack.Startup -ScriptRoot $Script:DeltaScriptRoot -InstallRoot $root
 
     Write-Host ''
     Write-Host 'Antivirus and backup software'

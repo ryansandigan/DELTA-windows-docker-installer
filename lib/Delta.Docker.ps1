@@ -602,6 +602,57 @@ function Get-DeltaDockerCliState {
     }
 }
 
+function Initialize-DeltaDockerPath {
+    <#
+      Makes sure `docker` is resolvable in this process, and says whether it
+      had to do anything.
+
+      Every Docker call in this installer goes through Get-Command, which reads
+      PATH. An interactive session always has Docker's bin directory on it. A
+      process launched by Task Scheduler may not: the environment it builds is
+      not always the one an interactive sign-in produces, and a PATH that was
+      extended after the machine last read it is a common way for a scheduled
+      task to fail with "not found" on a machine where the command plainly
+      exists.
+
+      So: if `docker` already resolves, nothing happens. If it does not, the
+      two directories Docker Desktop actually installs into - per machine and
+      per user - are probed, and the first one that holds docker.exe is
+      prepended to this process's PATH only. The operator's environment is
+      never modified.
+    #>
+    param()
+
+    $result = [PSCustomObject]@{ Resolved = $false; Path = $null; Repaired = $false }
+
+    $docker = Get-Command -Name 'docker' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($docker) {
+        $result.Resolved = $true
+        $result.Path = $docker.Source
+        return $result
+    }
+
+    $candidates = @(
+        (Join-Path -Path "$env:ProgramFiles"   -ChildPath 'Docker\Docker\resources\bin')
+        (Join-Path -Path "$env:LOCALAPPDATA"   -ChildPath 'Programs\DockerDesktop\resources\bin')
+        (Join-Path -Path "$env:ProgramData"    -ChildPath 'DockerDesktop\version-bin')
+    )
+
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        $exe = Join-Path -Path $candidate -ChildPath 'docker.exe'
+        if (Test-Path -LiteralPath $exe -PathType Leaf) {
+            $env:PATH = "$candidate;$env:PATH"
+            $result.Resolved = $true
+            $result.Repaired = $true
+            $result.Path = $exe
+            return $result
+        }
+    }
+
+    return $result
+}
+
 function Get-DeltaDockerEngineState {
     <#
       Distinguishes the three Docker conditions A§22 gives different,
@@ -1391,4 +1442,749 @@ function Invoke-DeltaRuntimeStage {
     $result.Outcome = 'ready'
     $result.Reason = "Docker engine $($engine.ServerVersion) is reachable in Linux-container mode with Compose v$($compose.Version)."
     return $result
+}
+
+# ===========================================================================
+# Unattended startup and reboot recovery (A§16, decision gate U1)
+#
+# The rule this whole section exists to obey: never print a recovery claim
+# that has not been measured (A§16.3 Layer 4). Everything below either reads
+# what the host actually has, or configures one specific mechanism and records
+# which one - and the claim that DELTA returns after a restart is only ever
+# made once a real unattended reboot has demonstrated it.
+#
+# Layer 1  configure every vendor mechanism that applies to this host
+# Layer 2  measure whether anything on this host can start the Docker engine
+#          before an interactive sign-in
+# Layer 3  a scheduled task at Windows startup, ONLY where Layer 2 says the
+#          vendor mechanisms cannot
+# Layer 4  record what was configured, and report it truthfully
+#
+# What this section is explicitly not: a service, a service wrapper, a
+# supervisor, or anything that watches containers. The task it may register
+# runs one script once at boot and exits.
+# ===========================================================================
+
+# Docker Desktop's per-user settings file. AutoStart is the vendor's own
+# "start Docker Desktop when you sign in" setting; there is no CLI for it, so
+# the file is the only way to set it.
+$Script:DeltaDockerSettingsRelativePath = 'Docker\settings-store.json'
+
+# The Windows service Docker Desktop's installer registers when it is asked
+# to. Its absence is a fact the assessment measured on this host and Phase 6
+# has to re-measure rather than assume (A§16.1).
+$Script:DeltaDockerServiceName = 'com.docker.service'
+
+$Script:DeltaStartupScriptName = 'start-delta.ps1'
+
+# The trigger fires at boot, and then waits. The delay is not a guess about
+# how long Docker takes - start-delta.ps1 waits for the engine itself - it is
+# to keep the task out of the way of the storm of service starts that a
+# Windows boot already is.
+$Script:DeltaStartupTaskDelay = 'PT60S'
+
+# A bound on the whole recovery, so a task that is stuck cannot sit in the
+# scheduler forever. Generous: a cold start pulls nothing but does initialise
+# containers and wait on three health gates.
+#
+# A TimeSpan, not the ISO 8601 duration the task XML stores: the trigger's
+# Delay property is a raw CIM string and takes "PT60S", while
+# New-ScheduledTaskSettingsSet -ExecutionTimeLimit is a typed parameter and
+# refuses one. The two look interchangeable and are not.
+$Script:DeltaStartupTaskTimeLimit = [System.TimeSpan]::FromMinutes(30)
+
+function Get-DeltaDockerSettingsPath {
+    <#
+      Docker Desktop's settings-store.json for the user this installer is
+      running as. Docker Desktop is installed per user on this class of host,
+      so "the settings" means "this user's settings" - there is no
+      machine-wide equivalent to read instead.
+    #>
+    param([string]$AppDataPath = $env:APPDATA)
+
+    if (-not $AppDataPath) { return $null }
+    return (Join-Path -Path $AppDataPath -ChildPath $Script:DeltaDockerSettingsRelativePath)
+}
+
+function Get-DeltaDockerAutoStartState {
+    <#
+      Reads Docker Desktop's AutoStart setting. Returns Supported (is there a
+      settings file at all), Enabled, and the raw parsed document so a writer
+      can put back everything it does not own.
+    #>
+    param([string]$SettingsPath)
+
+    if (-not $PSBoundParameters.ContainsKey('SettingsPath')) {
+        $SettingsPath = Get-DeltaDockerSettingsPath
+    }
+
+    $result = [PSCustomObject]@{
+        Path      = $SettingsPath
+        Supported = $false
+        Enabled   = $null
+        Settings  = $null
+        Error     = $null
+    }
+
+    if (-not $SettingsPath -or -not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
+        $result.Error = 'Docker Desktop has no settings file for this user yet.'
+        return $result
+    }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($SettingsPath)
+        $settings = $raw | ConvertFrom-Json
+    }
+    catch {
+        $result.Error = "'$SettingsPath' could not be read as JSON: $($_.Exception.Message)"
+        return $result
+    }
+
+    $result.Supported = $true
+    $result.Settings = $settings
+    if (@($settings.PSObject.Properties.Name) -contains 'AutoStart') {
+        $result.Enabled = [bool]$settings.AutoStart
+    }
+    else {
+        $result.Enabled = $false
+    }
+    return $result
+}
+
+function Set-DeltaDockerAutoStart {
+    <#
+      Turns Docker Desktop's AutoStart on or off by rewriting exactly that one
+      key and leaving every other setting in the file untouched.
+
+      Two honest limits, both reported rather than papered over:
+
+        - Docker Desktop rewrites this file itself, and a running instance can
+          overwrite the change when it exits. The result is re-read after
+          writing, and what is returned is what the file says afterwards - not
+          what was asked for.
+        - AutoStart fires at interactive sign-in. It is a vendor mechanism
+          worth configuring, and it is not on its own an answer to an
+          unattended reboot. Nothing here pretends otherwise.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$Enabled,
+        [string]$SettingsPath
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('SettingsPath')) {
+        $SettingsPath = Get-DeltaDockerSettingsPath
+    }
+
+    $state = Get-DeltaDockerAutoStartState -SettingsPath $SettingsPath
+    $result = [PSCustomObject]@{
+        Path      = $SettingsPath
+        Supported = $state.Supported
+        Changed   = $false
+        Enabled   = $state.Enabled
+        Reason    = $state.Error
+    }
+
+    if (-not $state.Supported) { return $result }
+    if ($state.Enabled -eq $Enabled) {
+        $result.Reason = "AutoStart is already $(if ($Enabled) { 'enabled' } else { 'disabled' })."
+        return $result
+    }
+
+    try {
+        $settings = $state.Settings
+        if (@($settings.PSObject.Properties.Name) -contains 'AutoStart') {
+            $settings.AutoStart = $Enabled
+        }
+        else {
+            Add-Member -InputObject $settings -MemberType NoteProperty -Name 'AutoStart' -Value $Enabled
+        }
+        # Not Write-DeltaFileAtomic: this is a vendor file, and replacing it by
+        # rename would drop whatever ACL or ownership Docker Desktop put on it.
+        [System.IO.File]::WriteAllText($SettingsPath, ($settings | ConvertTo-Json -Depth 12), $Script:DeltaUtf8NoBom)
+    }
+    catch {
+        $result.Reason = "Docker Desktop's settings file could not be written: $($_.Exception.Message)"
+        return $result
+    }
+
+    $after = Get-DeltaDockerAutoStartState -SettingsPath $SettingsPath
+    $result.Enabled = $after.Enabled
+    $result.Changed = ($after.Enabled -eq $Enabled)
+    $result.Reason = if ($result.Changed) {
+        "AutoStart set to $Enabled."
+    }
+    else {
+        "AutoStart was written as $Enabled but the file now reads $($after.Enabled). Docker Desktop may have rewritten it."
+    }
+    return $result
+}
+
+function Get-DeltaDockerServiceState {
+    <#
+      Whether com.docker.service exists on this host and how it starts.
+
+      A§16.1 measured its complete absence on the assessment host, where
+      Docker Desktop is installed per user. That is a property of how Docker
+      was installed, not of Windows, so it is measured again here rather than
+      assumed either way.
+    #>
+    param([string]$ServiceName = $Script:DeltaDockerServiceName)
+
+    $result = [PSCustomObject]@{
+        Name      = $ServiceName
+        Exists    = $false
+        Status    = $null
+        StartType = $null
+    }
+
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $service) { return $result }
+
+    $result.Exists = $true
+    $result.Status = [string]$service.Status
+    try {
+        $result.StartType = [string](Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop).StartMode
+    }
+    catch {
+        $result.StartType = [string]$service.StartType
+    }
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# The startup task (Layer 3)
+# ---------------------------------------------------------------------------
+
+function Get-DeltaStartupTaskName {
+    param([Parameter(Mandatory)][string]$ProjectName)
+    return "DELTA (Docker) - $ProjectName - Startup"
+}
+
+function Get-DeltaStartupTaskState {
+    <#
+      The registered startup task for this installation, if there is one,
+      described in the terms that matter: what it runs, as whom, and whether
+      its trigger is one that fires without anybody signing in.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectName)
+
+    $result = [PSCustomObject]@{
+        Name        = (Get-DeltaStartupTaskName -ProjectName $ProjectName)
+        Exists      = $false
+        Enabled     = $false
+        UserId      = $null
+        LogonType   = $null
+        RunLevel    = $null
+        AtStartup   = $false
+        Execute     = $null
+        Arguments   = $null
+        LastRunTime = $null
+        LastResult  = $null
+        Task        = $null
+    }
+
+    # -TaskName is a wildcard filter, so the literal name is bracket-escaped -
+    # the same trap the firewall rules hit in Phase 5, where "[project]" was
+    # read as a character class.
+    $escaped = [System.Management.Automation.WildcardPattern]::Escape($result.Name)
+    $task = Get-ScheduledTask -TaskName $escaped -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $task) { return $result }
+
+    $result.Exists = $true
+    $result.Task = $task
+    $result.Enabled = ($task.Settings.Enabled -ne $false)
+    $result.UserId = $task.Principal.UserId
+    $result.LogonType = [string]$task.Principal.LogonType
+    $result.RunLevel = [string]$task.Principal.RunLevel
+    $result.AtStartup = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' }).Count -gt 0
+
+    $action = @($task.Actions) | Select-Object -First 1
+    if ($action) {
+        $result.Execute = [string]$action.Execute
+        $result.Arguments = [string]$action.Arguments
+    }
+
+    $info = Get-ScheduledTaskInfo -TaskName $escaped -ErrorAction SilentlyContinue
+    if ($info) {
+        $result.LastRunTime = $info.LastRunTime
+        $result.LastResult = $info.LastTaskResult
+    }
+    return $result
+}
+
+function Register-DeltaStartupTask {
+    <#
+      Registers the one scheduled task this product owns: at Windows startup,
+      run start-delta.ps1 once, as the account that installed DELTA.
+
+      Why that account and not SYSTEM, which is what A§16.3 sketched. Measured
+      on this host: Docker Desktop's WSL distribution is registered under the
+      installing user's HKCU, with its virtual disk under that user's profile
+      (C:\Users\<user>\AppData\Local\Docker\wsl). SYSTEM has no such
+      registration, so a Docker started as SYSTEM would provision a second,
+      empty engine - and DELTA's data volume lives in the first one. The
+      installation would come back up on an empty database, which is exactly
+      the A§9.4 outcome the whole design exists to prevent. SYSTEM also has no
+      docker CLI plugins, so it has neither `docker compose` nor
+      `docker desktop`. Running as the installing user is what makes the task
+      see the same engine, the same volumes and the same CLI as the installer.
+
+      The logon type is S4U: the task runs whether or not that user is signed
+      in, and no password is stored anywhere. This is not autologon - no
+      interactive session is created and no credential is saved - and it is not
+      a service: the task runs one script, once, and exits.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$UserId
+    )
+
+    $result = [PSCustomObject]@{
+        Name      = (Get-DeltaStartupTaskName -ProjectName $ProjectName)
+        Succeeded = $false
+        Action    = 'none'
+        UserId    = $UserId
+        Reason    = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        $result.Reason = "The startup script was not found at '$ScriptPath'. The task was not registered, because a task that points at a missing script is worse than no task."
+        return $result
+    }
+
+    if (-not $UserId) {
+        $UserId = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name
+        $result.UserId = $UserId
+    }
+
+    $arguments = ConvertTo-DeltaCommandLine -Arguments @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'
+        '-File', $ScriptPath
+        '-InstallRoot', $InstallRoot
+    )
+
+    $existing = Get-DeltaStartupTaskState -ProjectName $ProjectName
+
+    try {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $trigger.Delay = $Script:DeltaStartupTaskDelay
+        $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType S4U -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -ExecutionTimeLimit $Script:DeltaStartupTaskTimeLimit `
+            -MultipleInstances IgnoreNew
+
+        $null = Register-ScheduledTask -TaskName $result.Name -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings `
+            -Description "Starts Docker and the DELTA Compose project '$ProjectName' after a Windows restart. Registered by the DELTA installer; it runs one script once at boot and exits." `
+            -Force -ErrorAction Stop
+    }
+    catch {
+        $result.Reason = "The startup task could not be registered: $($_.Exception.Message)"
+        return $result
+    }
+
+    $after = Get-DeltaStartupTaskState -ProjectName $ProjectName
+    if (-not $after.Exists) {
+        $result.Reason = 'The startup task was registered without error but cannot be read back.'
+        return $result
+    }
+    if (-not $after.AtStartup) {
+        $result.Reason = 'The startup task exists but has no at-startup trigger, so it would not run after a restart.'
+        return $result
+    }
+
+    $result.Succeeded = $true
+    $result.Action = if ($existing.Exists) { 'replaced' } else { 'created' }
+    $result.UserId = $after.UserId
+    return $result
+}
+
+function Unregister-DeltaStartupTask {
+    <#
+      Removes this installation's startup task, and only that one - matched by
+      the exact name built from its Compose project.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectName)
+
+    $name = Get-DeltaStartupTaskName -ProjectName $ProjectName
+    $state = Get-DeltaStartupTaskState -ProjectName $ProjectName
+    if (-not $state.Exists) {
+        return [PSCustomObject]@{ Name = $name; Removed = $false; Reason = 'No such task.' }
+    }
+
+    try {
+        Unregister-ScheduledTask -TaskName ([System.Management.Automation.WildcardPattern]::Escape($name)) -Confirm:$false -ErrorAction Stop
+        return [PSCustomObject]@{ Name = $name; Removed = $true; Reason = $null }
+    }
+    catch {
+        return [PSCustomObject]@{ Name = $name; Removed = $false; Reason = $_.Exception.Message }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The measurement (Layer 2)
+# ---------------------------------------------------------------------------
+
+function Measure-DeltaUnattendedStartCapability {
+    <#
+      Enumerates every mechanism on this host that could start the Docker
+      engine, and classifies each by *when* it fires. That distinction is the
+      whole question: Windows runs services and at-startup scheduled tasks
+      before anybody signs in, and runs HKCU Run entries, the Startup folder
+      and Docker Desktop's own AutoStart only at interactive sign-in.
+
+      Verdict:
+        none      nothing on this host runs before an interactive sign-in, so
+                  Docker cannot start unattended. Layer 1 is insufficient here
+                  and Layer 3 is warranted.
+        task      this installation's startup task is registered and would run
+                  at boot.
+        unproven  something else runs at boot, but whether it brings the Linux
+                  engine up is not something this function can know - only a
+                  real reboot can answer that.
+
+      Nothing here claims that a mechanism works. It reports what exists and
+      when it fires; the reboot test is what turns that into evidence.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectName)
+
+    $mechanisms = New-Object 'System.Collections.Generic.List[object]'
+    $add = {
+        param($Name, $When, $Present, $StartsEngine, $Detail)
+        $null = $mechanisms.Add([PSCustomObject]@{
+            Name = $Name; When = $When; Present = $Present; StartsEngine = $StartsEngine; Detail = $Detail
+        })
+    }
+
+    $service = Get-DeltaDockerServiceState
+    if ($service.Exists) {
+        $automatic = ($service.StartType -match '(?i)^auto')
+        & $add $Script:DeltaDockerServiceName $(if ($automatic) { 'boot' } else { 'manual' }) $true 'unknown' `
+            "Windows service present, start type $($service.StartType), currently $($service.Status). Docker documents this service as the privileged helper that lets users switch engines without an elevation prompt; whether it also brings the Linux engine up at boot on this build is not something the installer can determine without a restart."
+    }
+    else {
+        & $add $Script:DeltaDockerServiceName 'never' $false 'no' `
+            'No such Windows service. Docker Desktop is installed per user on this host, so nothing Docker owns runs as a service at boot.'
+    }
+
+    $task = Get-DeltaStartupTaskState -ProjectName $ProjectName
+    if ($task.Exists -and $task.AtStartup -and $task.Enabled) {
+        & $add $task.Name 'boot' $true 'unknown' `
+            "Scheduled task, at Windows startup, running as $($task.UserId) ($($task.LogonType)), whether or not that user is signed in."
+    }
+
+    $autoStart = Get-DeltaDockerAutoStartState
+    & $add 'Docker Desktop AutoStart' 'sign-in' ([bool]$autoStart.Enabled) 'yes' $(
+        if (-not $autoStart.Supported) { 'No Docker Desktop settings file for this user.' }
+        elseif ($autoStart.Enabled) { 'Enabled. Docker Desktop starts when this user signs in to Windows.' }
+        else { 'Disabled.' }
+    )
+
+    $runEntry = $null
+    try {
+        $run = Get-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction Stop
+        $runEntry = @($run.PSObject.Properties | Where-Object { $_.Value -is [string] -and $_.Value -match '(?i)docker desktop' }) | Select-Object -First 1
+    }
+    catch { }
+    & $add 'HKCU Run entry' 'sign-in' ([bool]$runEntry) 'yes' $(
+        if ($runEntry) { "$($runEntry.Name) -> $($runEntry.Value). Fires at interactive sign-in only." }
+        else { 'No Docker Desktop entry under HKCU Run.' }
+    )
+
+    $machineRun = $null
+    try {
+        $run = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction Stop
+        $machineRun = @($run.PSObject.Properties | Where-Object { $_.Value -is [string] -and $_.Value -match '(?i)docker' }) | Select-Object -First 1
+    }
+    catch { }
+    if ($machineRun) {
+        & $add 'HKLM Run entry' 'sign-in' $true 'yes' "$($machineRun.Name) -> $($machineRun.Value). Fires at the first interactive sign-in, not at boot."
+    }
+
+    $bootCapable = @($mechanisms | Where-Object { $_.When -eq 'boot' -and $_.Present -and $_.StartsEngine -ne 'no' })
+
+    $verdict = 'none'
+    if ($task.Exists -and $task.AtStartup -and $task.Enabled) { $verdict = 'task' }
+    elseif ($bootCapable.Count -gt 0) { $verdict = 'unproven' }
+
+    $reason = switch ($verdict) {
+        'task'     { "This installation's startup task runs at Windows startup, before any sign-in." }
+        'unproven' { "Something on this host runs at boot ($(($bootCapable | ForEach-Object { $_.Name }) -join ', ')), but whether it starts the Linux engine can only be established by a real restart." }
+        default    { 'Nothing on this host starts Docker before an interactive sign-in: there is no Docker Windows service, and the only mechanisms present fire at sign-in.' }
+    }
+
+    return [PSCustomObject]@{
+        Verdict     = $verdict
+        Reason      = $reason
+        Mechanisms  = $mechanisms.ToArray()
+        Service     = $service
+        Task        = $task
+        AutoStart   = $autoStart
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The stage (Layers 1 to 4)
+# ---------------------------------------------------------------------------
+
+function Invoke-DeltaStartupConfiguration {
+    <#
+      Configures unattended startup for this installation and records what was
+      actually configured.
+
+      Layer 1: every vendor mechanism that applies here. The Compose restart
+      policy is verified rather than set - the templates own it, and a policy
+      this stage "fixed" by editing the generated file would be lost on the
+      next run. Docker Desktop's AutoStart is set. --always-run-service is an
+      install-time flag of Docker Desktop's own installer, so on a host where
+      Docker is already installed there is nothing to apply; that is reported,
+      not silently skipped.
+
+      Layer 2: measure. Layer 3: register the startup task only where the
+      measurement says nothing runs before sign-in. Layer 4: write the facts
+      into .delta-install.json, including - always - whether a real reboot has
+      confirmed any of it.
+
+      A failure here never fails the installation. DELTA is running; what is
+      at stake is what happens after the next restart, and the honest response
+      to being unable to configure that is to say so.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [object]$RestartPolicy
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded    = $false
+        Mechanism    = 'none'
+        Reason       = $null
+        RestartPolicy = $RestartPolicy
+        AutoStart    = $null
+        Service      = $null
+        AlwaysRunService = $null
+        Measurement  = $null
+        Task         = $null
+        BootTested   = $false
+        BootTest     = $null
+    }
+
+    Show-Section -Title 'Unattended startup'
+
+    # --- Layer 1 ----------------------------------------------------------
+    Write-Step 'Configuring the vendor startup mechanisms'
+
+    if ($RestartPolicy) {
+        if ($RestartPolicy.Succeeded) {
+            Write-Detail "[ ok ]     restart policy               all services: $($RestartPolicy.Policy)"
+        }
+        else {
+            Write-DeltaWarning "The Compose restart policy is not what it should be: $($RestartPolicy.Reason)"
+        }
+    }
+
+    $service = Get-DeltaDockerServiceState
+    $result.Service = $service
+    if ($service.Exists) {
+        Write-Detail "[ ok ]     $($Script:DeltaDockerServiceName)           present, start type $($service.StartType), $($service.Status)"
+        $result.AlwaysRunService = 'present'
+    }
+    else {
+        Write-Detail "[note]     $($Script:DeltaDockerServiceName)           not installed on this host"
+        # --always-run-service is an argument to "Docker Desktop Installer.exe
+        # install". With Docker already installed there is nothing to pass it
+        # to, and re-running a vendor product's installer to add a flag is not
+        # something this phase does to a working machine.
+        $result.AlwaysRunService = 'not-applicable'
+        Write-Detail '           --always-run-service is an install-time flag of Docker Desktop Installer.exe, so it'
+        Write-Detail '           does not apply to an installation that is already in place. Docker documents it as'
+        Write-Detail '           the flag that keeps the privileged helper running so users are not prompted for'
+        Write-Detail '           elevation when switching engines - not as a way to start the engine at boot.'
+    }
+
+    $autoStart = Set-DeltaDockerAutoStart -Enabled $true
+    $result.AutoStart = $autoStart
+    if ($autoStart.Supported -and $autoStart.Enabled) {
+        Write-Detail "[ ok ]     Docker Desktop AutoStart     enabled ($($autoStart.Reason))"
+    }
+    elseif ($autoStart.Supported) {
+        Write-DeltaWarning "Docker Desktop's AutoStart setting could not be enabled: $($autoStart.Reason)"
+    }
+    else {
+        Write-Detail "[note]     Docker Desktop AutoStart     $($autoStart.Reason)"
+    }
+
+    # Measured on this host: Docker Desktop keeps its settings in memory while
+    # it runs and writes them out when it exits, so a change made to the file
+    # underneath a running Docker Desktop is silently reverted the next time it
+    # shuts down. The setting is written anyway - it is correct on the next
+    # cold start - but the operator is told, because a fact that quietly
+    # reverses itself is exactly the kind of thing this phase must not report
+    # as settled.
+    if ($autoStart.Changed) {
+        $desktop = Get-DeltaDockerDesktopStatus
+        if ($desktop.Status -eq 'running') {
+            Write-DeltaWarning 'Docker Desktop is running, and it rewrites this settings file when it exits, so it may revert AutoStart the next time it shuts down. Measured on this host. Nothing DELTA depends on is affected: the startup mechanism below does not rely on AutoStart.'
+        }
+    }
+    Write-Detail '           AutoStart fires at interactive sign-in, so on its own it does not cover a restart'
+    Write-Detail '           that nobody signs in after.'
+
+    # --- Layer 2 ----------------------------------------------------------
+    Write-Step 'Measuring what starts Docker at boot'
+
+    $measurement = Measure-DeltaUnattendedStartCapability -ProjectName $ProjectName
+    $result.Measurement = $measurement
+    foreach ($mechanism in $measurement.Mechanisms) {
+        $marker = if ($mechanism.Present) { '[found]  ' } else { '[absent] ' }
+        Write-Detail ("{0} {1,-30} {2,-8} {3}" -f $marker, $mechanism.Name, $mechanism.When, $mechanism.Detail)
+    }
+    Write-Detail ''
+    Write-Detail $measurement.Reason
+
+    # --- Layer 3 ----------------------------------------------------------
+    $scriptPath = Join-Path -Path $ScriptRoot -ChildPath $Script:DeltaStartupScriptName
+
+    # A task that already exists is not automatically a task that is still
+    # right: the installer directory it points at can be moved or renamed, and
+    # a startup task aimed at a script that is no longer there fails silently
+    # at boot, which is the worst possible way for this to break. So an
+    # existing task is reconciled against what it should be, the same way the
+    # firewall rules are.
+    $stale = $false
+    if ($measurement.Verdict -eq 'task' -and $measurement.Task) {
+        $arguments = [string]$measurement.Task.Arguments
+        $stale = ($arguments -notlike "*$scriptPath*") -or ($arguments -notlike "*$InstallRoot*")
+    }
+
+    if ($measurement.Verdict -eq 'none' -or $stale) {
+        Write-Step 'Registering the DELTA startup task'
+        if ($stale) {
+            Write-Detail 'The registered startup task no longer matches this installer or this installation'
+            Write-Detail 'root, so it is being replaced. A task pointing at a script that has moved would'
+            Write-Detail 'fail at boot with nobody there to see it.'
+        }
+        else {
+            Write-Detail 'Because nothing on this host starts Docker before a sign-in, DELTA registers one'
+            Write-Detail 'scheduled task that runs at Windows startup. It starts Docker, waits for the engine,'
+            Write-Detail 'checks that the database volume is still there, and brings the stack up. It supervises'
+            Write-Detail 'nothing and exits when it is done.'
+        }
+
+        $registration = Register-DeltaStartupTask -ProjectName $ProjectName -InstallRoot $InstallRoot -ScriptPath $scriptPath
+        $result.Task = $registration
+
+        if (-not $registration.Succeeded) {
+            Write-DeltaWarning "The startup task could not be registered: $($registration.Reason)"
+            Write-Detail 'DELTA is running and unaffected. After the next restart it will stay down until'
+            Write-Detail 'somebody signs in to this machine and Docker Desktop starts.'
+            $result.Mechanism = 'none'
+            $result.Reason = $registration.Reason
+        }
+        else {
+            Write-Detail "[ ok ]     task $($registration.Action): $($registration.Name)"
+            Write-Detail "[ ok ]     runs as $($registration.UserId), at Windows startup, whether or not that user is signed in"
+            Write-Detail "[ ok ]     runs $scriptPath -InstallRoot $InstallRoot"
+            $result.Mechanism = 'startup-task'
+            $result.Succeeded = $true
+        }
+    }
+    else {
+        $result.Mechanism = if ($measurement.Verdict -eq 'task') { 'startup-task' } else { 'vendor' }
+        $result.Succeeded = $true
+        $result.Task = $measurement.Task
+    }
+
+    # --- Layer 4 ----------------------------------------------------------
+    # Whatever a previous run measured about a real reboot is preserved: this
+    # stage configures a mechanism, it never observes a restart, so it is in no
+    # position to claim or to clear that evidence.
+    $existing = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $previousBootTest = $null
+    if ($existing.Exists -and $existing.IsValid -and (@($existing.Data.PSObject.Properties.Name) -contains 'unattendedStartup')) {
+        $previous = $existing.Data.unattendedStartup
+        if (@($previous.PSObject.Properties.Name) -contains 'bootTest') { $previousBootTest = $previous.bootTest }
+    }
+    $result.BootTest = $previousBootTest
+    $result.BootTested = [bool]($previousBootTest -and $previousBootTest.result -eq 'reachable')
+
+    $facts = [ordered]@{
+        configured           = $result.Succeeded
+        mechanism            = $result.Mechanism
+        configuredAt         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        composeRestartPolicy = $(if ($RestartPolicy -and $RestartPolicy.Succeeded) { $RestartPolicy.Policy } else { 'unverified' })
+        dockerDesktopAutoStart = [bool]$autoStart.Enabled
+        dockerService        = $(if ($service.Exists) { "$($service.StartType)" } else { 'absent' })
+        alwaysRunService     = $result.AlwaysRunService
+        taskName             = $(if ($result.Task -and $result.Task.Name) { $result.Task.Name } else { $null })
+        taskUserId           = $(if ($result.Task -and $result.Task.UserId) { $result.Task.UserId } else { $null })
+        startupScript        = $(if ($result.Mechanism -eq 'startup-task') { (Join-Path -Path $ScriptRoot -ChildPath $Script:DeltaStartupScriptName) } else { $null })
+        rebootTested         = $result.BootTested
+        bootTest             = $previousBootTest
+    }
+    $null = Write-DeltaInstallState -InstallRoot $InstallRoot -Properties @{ unattendedStartup = [PSCustomObject]$facts }
+
+    Write-Detail ''
+    if ($result.BootTested) {
+        Write-Success "Unattended startup: $($result.Mechanism), confirmed by a real restart on $($previousBootTest.at)."
+    }
+    elseif ($result.Succeeded) {
+        Write-Success "Unattended startup: $($result.Mechanism) configured - NOT yet confirmed by a real restart."
+    }
+    else {
+        Write-DeltaWarning 'Unattended startup is not configured on this host.'
+    }
+
+    return $result
+}
+
+function Write-DeltaRebootTestResult {
+    <#
+      Records the outcome of a real unattended restart in the state file. The
+      only thing that may ever set rebootTested to true.
+
+      It is deliberately a separate function from the one that configures the
+      mechanism: configuring something and observing that it worked are
+      different claims, made at different times, on different evidence.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][ValidateSet('reachable', 'unreachable')][string]$Result,
+        [string]$Detail,
+        [string]$Mechanism,
+        [datetime]$At = (Get-Date)
+    )
+
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $startup = $null
+    if ($state.Exists -and $state.IsValid -and (@($state.Data.PSObject.Properties.Name) -contains 'unattendedStartup')) {
+        $startup = $state.Data.unattendedStartup
+    }
+    if (-not $startup) {
+        $startup = [PSCustomObject]@{ configured = $false; mechanism = 'none' }
+    }
+
+    $bootTest = [PSCustomObject]@{
+        at        = $At.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        result    = $Result
+        mechanism = $(if ($Mechanism) { $Mechanism } else { [string]$startup.mechanism })
+        detail    = $Detail
+    }
+
+    $properties = [ordered]@{}
+    foreach ($property in $startup.PSObject.Properties) {
+        if ($property.Name -in @('bootTest', 'rebootTested')) { continue }
+        $properties[$property.Name] = $property.Value
+    }
+    $properties['rebootTested'] = ($Result -eq 'reachable')
+    $properties['bootTest'] = $bootTest
+
+    return (Write-DeltaInstallState -InstallRoot $InstallRoot -Properties @{ unattendedStartup = [PSCustomObject]$properties })
 }

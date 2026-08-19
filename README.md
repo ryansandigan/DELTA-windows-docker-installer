@@ -201,16 +201,65 @@ If a previous run stopped part-way, the next one picks up from there.
 
 ## After a Windows restart
 
-**Today, DELTA comes back when Docker Desktop is running — and Docker Desktop
-starts when somebody signs in to Windows.** After a restart with no interactive
-sign-in (an overnight patch reboot, for example), DELTA stays down until
-someone signs in.
+Docker Desktop, as Docker ships it on Windows, starts when somebody **signs in**
+— there is no Docker service that runs at boot. On its own that would mean DELTA
+stays down after an overnight patch reboot until a person signs in to the
+machine.
 
-Running `.\setup.ps1` again brings everything back up.
+So the installer measures what this machine actually has, and if nothing on it
+starts Docker before a sign-in, it registers **one scheduled task**:
 
-Starting DELTA automatically after an unattended restart is not configured by
-this installer yet. It is the next piece of work, and this file will say so
-plainly when it is done.
+```
+DELTA (Docker) - <project> - Startup
+   trigger   at Windows startup, 60 seconds after boot
+   runs as   the account that installed DELTA, whether or not it is signed in
+   action    start-delta.ps1 -InstallRoot C:\DELTA
+```
+
+The task runs the script once and exits. It starts Docker, waits for the engine,
+checks the database volume is still there, brings the three containers up in
+order, and confirms DELTA answers. It is not a service and it supervises
+nothing.
+
+**What the installer will and will not claim.** The summary at the end of an
+install tells you which mechanism is configured, and whether a *real* restart
+has ever confirmed it. Until one has, it says "configured but not yet proven" —
+it will not tell you DELTA comes back on its own until that has been
+demonstrated on your machine.
+
+To confirm it yourself, the only test that counts:
+
+1. Restart Windows.
+2. **Do not sign in.**
+3. From another machine, request `http://<your-host>/`. It should answer 200
+   within a couple of minutes of boot.
+
+Then read the log, which records every boot:
+
+```powershell
+Get-Content C:\DELTA\logs\installer\startup.log
+```
+
+You can also run it by hand at any time — the same code path the task uses:
+
+```powershell
+.\start-delta.ps1 -InstallRoot C:\DELTA
+```
+
+Two things worth knowing:
+
+- **Docker Desktop will have no window or tray icon** after an unattended start,
+  because it was started before anyone signed in. Docker and DELTA both work
+  normally; if you want the Docker Desktop interface back, stop it and start it
+  from the Start menu.
+- **Other containers on this machine are not this installer's business.** The
+  task starts DELTA's Compose project and nothing else. Anything else you run in
+  Docker comes back only if its own restart policy says so.
+
+If you would rather DELTA did not start by itself, disable or delete that one
+scheduled task — nothing else depends on it. Note that running `.\setup.ps1`
+again will re-register it, because the installer treats "nothing starts Docker
+at boot" as something to fix.
 
 ---
 

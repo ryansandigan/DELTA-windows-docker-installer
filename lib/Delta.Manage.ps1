@@ -474,3 +474,125 @@ function Invoke-DeltaAdminPasswordReset {
     $result.Succeeded = $true
     return $result
 }
+
+# ---------------------------------------------------------------------------
+# Start DELTA (A§16.3 Layer 4, Phase 6)
+#
+# One operation that takes an installed-but-not-running DELTA to a reachable
+# one. It is what the startup task runs after a reboot, and what Phase 7's
+# menu entry will call - the same code path either way, so that manual
+# recovery and automatic recovery cannot behave differently.
+#
+# Everything it does is already owned by something else: the engine by
+# Delta.Docker.ps1, the persistent-data precheck and the ordered, health-gated
+# startup by Delta.Stack.ps1. This function sequences them and reports; it
+# reimplements none of them, and it supervises nothing - it runs once and
+# returns.
+# ---------------------------------------------------------------------------
+
+function Start-DeltaInstallation {
+    <#
+      Starts Docker if it is not running, waits for the Linux engine, checks
+      that the database volume is still there, brings the stack up in order
+      with health gating, and verifies that DELTA answers over HTTP.
+
+      Returns Succeeded, a Stage naming where it got to, and a Reason. The
+      stages are deliberately named after the things an operator would have to
+      diagnose: configuration, engine, precheck, stack, verify.
+
+      What it will not do, by construction:
+        - it never runs the security bootstrap (no -SecurityBootstrap is
+          passed), because the credential of an existing installation is not
+          this operation's business;
+        - it never generates or rewrites .env, docker-compose.yml or the NGINX
+          configuration - it reads the configuration that is already there;
+        - it never pulls, never updates an image pin, never touches a volume,
+          and has no path to `docker compose down` in any form.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [int]$EngineTimeoutSeconds = $Script:DeltaEngineStartTimeoutSeconds,
+        [switch]$SkipEngineStart
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded     = $false
+        Stage         = 'configuration'
+        Reason        = $null
+        Configuration = $null
+        Engine        = $null
+        EngineStarted = $false
+        Precheck      = $null
+        Start         = $null
+        Url           = $null
+        Elapsed       = $null
+    }
+    $started = Get-Date
+
+    # --- configuration ----------------------------------------------------
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    if (-not $state.Exists) {
+        $result.Reason = "There is no DELTA installation registered at '$InstallRoot' ($($state.Path) does not exist). Nothing was started."
+        return $result
+    }
+    if (-not $state.IsValid) {
+        $result.Reason = "The installation state at '$InstallRoot' could not be read: $($state.Error). Nothing was started."
+        return $result
+    }
+
+    $configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
+    if (-not $configuration) {
+        $result.Reason = "'$InstallRoot' has no .env, so there is no configuration to start from. Nothing was started."
+        return $result
+    }
+    $result.Configuration = $configuration
+    Write-Step "Starting DELTA in $InstallRoot"
+    Write-Detail "Compose project $($configuration.ProjectName), data volume $($configuration.PgDataVolume)"
+
+    # --- engine -----------------------------------------------------------
+    $result.Stage = 'engine'
+    $engine = Get-DeltaDockerEngineState
+    $result.Engine = $engine
+
+    if ($engine.Status -ne 'ready' -and -not $SkipEngineStart) {
+        Write-Detail "The Docker engine is not ready ($($engine.Status)). Starting Docker Desktop."
+        $engine = Start-DeltaDockerEngine -TimeoutSeconds $EngineTimeoutSeconds
+        $result.Engine = $engine
+        $result.EngineStarted = ($engine.Status -eq 'ready')
+    }
+
+    if ($engine.Status -ne 'ready') {
+        $result.Reason = "The Docker engine did not become available (state: $($engine.Status)). $(if ($engine.RawError) { $engine.RawError } else { $engine.Detail })"
+        return $result
+    }
+    Write-Detail "[ ok ]     Docker engine $($engine.ServerVersion), $($engine.OSType) containers, backend $($engine.Backend)"
+
+    # --- persistent data ---------------------------------------------------
+    # Before `up`, always. If the volume has gone, starting the stack would
+    # initialise an empty cluster and DELTA would build a brand-new schema -
+    # the installation would come back up looking healthy with all data gone
+    # (A§9.4). After an unattended boot, with nobody watching, that is the
+    # single worst thing this operation could do.
+    $result.Stage = 'precheck'
+    $result.Precheck = Test-DeltaPersistentDataPrecheck -InstallRoot $InstallRoot -Configuration $configuration
+    if (-not $result.Precheck.Succeeded) {
+        $result.Reason = $result.Precheck.Reason
+        return $result
+    }
+
+    # --- the stack ---------------------------------------------------------
+    $result.Stage = 'stack'
+    $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration -AllowPrompt $false
+    if (-not $result.Start.Succeeded) {
+        $result.Stage = $result.Start.Stage
+        $result.Reason = $result.Start.Reason
+        return $result
+    }
+
+    $result.Stage = 'verify'
+    $result.Url = $result.Start.Http.Url
+    $result.Elapsed = [int]((Get-Date) - $started).TotalSeconds
+    $result.Succeeded = $true
+    Write-Success "DELTA answered HTTP $($result.Start.Http.StatusCode) at $($result.Url) after $($result.Elapsed)s."
+    return $result
+}

@@ -97,7 +97,7 @@ The assessment left five open items (A§26). **U2 has since been resolved and is
 | ID | Question | Gate at | Must resolve **before** the phase? | Assessment default | Class |
 |---|---|---|---|---|---|
 | ~~**U2**~~ | ~~Named volume vs bind mount for PGDATA~~ | — | **✅ RESOLVED 2026-08-19 — no longer a gate** | **Approved: named volume `delta_pgdata`** for raw PGDATA; bind mounts for operator-managed files; `pg_dump` to `C:\DELTA\backups\` is the portable recovery artefact (A§9.2, A§26 U2) | Settled |
-| **U1** | Does Docker start unattended after reboot on each target OS? | **Phase 6** | **No** — resolve *during* the phase by measurement | Configure all vendor mechanisms, measure, add scheduled task only if needed (A§16.3) | Could alter architecture |
+| **U1** | Does Docker start unattended after reboot on each target OS? | **Phase 6** | **No** — resolve *during* the phase by measurement | Configure all vendor mechanisms, measure, add scheduled task only if needed (A§16.3). **Measured 2026-08-19 on Server 2025: Layer 1 insufficient — no Docker service exists and every present mechanism fires at sign-in. Layer 3 configured as an S4U scheduled task running as the installing user (not SYSTEM — see Phase 6 status). Awaiting the real reboot test.** | Could alter architecture |
 | **U3** | Does a failed pre-update backup abort the update? | **Phase 9** | No | **Abort unconditionally**, no override (A§26 U3) | Implementation-time |
 | **U4** | NGINX access-log rotation | **Phase 7** | No | Scheduled trim: rename + `nginx -s reopen`, keep 7 (A§26 U4) | Implementation-time |
 | **U5** | Server 2022 / Windows 11 parity | **Phase 11** (continuous from Phase 3) | No | Server 2025 is the reference; exercise the others continuously (A§26 U5) | Validation/parity |
@@ -673,6 +673,69 @@ sc.exe query com.docker.service
 **Dependencies for next phase.** Later phases may assume the stack returns unattended by a known, recorded mechanism.
 
 **Documentation update.** `README.md` gains a short "After a Windows restart" section stating the measured behaviour. If U1 resolves in favour of the scheduled task, record that in `.delta-install.json` and note the finding — it is a product characteristic, not an implementation detail.
+
+#### Implementation status
+
+**Status: PARTIAL — AWAITING REBOOT TEST** · 2026-08-19 · **Acceptance gate: not yet met.** The implementation is complete and every pre-reboot measurement is green, but the gate is *"a real reboot with no interactive sign-in leaves DELTA reachable"* and that reboot has not happened. Phase 6 is not COMPLETE and must not be recorded as such until it has.
+
+Delivered: `start-delta.ps1`; the unattended-startup section of `lib\Delta.Docker.ps1` (`Set-DeltaDockerAutoStart`, `Get-DeltaDockerServiceState`, `Initialize-DeltaDockerPath`, the startup-task functions, `Measure-DeltaUnattendedStartCapability`, `Invoke-DeltaStartupConfiguration`, `Write-DeltaRebootTestResult`); `Start-DeltaInstallation` in `lib\Delta.Manage.ps1`; `Test-DeltaComposeRestartPolicy` and `Get-DeltaStackConfiguration` in `lib\Delta.Stack.ps1`; `Start-DeltaLog -Append` in `lib\Delta.Common.ps1`; `Show-DeltaRestartBehaviour` in `setup.ps1`.
+
+**U1 — resolved by measurement: Layer 1 is insufficient on this host, and Layer 3 is required**
+
+Layer 1 was configured first and then measured, in that order.
+
+| Vendor mechanism | Measured state | Outcome |
+|---|---|---|
+| `restart: unless-stopped` on all three services | Already correct in the template and in the rendered model | Verified, not set. `Test-DeltaComposeRestartPolicy` reads `docker compose config`, because the *model* is what Compose acts on |
+| Docker Desktop `AutoStart` | `false` | Set to `true` — and see the honesty note below |
+| `com.docker.service` | **Does not exist.** Docker Desktop is installed per user at `%LOCALAPPDATA%\Programs\DockerDesktop`; `Get-Service` and `sc query` both return nothing | A§16.1 re-confirmed |
+| `--always-run-service` | **Not applicable.** It is an argument to `Docker Desktop Installer.exe install`, so there is nothing to pass it to on a host where Docker is already installed. The installed build's own `--help` describes it as *"Keep service always running, so regular users can switch to windows containers or hyper-v without being prompted for admin rights"* — a UAC-avoidance flag, not an engine-at-boot flag | Recorded as `not-applicable`, with the reason, rather than silently skipped |
+
+The Layer 2 measurement then enumerates every mechanism on the host and classifies each by **when it fires**. On this host: no Docker service; no HKLM Run entry; no boot-triggered task; and the only two mechanisms present — the `HKCU\...\Run` entry and `AutoStart` — both fire at **interactive sign-in**. Verdict `none`: nothing runs before a sign-in, so Layer 1 cannot start Docker unattended here. That is a measurement of what exists, not an inference about what works, and it is what warrants Layer 3.
+
+**Layer 3 runs as the installing user, not as SYSTEM — and that correction is the phase's most important finding.** A§16.3 sketched a SYSTEM task. Two measurements say SYSTEM is the wrong identity, one of them dangerously so:
+
+- **The `docker-desktop` WSL distribution is registered per user.** It lives in the installing user's `HKCU\...\Lxss`, with its virtual disk at `C:\Users\<user>\AppData\Local\Docker\wsl\main`. SYSTEM has no such registration, so Docker started as SYSTEM would provision a *second, empty* engine — and `delta_pgdata` lives in the first one. DELTA would come back up on an empty database and initialise a fresh schema with the seeded administrator: precisely the A§9.4 outcome the design exists to prevent, arrived at while nobody is watching.
+- **SYSTEM has no docker CLI plugins.** Measured by running a probe task as SYSTEM: `docker info` and `docker ps` work (the `docker_engine` pipe is reachable), but `docker compose` and `docker desktop` both fail with *"unknown command"* — the plugins live in the user's profile. A SYSTEM task could see the engine and could not drive Compose.
+
+So the task uses **`-LogonType S4U`** with the installing account: it runs whether or not that user is signed in, and **no password is stored**. That is not autologon (no interactive session, no saved credential) and not a service (one script, once, then exit). Guardrails held: no WinSW, no custom service, no supervision, nothing from `lib\DeltaInstaller.Service.ps1`, and no `docker compose down` in any form.
+
+**Implementation notes**
+
+- **`Start-DeltaInstallation` sequences existing primitives and owns none of them.** Engine control is Phase 2's, the persistent-data precheck and the ordered health-gated start are Phase 3's. It passes **no** `-SecurityBootstrap`, so it structurally cannot touch an existing installation's credential; it generates nothing, pulls nothing, and pins nothing. The startup task and Phase 7's menu entry will call the same function, so automatic and manual recovery cannot drift apart.
+- **`Get-DeltaStackConfiguration` reads `.env` instead of calling `New-DeltaEnvironmentFile`.** The generator returns the configuration object as a by-product of *writing* the file; using it to find out what is configured would make reading the configuration a mutating act on the one file that holds every secret.
+- **The persistent-data precheck is what makes unattended startup safe**, not an inherited nicety. It is the difference between "DELTA did not come back" and "DELTA came back empty", and after a boot nobody is there to notice the second one.
+- **The startup log is one appended file**, `logs\installer\startup.log`, trimmed past 1 MB — an operator reading it after a reboot needs a history, not one transcript per boot. It goes through the same redacting writer as everything else.
+- **`Initialize-DeltaDockerPath`** repairs this process's PATH from Docker Desktop's two real install locations if `docker` does not resolve. A scheduled task does not always get the PATH an interactive sign-in produces, and "not found" on a machine where the command plainly exists is a bad way to fail at boot.
+- **The task is reconciled, not merely created.** A rerun compares the registered command line against the current script path and installation root and replaces it if they have drifted — a startup task pointing at a moved installer fails silently at boot, which is the worst way for this to break. Verified physically by seeding a task with a wrong root and rerunning.
+- **Docker Desktop reverts `AutoStart` if it is running when the file is written.** Measured: the installer set it to `true` and read `true` back, and after a later Docker Desktop stop/start the file read `false` again — Docker Desktop keeps its settings in memory and flushes them on exit. The installer now warns when it writes the setting under a running Docker Desktop. Nothing depends on it: the startup task does not use AutoStart. The *measurement* is always read live, so the reported mechanism is never a stale claim.
+- **Truthful reporting is structural, not editorial.** `rebootTested` can only be set by `Write-DeltaRebootTestResult`, which is a separate function from the one that configures the mechanism — configuring something and observing that it worked are different claims, on different evidence, at different times. `Show-DeltaRestartBehaviour` has exactly three things it can say, and says "CONFIGURED but NOT YET PROVEN" until a restart has been recorded.
+
+**A Phase 3 defect this phase surfaced and fixed.** `Test-DeltaMigrationOutcome` read the whole of `docker compose logs delta` and matched the *initialise* marker first. A container that initialised a database once and has since been restarted therefore reported `branch: initialise` forever, and — worse — an error line from a run days earlier would have failed a perfectly good start. Phase 6 makes restarts routine, so it now scans from the **last** branch marker: the branch and the error scan are both about the current start. The live installation immediately began reporting `branch: upgrade`, which is the truth. Three regression tests cover it.
+
+**Validation observations** (physical, on the operator's live installation at `C:\DELTA` — project `delta`, volume `delta_pgdata`, HTTP 80)
+
+- **52/52 Phase 6 assertions pass**, covering the AutoStart primitives (including that setting it preserves every other key), service detection, task registration/read-back/idempotency/removal, the boot-capability measurement, reboot-test recording, restart-policy verification, non-mutating configuration reads, the appended log (including redaction and trimming), the migration-branch fix, the static guardrails and package integrity.
+- **Rehearsal A — task fires with the stack already up.** Ran in **session 0** as `Administrator` (S4U), resolved Docker, precheck passed, `up -d` was a no-op, HTTP 200, exit 0, 7 s.
+- **Rehearsal B — stack stopped, engine up.** `docker compose stop` left all three exited and the site unreachable; the task recovered db (7 s) → delta (7 s) → nginx (7 s) → **HTTP 200 in 27 s**, exit 0.
+- **Rehearsal C — Docker Desktop fully stopped.** This is the measurement that decides whether the reboot can work, and it was run deliberately rather than discovered at reboot. From `docker desktop stop` (engine pipe gone, site unreachable) the task detected `engine-down`, ran `docker desktop start --timeout 300`, had the engine at 27 s, and reached **HTTP 200 at 54 s**, exit 0. The WSL distribution list, the `Lxss` registrations and `delta_pgdata` were **unchanged** — no second engine was created, which is the failure a SYSTEM task would have produced.
+- **`restart: unless-stopped` did not restore containers after a `docker desktop stop`/start cycle** — the unrelated `apc-2026` container carries that policy and stayed exited. Docker's graceful shutdown stops containers, and `unless-stopped` correctly declines to restart something that was stopped. The design does not depend on it: the startup task issues an explicit `up -d`. Worth recording, because A§16.2's phrasing invites the opposite assumption.
+- **Docker Desktop now runs in session 0** (started by the task) while the interactive session is 2, and the CLI and DELTA both work normally from the interactive session. That is the state a real boot produces, and it works — but there is no tray icon or GUI for a user who signs in afterwards. Recorded in `README.md` because it will otherwise be reported as a fault.
+- **Rerun idempotency:** three consecutive `setup.ps1` runs, all exit 0, no container recreated. `POSTGRES_PASSWORD`, `DELTA_DB_PASSWORD`, `SESSION_SECRET`, `DATABASE_URL`, `HTTP_PORT`, `COMPOSE_PROJECT_NAME`, `DELTA_IMAGE` and `PGDATA_VOLUME` digests, the administrator credential's stored-hash digest, `.env`'s ACL and the single firewall rule are **byte-for-byte identical to the pre-phase baseline**. Database still PostgreSQL 17.5 / PostGIS 3.5.2, schema 0.2.3, 39 tables. Exactly one scheduled task.
+- **Unrelated resources:** containers, images, volumes, networks and the Compose project list all match the pre-phase snapshot. `apc-2026` and `deltaprobe-postgres-1` were stopped by rehearsal C's engine stop — an unavoidable consequence of stopping the engine, not an operation on those projects — and were restarted to their prior state immediately.
+- Published ports remain **nginx only**. All eight scripts parse under Windows PowerShell 5.1. No secret value or key name appears in any transcript, in the repository's `logs\installer\` or in `C:\DELTA\logs\installer\`.
+- **Regression caveat, stated plainly.** The Phase 1/2/4/5 suites were never committed to the repository and no longer exist on this host, so they could not be re-run. What they protected was re-established as direct invariant checks against the live installation instead — parse, secrets, credential, ACLs, firewall, published ports, schema and table count, install-root refusal, package integrity, redaction — all listed above and all green. Committing the suites would have prevented this; that is a process observation, not a Phase 6 deliverable.
+
+**The reboot test that is still required**
+
+Everything is in place and nothing further needs to be configured. The remaining evidence can only come from the operator:
+
+1. Restart Windows. 2. **Do not sign in.** 3. From another machine, `curl http://<host>/` — it must return **200**.
+4. Then, on the host: `Get-Content C:\DELTA\logs\installer\startup.log` for the boot timeline, and `Get-ScheduledTaskInfo` for the task's result.
+
+Expected from the rehearsals: task fires at boot + 60 s, engine ready around +30 s later, HTTP 200 roughly 90–120 s after boot. On success, record it with `Write-DeltaRebootTestResult -InstallRoot C:\DELTA -Result reachable`, which is the only thing that may set `rebootTested`.
+
+**State-file fields added** — all under `unattendedStartup`: `configured`, `mechanism`, `configuredAt`, `composeRestartPolicy`, `dockerDesktopAutoStart`, `dockerService`, `alwaysRunService`, `taskName`, `taskUserId`, `startupScript`, `rebootTested`, `bootTest` (`{at, result, mechanism, detail}`). No secrets, no volatile noise; the Phase 1–5 facts are untouched.
 
 ---
 

@@ -155,25 +155,77 @@ function Protect-DeltaSecretText {
 $Script:DeltaLogPath = $null
 $Script:DeltaLogWriteFailureReported = $false
 
+# Bounds for the appended startup log only. The per-run transcripts are one
+# file per run and are the operator's to keep or delete.
+$Script:DeltaAppendLogMaxBytes  = 1MB
+$Script:DeltaAppendLogKeepBytes = 256KB
+
+function Limit-DeltaLogFile {
+    <#
+      Trims an appended log to its most recent lines once it passes the size
+      cap. Best effort: a log that cannot be trimmed is left exactly as it is
+      rather than being lost.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+        $file = Get-Item -LiteralPath $Path
+        if ($file.Length -le $Script:DeltaAppendLogMaxBytes) { return }
+
+        $lines = [System.IO.File]::ReadAllLines($Path)
+        $kept = New-Object 'System.Collections.Generic.List[string]'
+        $bytes = 0
+        for ($i = $lines.Length - 1; $i -ge 0; $i--) {
+            $bytes += $lines[$i].Length + 2
+            if ($bytes -gt $Script:DeltaAppendLogKeepBytes) { break }
+            $kept.Insert(0, $lines[$i])
+        }
+        $kept.Insert(0, "--- earlier entries trimmed on $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) ---")
+        [System.IO.File]::WriteAllLines($Path, $kept.ToArray(), $Script:DeltaUtf8NoBom)
+    }
+    catch { }
+}
+
 function Start-DeltaLog {
     <#
       Opens the installer transcript in $Directory and returns its full path.
       The directory is created if it does not exist; a failure to create it
       is reported once and then downgraded to "no log this run" - an
       installation must not be blocked by a logging problem.
+
+      -Append opens one fixed file, "<Name>.log", and adds to it instead of
+      creating a new timestamped file per run. That is what the unattended
+      startup path needs: after a reboot the operator has to be able to read
+      one file and see the history of boots, not hunt through a directory of
+      per-boot transcripts. Because that file is written by something nobody
+      watches, it is trimmed to the most recent $Script:DeltaAppendLogKeepBytes
+      when it grows past $Script:DeltaAppendLogMaxBytes - the alternative is a
+      log that grows without limit on a machine that reboots for patching.
     #>
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [string]$Name = 'setup'
+        [string]$Name = 'setup',
+        [switch]$Append
     )
 
     try {
         if (-not (Test-Path -LiteralPath $Directory)) {
             $null = New-Item -ItemType Directory -Path $Directory -Force
         }
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $Script:DeltaLogPath = Join-Path -Path $Directory -ChildPath "$Name-$stamp.log"
-        [System.IO.File]::WriteAllText($Script:DeltaLogPath, '', $Script:DeltaUtf8NoBom)
+        if ($Append) {
+            $Script:DeltaLogPath = Join-Path -Path $Directory -ChildPath "$Name.log"
+            Limit-DeltaLogFile -Path $Script:DeltaLogPath
+            if (-not (Test-Path -LiteralPath $Script:DeltaLogPath -PathType Leaf)) {
+                [System.IO.File]::WriteAllText($Script:DeltaLogPath, '', $Script:DeltaUtf8NoBom)
+            }
+            [System.IO.File]::AppendAllText($Script:DeltaLogPath, [Environment]::NewLine, $Script:DeltaUtf8NoBom)
+        }
+        else {
+            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $Script:DeltaLogPath = Join-Path -Path $Directory -ChildPath "$Name-$stamp.log"
+            [System.IO.File]::WriteAllText($Script:DeltaLogPath, '', $Script:DeltaUtf8NoBom)
+        }
     }
     catch {
         $Script:DeltaLogPath = $null
