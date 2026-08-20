@@ -1794,6 +1794,19 @@ $Script:DeltaBackupTimeoutSeconds = 1800
 # which is the actual verification.
 $Script:DeltaBackupMagic = [byte[]]@(0x50, 0x47, 0x44, 0x4D, 0x50)  # "PGDMP"
 
+# What a `pg_restore --list` table of contents must name for the archive to be
+# DELTA's database rather than some other perfectly valid PostgreSQL dump.
+# Matched against the TOC text, which lists entries as "id; oid oid TYPE schema
+# name owner". Deliberately few and deliberately structural: the version table
+# the installer reads, the administrator table the security bootstrap writes,
+# and the extension the geometry columns depend on.
+$Script:DeltaBackupContentMarkers = [ordered]@{
+    'dts_system_info'  = '(?im)^\s*\d+;\s.*\bTABLE\b.*\bdts_system_info\b'
+    'super_admin_users' = '(?im)^\s*\d+;\s.*\bTABLE\b.*\bsuper_admin_users\b'
+    'division'         = '(?im)^\s*\d+;\s.*\bTABLE\b.*\bdivision\b'
+    'postgis'          = '(?im)^\s*\d+;\s.*\bEXTENSION\b.*\bpostgis\b'
+}
+
 function Format-DeltaByteSize {
     param([Parameter(Mandatory)][AllowNull()][object]$Bytes)
 
@@ -1864,6 +1877,15 @@ function Test-DeltaBackupArchive {
 
       A file existing is not evidence. A non-zero size is not evidence. Only a
       successful parse that yields at least one table-of-contents entry is.
+
+      The parse proves the archive is readable PostgreSQL. It does not prove
+      the archive is DELTA's database - a valid dump of the wrong database
+      would pass it. So the table of contents is also checked for the objects
+      this application cannot be without, and the answer is reported as its own
+      fact: DeltaContent, with the markers found. A missing marker is a loud
+      warning rather than a deletion, because "this file is not a readable
+      archive" and "this readable archive is not the database I expected" are
+      different claims and only the first justifies destroying the file.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -1873,10 +1895,13 @@ function Test-DeltaBackupArchive {
     )
 
     $result = [PSCustomObject]@{
-        Verified   = $false
-        SizeBytes  = 0
-        TocEntries = 0
-        Reason     = $null
+        Verified     = $false
+        SizeBytes    = 0
+        TocEntries   = 0
+        DeltaContent = $false
+        Markers      = @()
+        MissingMarkers = @()
+        Reason       = $null
     }
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -1934,8 +1959,30 @@ function Test-DeltaBackupArchive {
         return $result
     }
 
+    # Is this DELTA's database? dts_system_info carries the schema version the
+    # installer reads, super_admin_users carries the administrator account, and
+    # the postgis extension is what makes the geometry columns restorable. An
+    # archive missing any of them is not the thing an update should fall back
+    # on, even though it parses.
+    $toc = $capture.StdOut
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($marker in $Script:DeltaBackupContentMarkers.Keys) {
+        if ($toc -match $Script:DeltaBackupContentMarkers[$marker]) { $null = $found.Add($marker) }
+        else { $null = $missing.Add($marker) }
+    }
+    $result.Markers = $found.ToArray()
+    $result.MissingMarkers = $missing.ToArray()
+    $result.DeltaContent = ($missing.Count -eq 0)
+
     $result.Verified = $true
     $result.Reason = "pg_restore --list parsed the archive: $($result.TocEntries) table-of-contents entries."
+    if ($result.DeltaContent) {
+        $result.Reason += " Contents are DELTA's: $($result.Markers -join ', ')."
+    }
+    else {
+        $result.Reason += " NOTE: the archive parses but does not look like DELTA's database - missing $($result.MissingMarkers -join ', ')."
+    }
     return $result
 }
 
@@ -2104,6 +2151,19 @@ function New-DeltaDatabaseBackup {
         $fileName = "delta-$stamp.dump"
         $target = Join-Path -Path $directory -ChildPath $fileName
     }
+    if (Test-Path -LiteralPath $target) {
+        # Still occupied after the retry, so the name is not simply a
+        # same-second collision - something is already sitting on it (a clock
+        # change, a restored copy, a hand-placed file). The dump opens its
+        # target with FileMode::Create, which truncates, so continuing here
+        # would destroy an existing backup without saying so. Refusing is the
+        # only safe answer: an existing backup is never overwritten silently.
+        $result.Stage = 'precheck'
+        $result.Path = $target
+        $result.FileName = $fileName
+        $result.Reason = "A file already exists at '$target' and would be overwritten. No backup was taken; move or delete that file, or take the backup again in a moment."
+        return $result
+    }
     $result.Path = $target
     $result.FileName = $fileName
 
@@ -2220,6 +2280,10 @@ function Invoke-DeltaBackupOperation {
         Write-Detail "Size           $(Format-DeltaByteSize $backup.SizeBytes)"
         Write-Detail "Taken in       $($backup.DurationSecs)s"
         Write-Detail "Verification   $($backup.Verification.Reason)"
+        if (-not $backup.Verification.DeltaContent) {
+            Write-DeltaWarning 'The archive is readable, but it does not contain the objects a DELTA database should.'
+            Write-DeltaWarning "Missing: $($backup.Verification.MissingMarkers -join ', '). Check which database this installation is configured against."
+        }
         if ($backup.Retention) {
             Write-Detail "Retention      $($backup.Retention.Reason)"
             foreach ($old in $backup.Retention.Removed) {
@@ -2237,7 +2301,11 @@ function Invoke-DeltaBackupOperation {
         Write-DeltaFailure 'The backup failed. No backup was produced.'
         Write-Detail "Stage reached  $($backup.Stage)"
         Write-Detail $backup.Reason
-        if ($backup.Path) {
+        # Only claim something about the target file when this run actually
+        # tried to write it. A precheck refusal leaves somebody else's file
+        # exactly where it was, and calling that "NOT a backup" would be both
+        # wrong and alarming.
+        if ($backup.Path -and $backup.Stage -ne 'precheck') {
             if ($backup.Deleted) {
                 Write-Detail 'The partial file was deleted, so nothing in backups\ can be mistaken for a valid backup.'
             }
