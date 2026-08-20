@@ -1421,7 +1421,7 @@ docker compose ps --format json          # published ports on nginx only
 
 ### Phase 12 — DELTA Uninstall & Removal
 
-**Status: COMPLETE** · 2026-08-21 · commit `<recorded below>` · **Result: PASS.** 175 Phase 12 assertions and 351 regression assertions pass — 526 in total.
+**Status: COMPLETE** · 2026-08-21 · commits `8926bfa` + `7e80f73` · **Result: PASS.** 175 Phase 12 assertions and 351 regression assertions pass — 526 in total.
 
 **Goal.** An `uninstall.ps1` that cannot delete a DELTA installation it has not first archived and verified.
 
