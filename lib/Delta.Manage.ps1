@@ -2322,6 +2322,736 @@ function Invoke-DeltaBackupOperation {
     return $backup
 }
 
+# ---------------------------------------------------------------------------
+# Update DELTA (A§18)
+#
+# The most dangerous operation in this product, because recreating the DELTA
+# container *is* a schema migration (A§2.1) and those migrations are
+# forward-only. Reverting the image does not revert the schema, so the verified
+# Phase 8 backup is not a courtesy - it is the only rollback path that exists.
+# That is why the backup gate has no override of any kind.
+#
+# The order below is chosen so that every failure lands before the step it
+# protects:
+#
+#   inspect  - a remote digest we cannot read means we do not know whether an
+#              update exists, so nothing happens at all
+#   compare  - equal digests end the operation here: no backup, no pull, no
+#              recreation, no risk (A§18.3 step 2)
+#   confirm  - the operator sees both identities before anything changes
+#   backup   - mandatory and verified; failure aborts before the pull
+#   snapshot - the previous .env is copied into backups\ before it is rewritten
+#   repin    - .env is moved to the new digest BEFORE the pull, so the pull
+#              fetches exactly the digest that was compared, not whatever the
+#              moving tag points at by then
+#   pull     - failure restores the previous .env value; nothing was recreated
+#   recreate - only the delta service, with --no-deps
+#   reload   - NGINX re-resolves its upstream (see the note on the function)
+#   migrate  - verified actively; container health is not evidence
+#   health   - the endpoint is actually requested
+#
+# Nothing here removes a container, an image, a network or a volume, and there
+# is no path to `docker compose down` in any form.
+# ---------------------------------------------------------------------------
+
+$Script:DeltaUpdateService = 'delta'
+
+function Get-DeltaImageRepository {
+    <#
+      The repository part of an image reference, with any digest or tag
+      removed. "ghcr.io/x/y@sha256:..." and "ghcr.io/x/y:prod-latest" both
+      give "ghcr.io/x/y".
+
+      The tag is split off only after the last '/', because a registry host may
+      carry a port - "localhost:5000/x" must not lose its port to a naive
+      split on ':'.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Image)
+
+    if (-not $Image) { return $null }
+    $reference = $Image.Trim()
+
+    $at = $reference.IndexOf('@')
+    if ($at -ge 0) { return $reference.Substring(0, $at) }
+
+    $slash = $reference.LastIndexOf('/')
+    $colon = $reference.LastIndexOf(':')
+    if ($colon -gt $slash) { return $reference.Substring(0, $colon) }
+    return $reference
+}
+
+function Get-DeltaRemoteImageDigest {
+    <#
+      The digest the moving tag points at *in the registry*, resolved without
+      pulling anything (A§18.2, D2). `docker buildx imagetools inspect` reads
+      the manifest anonymously - GHCR needs no credentials for this image - and
+      returns in one cheap call the same digest that `RepoDigests` reports for
+      a local copy, which is what makes the two comparable.
+
+      `docker manifest inspect -v` is deliberately NOT used as a fallback,
+      although A§18.2 offers it. Measured on this host for this image: buildx
+      returns sha256:aa180b0d... (the index digest, which is also what
+      RepoDigests carries) while `manifest inspect -v` returns
+      sha256:f61e5a90... (the amd64 child manifest). Comparing the child digest
+      against a local RepoDigest would report an update on every single check,
+      forever. A fallback that is confidently wrong is worse than no fallback,
+      so when buildx cannot answer this reports that it does not know.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Reference,
+        [int]$TimeoutSeconds = 120
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded = $false
+        Digest    = $null
+        Reference = $Reference
+        Method    = 'buildx imagetools inspect'
+        Reason    = $null
+    }
+
+    $capture = Invoke-DeltaDockerCommand -Arguments @(
+        'buildx', 'imagetools', 'inspect', $Reference, '--format', '{{.Manifest.Digest}}'
+    ) -TimeoutSeconds $TimeoutSeconds
+
+    if ($capture.Error -eq 'not-found') {
+        $result.Reason = 'The docker CLI was not found on PATH, so the registry could not be queried.'
+        return $result
+    }
+    if ($capture.TimedOut) {
+        $result.Reason = "Querying the registry timed out after $TimeoutSeconds seconds. The update check made no changes."
+        return $result
+    }
+    if ($capture.ExitCode -ne 0) {
+        $text = (($capture.StdErr + ' ' + $capture.StdOut)).Trim()
+        $result.Reason = "The registry could not be queried for '$Reference': $text"
+        return $result
+    }
+
+    $digest = ($capture.StdOut -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    if ($digest) { $digest = $digest.Trim() }
+    if ($digest -notmatch '^sha256:[0-9a-f]{64}$') {
+        $result.Reason = "The registry returned something that is not a digest for '$Reference': '$digest'"
+        return $result
+    }
+
+    $result.Digest = $digest
+    $result.Succeeded = $true
+    return $result
+}
+
+function Get-DeltaRunningImageIdentity {
+    <#
+      What is actually running, as opposed to what .env says should be.
+
+      Both are reported, because they can legitimately differ - .env repinned
+      by a partial update that never recreated the container, for instance -
+      and an operator deciding whether to update needs to know which one they
+      are looking at. The comparison that decides "is there an update" uses the
+      RUNNING digest: what is on disk in .env is an intention, what is in the
+      container is a fact.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded       = $false
+        RunningDigest   = $null
+        RunningImage    = $null
+        ConfiguredImage = $Configuration.DeltaImage
+        ConfiguredDigest = $null
+        ContainerName   = $null
+        Reason          = $null
+    }
+
+    if ($Configuration.DeltaImage -match '@(sha256:[0-9a-f]{64})$') {
+        $result.ConfiguredDigest = $Matches[1]
+    }
+
+    $services = @(Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName)
+    $delta = $services | Where-Object { $_.Service -eq $Script:DeltaUpdateService } | Select-Object -First 1
+    if (-not $delta -or -not $delta.Name) {
+        $result.Reason = 'No container exists for the delta service, so what is running cannot be established.'
+        return $result
+    }
+    $result.ContainerName = $delta.Name
+
+    $inspect = Invoke-DeltaDockerCommand -Arguments @('container', 'inspect', $delta.Name, '--format', '{{.Config.Image}}') -TimeoutSeconds 60
+    if ($inspect.ExitCode -ne 0 -or -not $inspect.StdOut) {
+        $result.Reason = "The delta container could not be inspected: $((($inspect.StdErr + ' ' + $inspect.StdOut)).Trim())"
+        return $result
+    }
+    $result.RunningImage = ($inspect.StdOut -split "`r?`n" | Select-Object -First 1).Trim()
+
+    if ($result.RunningImage -match '@(sha256:[0-9a-f]{64})$') {
+        $result.RunningDigest = $Matches[1]
+    }
+    else {
+        # The container was started from a tag rather than a digest, so ask the
+        # local image what repository digest it actually carries.
+        $digest = Get-DeltaImageDigest -Image $result.RunningImage
+        if ($digest) { $result.RunningDigest = $digest.Digest }
+    }
+
+    if (-not $result.RunningDigest) {
+        $result.Reason = "The running image '$($result.RunningImage)' has no repository digest, so it cannot be compared with the registry. This happens with a locally built image that was never pulled."
+        return $result
+    }
+
+    $result.Succeeded = $true
+    return $result
+}
+
+function Test-DeltaUpdateAvailable {
+    <#
+      Answers "is there an update?" and nothing else. It pulls nothing, writes
+      nothing and changes nothing (A§18.3 step 2).
+
+      Three outcomes, kept distinct on purpose: an update is available, no
+      update is available, or the question could not be answered. The third is
+      not a disguised "no" - an operator who is told "you are up to date" when
+      the registry was unreachable has been misinformed about the one thing
+      they asked.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded       = $false
+        UpdateAvailable = $false
+        Repository      = $null
+        Tag             = $Configuration.DeltaImageTag
+        TagReference    = $null
+        RunningDigest   = $null
+        RunningImage    = $null
+        ConfiguredImage = $Configuration.DeltaImage
+        RemoteDigest    = $null
+        TargetImage     = $null
+        Reason          = $null
+    }
+
+    $repository = Get-DeltaImageRepository -Image $Configuration.DeltaImage
+    if (-not $repository) {
+        $result.Reason = 'DELTA_IMAGE is not set in .env, so there is no image to check.'
+        return $result
+    }
+    $result.Repository = $repository
+
+    if (-not $result.Tag) {
+        $result.Reason = 'DELTA_IMAGE_TAG is not set in .env, so there is no moving tag to compare against. Set it to the tag this installation tracks (prod-latest).'
+        return $result
+    }
+    $result.TagReference = "${repository}:$($result.Tag)"
+
+    $local = Get-DeltaRunningImageIdentity -InstallRoot $InstallRoot -Configuration $Configuration
+    if (-not $local.Succeeded) {
+        $result.Reason = $local.Reason
+        return $result
+    }
+    $result.RunningDigest = $local.RunningDigest
+    $result.RunningImage  = $local.RunningImage
+
+    $remote = Get-DeltaRemoteImageDigest -Reference $result.TagReference
+    if (-not $remote.Succeeded) {
+        $result.Reason = $remote.Reason
+        return $result
+    }
+    $result.RemoteDigest = $remote.Digest
+    $result.TargetImage  = "${repository}@$($remote.Digest)"
+
+    $result.Succeeded = $true
+    $result.UpdateAvailable = ($remote.Digest -ne $local.RunningDigest)
+    $result.Reason = if ($result.UpdateAvailable) {
+        "The registry has a different image for $($result.TagReference) than the one running."
+    }
+    else {
+        "$($result.TagReference) still resolves to the image already running."
+    }
+    return $result
+}
+
+function Show-DeltaUpdateConfirmation {
+    <#
+      Everything the operator needs to decide, before anything changes. The two
+      digests are shown in full: an abbreviation is fine for a status line and
+      not for the screen where somebody authorises a forward-only migration.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Check
+    )
+
+    # Bare Enter means No, which is this project's convention for every
+    # confirmation and exactly the right default for a forward-only migration.
+    return (Read-DeltaYesNoConfirmation -Body {
+        Write-Host 'An updated DELTA image is available.'
+        Write-Host ''
+        Write-Host "  Installation   $InstallRoot"
+        Write-Host "  Repository     $($Check.Repository)"
+        Write-Host "  Tag tracked    $($Check.Tag)"
+        Write-Host "  Running now    $($Check.RunningDigest)"
+        Write-Host "  Registry has   $($Check.RemoteDigest)"
+        Write-Host ''
+        Write-Host 'What will happen, in this order:'
+        Write-Host ''
+        Write-Host '  1. A full database backup is taken and verified. If it fails, the update stops.'
+        Write-Host '  2. The new image is pulled.'
+        Write-Host '  3. Only the DELTA application container is recreated. The database container,'
+        Write-Host '     its data volume, NGINX, your uploads, certificates and configuration are not.'
+        Write-Host '  4. DELTA migrates its own schema as it starts, and that migration is verified.'
+        Write-Host ''
+        Write-DeltaWarning 'DELTA schema migrations are forward-only. Going back to the old image afterwards'
+        Write-DeltaWarning 'does NOT undo the schema change - recovery from a bad migration is a restore'
+        Write-DeltaWarning 'from the backup taken in step 1.'
+    })
+}
+
+function Copy-DeltaEnvSnapshot {
+    <#
+      Copies .env into backups\ before the update rewrites its image pin, so
+      the exact configuration that produced the previous working container can
+      be read back later (A§18.3 step 6).
+
+      Named env-<stamp>.bak, deliberately NOT delta-<stamp>.dump: that shape is
+      the only thing Phase 8 retention will ever delete, and a configuration
+      snapshot must not age out with the dumps.
+
+      Hardened with the same ACL as .env itself - a snapshot of every secret
+      sitting next to a locked-down .env with an inherited ACL would defeat the
+      hardening completely.
+    #>
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $source = Join-Path -Path $InstallRoot -ChildPath '.env'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { return $null }
+
+    $directory = Get-DeltaBackupDirectory -InstallRoot $InstallRoot
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        $null = New-Item -Path $directory -ItemType Directory -Force
+    }
+
+    $target = Join-Path -Path $directory -ChildPath ("env-{0}.bak" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Copy-Item -LiteralPath $source -Destination $target -Force
+    Protect-DeltaSecretFile -Path $target
+    return $target
+}
+
+function Update-DeltaNginxUpstream {
+    <#
+      Tells NGINX to re-resolve the DELTA container's address.
+
+      This is not housekeeping, it is a correctness requirement, and it was
+      found by measurement rather than by reading. delta.conf uses
+      `proxy_pass http://delta:3000` with no resolver directive, so NGINX
+      resolves that name ONCE when the configuration loads and caches the
+      address for the life of the worker. Recreating only the delta container
+      usually returns the same address - Docker's IPAM hands back the lowest
+      free one - but it is not guaranteed. Forced to a different address in a
+      controlled test, the site returned HTTP 502 from a perfectly healthy
+      stack until NGINX was reloaded, at which point it returned 200 again.
+
+      `nginx -s reload` is a signal to the running process: the container is
+      not recreated, not restarted and not stopped, its ID does not change, and
+      established connections are drained rather than dropped. That keeps this
+      inside Phase 9's blast radius rule while removing an intermittent 502
+      that would otherwise depend on address luck.
+
+      A reload failure is reported and never fatal on its own - the endpoint
+      check that follows is what decides whether the site actually works.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
+    $result = [PSCustomObject]@{ Attempted = $false; Reloaded = $false; Reason = $null }
+
+    $services = @(Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName)
+    $nginx = $services | Where-Object { $_.Service -eq 'nginx' } | Select-Object -First 1
+    if (-not $nginx -or $nginx.State -ne 'running') {
+        $result.Reason = 'NGINX is not running, so there is no upstream cache to refresh.'
+        return $result
+    }
+
+    $result.Attempted = $true
+    $reload = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+        'exec', '-T', 'nginx', 'nginx', '-s', 'reload'
+    ) -TimeoutSeconds 120
+
+    if ($reload.ExitCode -ne 0) {
+        $result.Reason = "NGINX would not reload: $((($reload.StdErr + ' ' + $reload.StdOut)).Trim())"
+        return $result
+    }
+
+    $result.Reloaded = $true
+    $result.Reason = 'NGINX reloaded and re-resolved the DELTA container address.'
+    return $result
+}
+
+function Invoke-DeltaUpdate {
+    <#
+      Menu option 1. The A§18.3 flow, in order, with a hard stop at every
+      boundary.
+
+      Outcome is the field to read, not Succeeded: 'up-to-date', 'cancelled',
+      'updated' and 'failed' are four different things and only the last is a
+      problem. Succeeded is true for the first three, because nothing went
+      wrong in any of them.
+
+      -AllowPrompt false does not silently authorise the update. There is no
+      operator present to confirm a forward-only migration, so it refuses.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [object]$Configuration,
+        [bool]$AllowPrompt = $true
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded       = $false
+        Outcome         = 'failed'
+        Stage           = 'start'
+        Reason          = $null
+        Check           = $null
+        Backup          = $null
+        EnvSnapshot     = $null
+        PreviousImage   = $null
+        NewImage        = $null
+        Recreated       = $false
+        NginxReload     = $null
+        Migration       = $null
+        Http            = $null
+        SchemaVersion   = $null
+    }
+
+    if (-not $Configuration) {
+        $Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
+    }
+    if (-not $Configuration) {
+        $result.Stage = 'configuration'
+        $result.Reason = "'$InstallRoot' has no readable .env, so there is no installation to update."
+        return $result
+    }
+    $result.PreviousImage = $Configuration.DeltaImage
+
+    # --- inspect ----------------------------------------------------------
+    $result.Stage = 'inspect'
+    Write-Step 'Checking for a new DELTA image'
+    Write-Detail 'The registry is queried for the tag digest only. Nothing is downloaded.'
+
+    $check = Test-DeltaUpdateAvailable -InstallRoot $InstallRoot -Configuration $Configuration
+    $result.Check = $check
+    if (-not $check.Succeeded) {
+        $result.Reason = $check.Reason
+        return $result
+    }
+
+    Write-Detail "running   $($check.RunningDigest)"
+    Write-Detail "registry  $($check.RemoteDigest)"
+
+    # --- already current --------------------------------------------------
+    if (-not $check.UpdateAvailable) {
+        $result.Stage = 'up-to-date'
+        $result.Outcome = 'up-to-date'
+        $result.Succeeded = $true
+        $result.Reason = "DELTA is already running the image $($check.TagReference) resolves to. Nothing was backed up, pulled, recreated or changed."
+        return $result
+    }
+
+    # --- confirm ----------------------------------------------------------
+    $result.Stage = 'confirm'
+    if (-not $AllowPrompt) {
+        $result.Reason = 'An update is available, but this run is non-interactive and an update is never applied without explicit confirmation. Nothing was changed.'
+        return $result
+    }
+    if (-not (Show-DeltaUpdateConfirmation -InstallRoot $InstallRoot -Check $check)) {
+        $result.Stage = 'cancelled'
+        $result.Outcome = 'cancelled'
+        $result.Succeeded = $true
+        $result.Reason = 'The update was cancelled. Nothing was backed up, pulled, recreated or changed.'
+        return $result
+    }
+
+    # --- mandatory backup -------------------------------------------------
+    # A§26 U3, confirmed: a failed pre-update backup aborts the update
+    # unconditionally. There is no switch, no prompt and no branch below that
+    # can reach the pull without this having returned Succeeded.
+    $result.Stage = 'backup'
+    Write-Host ''
+    Write-Step 'Backing up the database before updating'
+    Write-Detail 'This is mandatory. DELTA migrations are forward-only, so this backup is the only'
+    Write-Detail 'way back from a migration that goes wrong. If it fails, the update stops here.'
+
+    $backup = New-DeltaDatabaseBackup -InstallRoot $InstallRoot -Configuration $Configuration
+    $result.Backup = $backup
+    if (-not $backup -or -not $backup.Succeeded) {
+        $reason = if ($backup) { $backup.Reason } else { 'The backup operation returned no result.' }
+        $result.Reason = "The mandatory pre-update backup did not succeed, so the update stopped before anything was pulled or recreated. $reason"
+        return $result
+    }
+    Write-Success "Verified backup: $($backup.Path) ($(Format-DeltaByteSize $backup.SizeBytes))"
+
+    # --- .env snapshot and repin -----------------------------------------
+    # The pin is written BEFORE the pull so that what gets pulled is exactly
+    # the digest that was compared. Pulling the tag instead would re-resolve
+    # it, and a tag that moved in between would install something nobody
+    # looked at.
+    $result.Stage = 'snapshot'
+    $envPath = Join-Path -Path $InstallRoot -ChildPath '.env'
+    $result.EnvSnapshot = Copy-DeltaEnvSnapshot -InstallRoot $InstallRoot
+    if ($result.EnvSnapshot) { Write-Detail "Configuration snapshot: $($result.EnvSnapshot)" }
+
+    $result.Stage = 'repin'
+    $previousImage = $Configuration.DeltaImage
+    try {
+        Set-DeltaEnvValue -Path $envPath -Key 'DELTA_IMAGE' -Value $check.TargetImage
+    }
+    catch {
+        $result.Reason = "DELTA_IMAGE could not be updated in .env: $($_.Exception.Message). Nothing was pulled or recreated."
+        return $result
+    }
+    $result.NewImage = $check.TargetImage
+    Write-Detail "DELTA_IMAGE repinned to $($check.TargetImage)"
+
+    # --- pull -------------------------------------------------------------
+    $result.Stage = 'pull'
+    Write-Host ''
+    Write-Step 'Pulling the new DELTA image'
+    $pull = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+        'pull', $Script:DeltaUpdateService
+    ) -TimeoutSeconds 3600
+
+    if ($pull.ExitCode -ne 0) {
+        $text = (($pull.StdErr + "`n" + $pull.StdOut)).Trim()
+        # Put .env back. Nothing has been recreated, so restoring the pin
+        # leaves the installation exactly as it was found.
+        try { Set-DeltaEnvValue -Path $envPath -Key 'DELTA_IMAGE' -Value $previousImage } catch { }
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'Pulling the new DELTA image failed.'
+        foreach ($line in ($text -split "`r?`n" | Select-Object -Last 15)) { if ($line.Trim()) { Write-Detail "  $line" } }
+        Write-Detail ''
+        Write-Detail (Get-DeltaPullFailureExplanation -ErrorText $text)
+        $result.NewImage = $null
+        $result.Reason = "The new image could not be pulled, so nothing was recreated. DELTA_IMAGE has been restored to $previousImage and the running container is untouched."
+        return $result
+    }
+    Write-Detail 'The new image is present locally.'
+
+    # --- recreate the application container only --------------------------
+    # --no-deps is what makes the blast radius exact: the db service is
+    # already running and healthy (the backup above proves it), so Compose has
+    # no reason to touch it, and --no-deps removes its ability to. NGINX is not
+    # named and does not depend on being named - nothing recreates it.
+    $result.Stage = 'recreate'
+    Write-Host ''
+    Write-Step 'Recreating the DELTA application container'
+    Write-Detail 'Only the delta service. The database container, its volume and NGINX are not touched.'
+
+    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+        'up', '-d', '--no-deps', $Script:DeltaUpdateService
+    ) -TimeoutSeconds 900
+    if ($up.ExitCode -ne 0) {
+        $result.Reason = "Recreating the DELTA container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim()). The database and its backup are untouched."
+        return $result
+    }
+    $result.Recreated = $true
+
+    # Compose decides whether to recreate from its own config hash. Verify the
+    # outcome rather than assuming it: if the container is somehow still on the
+    # old image, say so and recreate explicitly. This also makes a half-applied
+    # earlier update (env repinned, container never replaced) recoverable by
+    # simply running the update again.
+    $running = Get-DeltaRunningImageIdentity -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
+    if ($running.Succeeded -and $running.RunningDigest -ne $check.RemoteDigest) {
+        Write-Detail 'The container is still on the previous image; recreating it explicitly.'
+        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'up', '-d', '--no-deps', '--force-recreate', $Script:DeltaUpdateService
+        ) -TimeoutSeconds 900
+        if ($up.ExitCode -ne 0) {
+            $result.Reason = "The DELTA container could not be recreated onto the new image: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
+            return $result
+        }
+        $running = Get-DeltaRunningImageIdentity -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
+        if ($running.Succeeded -and $running.RunningDigest -ne $check.RemoteDigest) {
+            # Recreated and still not on the target image. Reporting success
+            # here would claim an update that did not happen, which is the one
+            # thing this operation must never do.
+            #
+            # The container was still replaced, so NGINX is refreshed on the
+            # way out: leaving the site returning 502 on top of a failed update
+            # would turn one problem into two.
+            $result.NginxReload = Update-DeltaNginxUpstream -InstallRoot $InstallRoot -Configuration $Configuration
+            $result.Reason = "The DELTA container was recreated but is still running $($running.RunningDigest) rather than the target $($check.RemoteDigest). The update has NOT been applied. The database and the pre-update backup are untouched."
+            return $result
+        }
+    }
+
+    # --- nginx upstream ---------------------------------------------------
+    # Immediately after the container is replaced, and deliberately BEFORE the
+    # health wait. The new container has its address the moment it is created,
+    # so NGINX can re-resolve straight away - and doing it here means that if
+    # anything below fails, the operator is not additionally left with a 502
+    # from NGINX still pointing at the container that no longer exists.
+    # Measured: with the reload after the health wait, an update that aborted
+    # at the health or migration stage left the site returning 502 even though
+    # the stack was running.
+    $result.Stage = 'reload'
+    $result.NginxReload = Update-DeltaNginxUpstream -InstallRoot $InstallRoot -Configuration $Configuration
+    if ($result.NginxReload.Reason) { Write-Detail $result.NginxReload.Reason }
+
+    # --- health -----------------------------------------------------------
+    $result.Stage = 'health'
+    $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service $Script:DeltaUpdateService -TimeoutSeconds $Script:DeltaAppHealthTimeoutSeconds
+    if (-not $health.Succeeded) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure "The updated DELTA container did not become healthy within $Script:DeltaAppHealthTimeoutSeconds seconds."
+        Show-DeltaServiceLogs -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service $Script:DeltaUpdateService
+        $result.Reason = 'The updated container did not become healthy. The database was not touched by this installer and the pre-update backup is intact.'
+        return $result
+    }
+
+    # --- migration --------------------------------------------------------
+    # The container has already run its own init/migration by the time it is
+    # healthy. Health is not evidence that it worked: the image runs psql
+    # without ON_ERROR_STOP, so a half-migrated schema still reports healthy
+    # (A§2.1). This is the check that distinguishes "the container started"
+    # from "DELTA started and its migration completed".
+    $result.Stage = 'migration'
+    $result.Migration = Test-DeltaMigrationOutcome -InstallRoot $InstallRoot -Configuration $Configuration
+    $result.SchemaVersion = $result.Migration.SchemaVersion
+    if (-not $result.Migration.Succeeded) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'The schema migration after the update did not verify.'
+        Write-Detail $result.Migration.Reason
+        if ($result.Migration.Errors.Count -gt 0) {
+            Write-Detail ''
+            Write-Detail 'Errors reported during migration:'
+            foreach ($line in ($result.Migration.Errors | Select-Object -First 20)) { Write-Detail "  $line" }
+        }
+        Write-Detail ''
+        Write-Detail "Schema version now reads: $(if ($result.Migration.SchemaVersion) { $result.Migration.SchemaVersion } else { 'unreadable' })"
+        Write-Detail ''
+        Write-DeltaWarning 'Putting the old image back is NOT sufficient. DELTA migrations are forward-only,'
+        Write-DeltaWarning 'so if the schema changed, an older application will run against a newer schema.'
+        Write-DeltaWarning 'The recovery path is a restore from the backup taken before this update:'
+        Write-Detail "  $($result.Backup.Path)"
+        Write-Detail '  See "Restoring the database" in README.md.'
+        $result.Reason = 'The post-update migration verification failed.'
+        return $result
+    }
+
+    # --- endpoint ---------------------------------------------------------
+    $result.Stage = 'verify'
+    Write-Step 'Verifying the endpoint'
+    $scheme = if ($Configuration.TlsEnabled) { 'https' } else { 'http' }
+    $port = if ($Configuration.TlsEnabled) { [int]$Configuration.HttpsPort } else { [int]$Configuration.HttpPort }
+    $url = (Get-DeltaPublicUrl -Scheme $scheme -HostName 'localhost' -Port $port) + '/'
+
+    $result.Http = Test-DeltaHttpEndpoint -Url $url -TimeoutSeconds 60
+    if (-not $result.Http.Succeeded) {
+        Write-DeltaFailure ''
+        Write-DeltaFailure "The updated stack did not answer at $url."
+        if ($result.Http.Error) { Write-Detail $result.Http.Error } else { Write-Detail "HTTP $($result.Http.StatusCode)" }
+        Show-DeltaServiceLogs -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'nginx' -Tail 20
+        $result.Reason = "The update was applied and the schema verified at version $($result.SchemaVersion), but the site did not answer over HTTP."
+        return $result
+    }
+    Write-Detail "[ ok ]     GET $url returned $($result.Http.StatusCode)"
+
+    # --- record -----------------------------------------------------------
+    # lastUpdate is an audit record, not the detection mechanism: the check at
+    # the top of this function derives everything it needs from Docker and the
+    # registry, so nothing here is load-bearing and an older state file stays
+    # perfectly readable.
+    $result.Stage = 'record'
+    try {
+        Write-DeltaInstallState -InstallRoot $InstallRoot -Properties ([ordered]@{
+            deltaImage         = $check.TargetImage
+            deltaImageDigest   = $check.RemoteDigest
+            deltaSchemaVersion = $result.SchemaVersion
+            lastUpdate         = [ordered]@{
+                at             = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                fromDigest     = $check.RunningDigest
+                toDigest       = $check.RemoteDigest
+                tag            = $check.Tag
+                backup         = $result.Backup.Path
+                envSnapshot    = $result.EnvSnapshot
+                schemaVersion  = $result.SchemaVersion
+            }
+        })
+    }
+    catch {
+        Write-DeltaWarning "The update succeeded but the installation state file could not be updated: $($_.Exception.Message)"
+    }
+
+    $result.Stage = 'complete'
+    $result.Outcome = 'updated'
+    $result.Succeeded = $true
+    $result.Reason = "DELTA updated from $($check.RunningDigest) to $($check.RemoteDigest); schema $($result.SchemaVersion)."
+    return $result
+}
+
+function Invoke-DeltaUpdateOperation {
+    <#
+      Menu option 1's reporting wrapper: runs the update and says what
+      happened, in the operator's terms, for each of the four outcomes.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration,
+        [bool]$AllowPrompt = $true
+    )
+
+    Show-Section -Title 'Update DELTA' -Subtitle $InstallRoot
+
+    $update = Invoke-DeltaUpdate -InstallRoot $InstallRoot -Configuration $Configuration -AllowPrompt $AllowPrompt
+
+    Write-Host ''
+    switch ($update.Outcome) {
+        'up-to-date' {
+            Write-Success 'DELTA is already up to date.'
+            Write-Detail "Tag tracked    $($update.Check.TagReference)"
+            Write-Detail "Digest         $($update.Check.RemoteDigest)"
+            Write-Detail ''
+            Write-Detail 'Nothing was backed up, pulled, recreated or changed.'
+        }
+        'cancelled' {
+            Write-Detail 'The update was cancelled.'
+            Write-Detail 'Nothing was backed up, pulled, recreated or changed.'
+        }
+        'updated' {
+            Write-Success 'DELTA updated.'
+            Write-Detail "From           $($update.Check.RunningDigest)"
+            Write-Detail "To             $($update.Check.RemoteDigest)"
+            Write-Detail "Schema         $($update.SchemaVersion)"
+            Write-Detail "Endpoint       HTTP $($update.Http.StatusCode)"
+            Write-Detail "Backup used    $($update.Backup.Path)"
+            if ($update.EnvSnapshot) { Write-Detail "Config saved   $($update.EnvSnapshot)" }
+            Write-Detail ''
+            Write-Detail 'The database container, its data volume, NGINX, uploads and certificates were'
+            Write-Detail 'not recreated. Keep the backup above until the new version has been exercised.'
+        }
+        default {
+            Write-DeltaFailure 'The update did not complete.'
+            Write-Detail "Stage reached  $($update.Stage)"
+            Write-Detail $update.Reason
+            if ($update.Backup -and $update.Backup.Succeeded) {
+                Write-Detail ''
+                Write-Detail "The pre-update backup is intact and verified: $($update.Backup.Path)"
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Detail 'Press Enter to return to the menu.'
+    $null = Read-Host
+    return $update
+}
+
 function Show-DeltaPhasePlaceholder {
     <#
       An operation the completed product has and this build does not yet. It
@@ -2378,7 +3108,7 @@ function Show-DeltaManagementMenu {
 
     Write-Host ''
     if ($canRun) {
-        Write-Host '  1. Update DELTA                  (Phase 9 - not implemented yet)'
+        Write-Host '  1. Update DELTA'
         Write-Host '  2. Backup Database'
         Write-Host '  3. Stop DELTA'
         Write-Host '  4. Restart DELTA'
@@ -2465,8 +3195,7 @@ function Invoke-DeltaManagementMode {
             }
             '1' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Update DELTA'; continue }
-                Show-DeltaPhasePlaceholder -Operation 'Update DELTA' -Phase 9 `
-                    -Description 'Compares the pinned image digest with the one behind prod-latest, backs the database up, pulls, recreates the DELTA container and verifies the migration.'
+                $null = Invoke-DeltaUpdateOperation -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
             }
             '2' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Backup Database'; continue }

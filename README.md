@@ -223,7 +223,7 @@ different claims.
 ### The menu
 
 ```
-  1. Update DELTA                  (a later version of this installer)
+  1. Update DELTA
   2. Backup Database
   3. Stop DELTA
   4. Restart DELTA
@@ -251,6 +251,8 @@ status.
 - **Restart DELTA** is a stop followed by a start, with all the same checks. It
   reports success only after the database, the application and NGINX are healthy
   *and* the configured address has answered.
+- **Update DELTA** checks whether a new application image has been published
+  and, if so, updates to it safely — see [Updating DELTA](#updating-delta) below.
 - **Backup Database** writes a verified dump to `C:\DELTA\backups\` — see
   [Backing up the database](#backing-up-the-database) below.
 - **DELTA Access Guide** shows the real URLs for this installation, tests the
@@ -309,6 +311,78 @@ nothing to do. Run it by hand at any time:
 ```powershell
 .\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
 ```
+
+### Updating DELTA
+
+Menu option **1** updates the DELTA application to the current published image.
+
+**How it decides whether there is anything to do.** DELTA is published under the
+tag `prod-latest`, and that tag *moves* — the same tag name points at different
+images over time. So "is the tag the same?" is not a useful question. The
+installer compares **image digests** instead: the exact content identity of what
+your container is running against the content identity the registry currently
+serves for `prod-latest`.
+
+```
+==> Checking for a new DELTA image
+    The registry is queried for the tag digest only. Nothing is downloaded.
+    running   sha256:aa180b0d7948e09f301fac2148f6f9134507387e017a5475a61eb32f771692f5
+    registry  sha256:aa180b0d7948e09f301fac2148f6f9134507387e017a5475a61eb32f771692f5
+```
+
+That check reads the registry manifest only — **nothing is downloaded**, and the
+DELTA image is around 214 MB, so this costs a second rather than several
+minutes. If the two digests match, the utility says so and **stops**: no backup,
+no pull, no container recreation, nothing changed at all.
+
+If the registry cannot be reached, the utility says *that*, and stops. It will
+not report "you are up to date" when the truth is "I could not find out".
+
+**Before anything changes** you get a summary — where the installation is, which
+tag it tracks, both digests in full, and what is about to happen — and you have
+to confirm. Pressing Enter without typing anything means no. Cancelling changes
+nothing whatsoever.
+
+**Then, in this order:**
+
+1. **A full database backup is taken and verified** (the same operation as menu
+   option 2, including the `pg_restore --list` check). This is not optional and
+   there is no way to skip it. **If the backup fails for any reason, the update
+   stops right there** — before anything is pulled and before any container is
+   replaced.
+2. Your current `.env` is copied to `C:\DELTA\backups\env-<timestamp>.bak`.
+3. `DELTA_IMAGE` in `.env` is repinned to the exact digest that was compared, and
+   the new image is pulled **by digest** — so what you install is what you were
+   shown, even if the tag moves in the meantime. If the pull fails, `.env` is put
+   back and nothing has been recreated.
+4. **Only the DELTA application container is recreated.** The database container,
+   its data volume, NGINX, your uploads, certificates and configuration are not.
+5. NGINX is told to re-resolve the application's address (a signal to the running
+   process — it is not restarted).
+6. DELTA runs its own schema migration as it starts, and that migration is
+   **actively verified** — see below.
+7. The site is actually requested, and the result reported.
+
+**Why the backup is mandatory.** Starting the new container *is* the schema
+migration, and DELTA's migrations are **forward-only** — there are no down
+migrations. Putting the old image back does not put the old schema back. That
+makes the pre-update backup the only route back from a bad migration, which is
+why it cannot be skipped.
+
+**Why "the container started" is not success.** DELTA's start command runs `psql`
+without `ON_ERROR_STOP`, so a migration can fail half-way, `psql` still exits 0,
+the application still starts, and Docker still reports the container healthy — on
+a half-migrated schema. The updater therefore checks three separate things: that
+the log shows a migration branch for *this* start, that it contains no `psql`
+errors, and that `dts_system_info.version_no` can actually be read back. All
+three must hold before the update is called a success.
+
+**If the update fails**, you are told which stage it reached and what is true
+afterwards. The pre-update backup is always preserved and its path is printed. On
+a migration failure the utility states plainly that **reverting the image is not
+sufficient** and that the recovery path is
+[restoring the database](#restoring-the-database) from that backup. Nothing here
+performs an automatic rollback, and nothing claims to.
 
 ### Backing up the database
 
