@@ -1215,7 +1215,7 @@ Two things the audit found to be **already correct**, and which this phase there
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · commits `d92c781` (phase inserted, audit), `92d4fda` (implementation), `af0ca0b` (defect fix) · **Acceptance gate: met — but only after an operator-found defect was fixed. The first acceptance was wrong, and the reason is recorded below because it matters more than the fix.**
+**Status: COMPLETE** · 2026-08-20 · commits `d92c781` (phase inserted, audit), `92d4fda` (implementation), `30e6b89` (defect fix) · **Acceptance gate: met — but only after an operator-found defect was fixed. The first acceptance was wrong, and the reason is recorded below because it matters more than the fix.**
 
 > **Acceptance corrected 2026-08-20.** Phase 10.5 was first reported PASS on evidence that included `GET /` = 200 and `GET /en/admin/login` = 200. Manual operator testing then found that `/en/admin/login` was rendering DELTA's **"System configuration errors"** page, listing `EMAIL_TRANSPORT`, `EMAIL_FROM` and `AUTHENTICATION_SUPPORTED` as missing. **That page returns HTTP 200.** Every status-code check in this project, from Phase 3 onward, had been passing over it. The defect and the validation gap are both recorded under "The acceptance defect" below.
 
