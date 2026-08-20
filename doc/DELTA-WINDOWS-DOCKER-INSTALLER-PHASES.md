@@ -1215,7 +1215,7 @@ Two things the audit found to be **already correct**, and which this phase there
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · commit `ba4c1e6` · **Acceptance gate: met.** All thirteen items demonstrated physically on isolated installations. 100/100 Phase 10.5 assertions pass.
+**Status: COMPLETE** · 2026-08-20 · commits `d92c781` (phase inserted, audit) and `92d4fda` (implementation) · **Acceptance gate: met.** All thirteen items demonstrated physically on isolated installations. 100/100 Phase 10.5 assertions pass.
 
 Delivered: the fresh-install settings section of `lib\Delta.Config.ps1` (`Test-DeltaHostName`, `Read-DeltaHostName`, `Read-DeltaInstallPassword`, `Read-DeltaFreshInstallSettings`); credential threading through `lib\Delta.Stack.ps1`; `-NewPasswordWasGenerated` on the Phase 5 primitive in `lib\Delta.Manage.ps1`; the settings step in `setup.ps1`; the fresh-install and rerun sections of `README.md`.
 
