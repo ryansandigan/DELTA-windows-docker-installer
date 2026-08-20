@@ -1288,9 +1288,27 @@ Delivered: the fresh-install settings section of `lib\Delta.Config.ps1` (`Test-D
 
 **A test-harness fault worth recording.** The Phase 10 SMTP suite's reset helper deleted `EMAIL_TRANSPORT` and `EMAIL_FROM` to create its baseline. After this fix that is no longer a clean baseline — it is a broken installation — and it left the operator's `.env` without them. The helper now restores the defaults instead of removing the keys.
 
+#### A second operator finding: EMAIL_FROM rejected a valid mailbox
+
+**Reported.** The SMTP prompt refused `"DELTA" <onboarding@resend.dev>` and accepted only a bare address.
+
+**Root cause.** The installer's validator was a bare-address regex, `^[^@\s]+@[^@\s]+\.[^@\s]+$`. That is **stricter than the application it configures** — which is never the right relationship. Read from the running image: `EMAIL_FROM` goes straight into `nodemailer.sendMail({ from: ... })`, which takes an RFC 5322 mailbox; DELTA's own validator asks only for an `@` and a `.`; and DELTA's built-in fallback is `'"Example" <no-reply@example.com>'`. The application does not merely tolerate the display-name form — it ships it as its default.
+
+**Fixed** with `Test-DeltaEmailFrom`, which accepts `address@host.tld`, `<address@host.tld>`, `Display Name <address@host.tld>` and `"Display Name" <address@host.tld>`, and still rejects a missing `@`, a domain with no dot, unbalanced angle brackets, trailing text after `>`, more than one `@`, spaces in a bare address, and a value carrying both quote characters (which `.env` cannot represent). Each rejection names the specific defect rather than saying "invalid".
+
+**The quoting question, answered by measurement rather than assumption.** A display name contains double quotes, so `Format-DeltaEnvValue` frames the line in single quotes. Whether Compose's `env_file` parser then delivers the value intact was tested directly against Compose before the validator was written: `EMAIL_FROM='"DELTA" <onboarding@resend.dev>'` arrives in the container as `"DELTA" <onboarding@resend.dev>`, byte for byte. The framing adapts per value and was recorded for each form:
+
+| Typed | `.env` line | In the container |
+|---|---|---|
+| `onboarding@resend.dev` | `EMAIL_FROM="onboarding@resend.dev"` | identical |
+| `"DELTA" <onboarding@resend.dev>` | `EMAIL_FROM='"DELTA" <onboarding@resend.dev>'` | identical |
+| `DELTA Notifications <onboarding@resend.dev>` | `EMAIL_FROM="DELTA Notifications <onboarding@resend.dev>"` | identical |
+
+**Validation** — 23/23 on an isolated installation (`C:\Workspace\delta-e`), plus 17 validator cases. All three forms were applied through **menu option 5**, and for each: the value in `.env` and the value `printenv` reports **inside the running container** are exactly what was typed, and `/`, `/en/admin/login` and `/en/user/login` all return 200 with an empty `configErrors` payload. A malformed value re-prompted rather than being accepted, and the recorded prompt list shows both attempts. The SMTP regression suite gained a permanent `S8` section covering both accepted forms, six rejected ones, and the container round trip: **66/66**.
+
 **Phase 6 is untouched and remains PARTIAL.** Nothing here measures, infers or records a reboot result.
 
-**For Phase 11.** Every endpoint assertion in this project that checks only a status code is now known to be weak against this class of failure. Phase 11's acceptance pass should assert on the `configErrors` payload wherever it exercises a page, and should treat "HTTP 200" as necessary but never sufficient.
+**For Phase 11.** Two lessons carry forward. Every endpoint assertion in this project that checks only a status code is weak against the configuration-error class of failure, so Phase 11's acceptance pass should assert on the `configErrors` payload wherever it exercises a page and treat "HTTP 200" as necessary but never sufficient. And both operator findings in this phase were the installer being **stricter or thinner than the application it configures** — the contract belongs to DELTA, and where this installer validates or defaults anything, that decision should be read out of the image rather than assumed.
 
 ---
 

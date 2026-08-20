@@ -598,6 +598,20 @@ page, so an unauthenticated relay cannot be expressed here. That is DELTA's
 constraint, not the installer's. Anything already configured is offered as the
 default — press Enter to keep it.
 
+**The from address takes either form**, because DELTA passes it straight to its
+mail library and its own built-in default uses the second one:
+
+```
+onboarding@resend.dev
+"DELTA" <onboarding@resend.dev>
+DELTA Notifications <onboarding@resend.dev>
+```
+
+The quotes and the display name are stored and delivered to DELTA exactly as
+you typed them. What is still rejected is anything genuinely malformed — no
+`@`, a domain with no dot, an unbalanced `<`, spaces in a bare address — and
+the message names which part is wrong.
+
 Switching back to **File** leaves the SMTP server settings in `.env` untouched,
 so you can switch to `smtp` again later without retyping them.
 

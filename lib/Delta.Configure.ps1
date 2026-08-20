@@ -237,6 +237,97 @@ function Read-DeltaSmtpPassword {
     }
 }
 
+function Test-DeltaEmailFrom {
+    <#
+      Whether a value is usable as EMAIL_FROM.
+
+      DELTA passes EMAIL_FROM straight to nodemailer's `from` field, which
+      takes an RFC 5322 mailbox - so a display name is not an exotic extra, it
+      is the ordinary form. DELTA's own built-in fallback is
+      '"Example" <no-reply@example.com>', which settles the question: the
+      application does not merely tolerate the display-name form, it ships it
+      as its default. DELTA's own validator asks only that the value contain an
+      "@" and a ".".
+
+      An earlier version of this installer accepted a bare address only, which
+      refused '"DELTA" <onboarding@resend.dev>' - a value the application is
+      perfectly happy with. An installer must not be stricter than the thing it
+      configures.
+
+      Accepted:
+        onboarding@resend.dev
+        <onboarding@resend.dev>
+        DELTA Notifications <onboarding@resend.dev>
+        "DELTA" <onboarding@resend.dev>
+
+      Still rejected: anything without an "@", a domain without a dot,
+      unbalanced angle brackets, a bare address containing spaces, and
+      trailing rubbish after the closing bracket.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $result = [PSCustomObject]@{
+        IsValid     = $false
+        Reason      = $null
+        Address     = $null
+        DisplayName = $null
+    }
+
+    $candidate = ([string]$Value).Trim()
+    if (-not $candidate) {
+        $result.Reason = 'A sender address is required.'
+        return $result
+    }
+    # .env can frame a value in single or double quotes but has no escaping
+    # convention every consumer agrees on, so a value needing both is refused
+    # here - while the operator can still retype it - rather than at the write.
+    if ($candidate.Contains('"') -and $candidate.Contains("'")) {
+        $result.Reason = 'A sender address cannot contain both single and double quotes.'
+        return $result
+    }
+
+    # local@domain.tld - no whitespace, no angle brackets, exactly one @, and a
+    # dot in the domain, which is what DELTA itself checks for.
+    $addr = '[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+'
+
+    if ($candidate -match "^(?<addr>$addr)`$") {
+        $result.Address = $Matches['addr']
+        $result.IsValid = $true
+        return $result
+    }
+    if ($candidate -match "^(?:(?<disp>`"[^`"]*`"|[^<>@`"]+?)\s*)?<(?<addr>$addr)>`$") {
+        $result.Address = $Matches['addr']
+        if ($Matches['disp']) { $result.DisplayName = $Matches['disp'].Trim() }
+        $result.IsValid = $true
+        return $result
+    }
+
+    # Name the specific defect - "invalid" on its own tells the operator
+    # nothing about which half of the value to go and fix.
+    if ($candidate -notmatch '@') {
+        $result.Reason = "'$candidate' has no @, so it is not an email address."
+    }
+    elseif (($candidate -match '<') -ne ($candidate -match '>')) {
+        $result.Reason = "'$candidate' has an unbalanced angle bracket. Use: `"Display Name`" <address@example.org>"
+    }
+    elseif ($candidate -match '<' -and $candidate -notmatch '>\s*$') {
+        $result.Reason = "'$candidate' has something after the closing angle bracket."
+    }
+    elseif ((($candidate -split '@').Count - 1) -gt 1 -and $candidate -notmatch '<') {
+        $result.Reason = "'$candidate' has more than one @."
+    }
+    elseif ($candidate -match '@[^\s<>@]*$' -and $candidate -notmatch '@[^\s<>@]*\.[^\s<>@]+') {
+        $result.Reason = "The domain in '$candidate' has no dot. DELTA requires one."
+    }
+    elseif ($candidate -match '\s' -and $candidate -notmatch '<') {
+        $result.Reason = "'$candidate' contains spaces. Use a plain address, or a display name with the address in angle brackets: `"DELTA`" <delta@example.org>"
+    }
+    else {
+        $result.Reason = "'$candidate' is not a valid sender address. Use delta@example.org or `"DELTA`" <delta@example.org>."
+    }
+    return $result
+}
+
 function Test-DeltaSmtpEndpoint {
     <#
       The A§20.1 validation, and deliberately no more than it: the host
@@ -439,9 +530,14 @@ function Invoke-DeltaSmtpConfiguration {
         # Required, not optional: DELTA validates EMAIL_FROM on every page load
         # and shows a configuration-error page when it is missing or has no "@"
         # and ".". An empty answer here would break the login page.
+        #
+        # Both mailbox forms are accepted, because nodemailer accepts both and
+        # DELTA's own fallback uses the display-name one.
+        Write-Detail 'Either delta@example.org or "DELTA" <delta@example.org>.'
         $collected['EMAIL_FROM'] = Read-DeltaEmailSettingValue -Prompt 'From address (EMAIL_FROM)' -CurrentValue $current.From -Validator {
             param($v)
-            if ($v -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return "'$v' does not look like an email address. DELTA requires an '@' and a '.'." }
+            $check = Test-DeltaEmailFrom -Value $v
+            if (-not $check.IsValid) { return $check.Reason }
             return $null
         }
 
