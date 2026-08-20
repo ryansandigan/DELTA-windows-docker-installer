@@ -224,7 +224,7 @@ different claims.
 
 ```
   1. Update DELTA                  (a later version of this installer)
-  2. Backup Database               (a later version of this installer)
+  2. Backup Database
   3. Stop DELTA
   4. Restart DELTA
   5. Configure SMTP                (a later version of this installer)
@@ -251,6 +251,8 @@ status.
 - **Restart DELTA** is a stop followed by a start, with all the same checks. It
   reports success only after the database, the application and NGINX are healthy
   *and* the configured address has answered.
+- **Backup Database** writes a verified dump to `C:\DELTA\backups\` — see
+  [Backing up the database](#backing-up-the-database) below.
 - **DELTA Access Guide** shows the real URLs for this installation, tests the
   endpoint, and tells you plainly if it did not answer.
 
@@ -307,6 +309,122 @@ nothing to do. Run it by hand at any time:
 ```powershell
 .\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
 ```
+
+### Backing up the database
+
+Menu option **2** takes a full logical backup of the DELTA database:
+
+```
+C:\DELTA\backups\delta-20260820-092752.dump
+```
+
+`pg_dump -Fc` runs **inside the database container** — its client matches the
+server, whereas the client inside the DELTA application container is an older
+major version and refuses to talk to it at all. The dump is streamed straight
+out of the container into the Windows file, byte for byte, and nothing is
+written inside the container or copied out afterwards. PostgreSQL is never
+published on a host port; the backup goes through Docker.
+
+A file appearing in `backups\` is not what makes a backup. Before the utility
+reports success it confirms that `pg_dump` exited cleanly, that the file exists
+and is not empty, and that `pg_restore --list` can parse it — read back through
+the same container. **If any of that fails, the file is deleted** and the
+failure is reported with PostgreSQL's own error text. That guarantee matters:
+nothing left in `backups\` is a dump that was never read back.
+
+```
+Backup complete and verified.
+    File           C:\DELTA\backups\delta-20260820-092752.dump
+    Size           324.6 KB
+    Taken in       0.5s
+    Verification   pg_restore --list parsed the archive: 234 table-of-contents entries.
+    Retention      0 old dump(s) removed, 2 retained, 0 bytes reclaimed.
+```
+
+**Retention.** After a successful backup, old dumps are tidied. A dump is
+deleted only when **both** of these are true:
+
+- it is not one of the newest **10** dumps, **and**
+- it is more than **30 days** old.
+
+So the ten most recent survive however old they are, everything from the last
+month survives however many there are, and only the old surplus goes. Only files
+named `delta-YYYYMMDD-HHmmss.dump` in this installation's own `backups\` folder
+are ever considered — anything else you keep there is left alone. The space
+reclaimed is reported.
+
+**What is and is not in the dump.** The dump contains the DELTA database:
+schema, data, and the `CREATE EXTENSION postgis` that makes the geometry columns
+work. It does **not** contain your uploads (`C:\DELTA\uploads\`), your
+configuration (`C:\DELTA\.env`) or your certificates (`C:\DELTA\certs\`). Those
+are ordinary Windows folders — copy them with whatever you already use, and read
+[Antivirus and backup software](#antivirus-and-backup-software) first.
+
+### Restoring the database
+
+**There is no restore menu entry, and that is deliberate.** Restoring replaces
+the live database. It is a rare, deliberate, destructive act, and it belongs in
+your hands rather than one keystroke away in a menu.
+
+> **Stop the DELTA application container first.** DELTA runs its own schema
+> initialisation and migration *every time its container starts*, and its restart
+> policy will bring it back on its own. If it comes back while a restore is only
+> half done, it will run a migration against a half-restored schema — and those
+> migrations are forward-only, so there is no undo. Leave the database container
+> running: that is what performs the restore.
+
+Run these from an elevated PowerShell prompt. Replace the file name with the
+backup you want, and `delta` with your `POSTGRES_USER` / `POSTGRES_DB` if you
+changed them in `C:\DELTA\.env`.
+
+```powershell
+cd C:\DELTA
+
+# 0. Take a fresh backup first, if the database is still readable at all.
+#    Menu option 2 in setup.ps1.
+
+# 1. Stop ONLY the application. The database stays up.
+docker compose stop delta
+
+# 2. Confirm the dump you are about to restore actually parses.
+cmd /c "docker compose exec -T db pg_restore --list < C:\DELTA\backups\delta-20260820-092752.dump"
+
+# 3. Restore it, dropping the objects it replaces as it goes.
+cmd /c "docker compose exec -T db pg_restore -U delta -d delta --clean --if-exists < C:\DELTA\backups\delta-20260820-092752.dump"
+
+# 4. Check what came back before letting the application near it.
+docker compose exec -T db psql -U delta -d delta -c "select version_no from dts_system_info;"
+docker compose exec -T db psql -U delta -d delta -c "select postgis_lib_version();"
+
+# 5. Start the application again. It will run its migration check on start.
+docker compose start delta
+docker compose ps
+```
+
+`cmd /c "... < file"` is used for steps 2 and 3 because PowerShell's own `<` and
+`|` convert the stream to text, which corrupts a binary dump. `cmd`'s redirect
+passes the bytes through unchanged. If you prefer, `Get-Content -Encoding Byte`
+piping is **not** a safe substitute on Windows PowerShell 5.1.
+
+Notes:
+
+- `--clean --if-exists` drops each object before recreating it, so restoring
+  over an existing database works. Some `DROP ... IF EXISTS` notices during the
+  restore are normal.
+- The dump records `CREATE EXTENSION postgis`, not PostGIS itself, so the target
+  must be a PostGIS-capable server. The `postgis/postgis:17-3.5` image this
+  installer uses is exactly that, which is why restoring into this stack works.
+- To restore into a **different** or empty database rather than over the live
+  one — which is the safer way to inspect a backup — create it first:
+  ```powershell
+  docker compose exec -T db psql -U delta -d postgres -c "CREATE DATABASE delta_check TEMPLATE template0;"
+  cmd /c "docker compose exec -T db pg_restore -U delta -d delta_check < C:\DELTA\backups\delta-20260820-092752.dump"
+  docker compose exec -T db psql -U delta -d delta_check -c "select version_no from dts_system_info;"
+  docker compose exec -T db psql -U delta -d postgres -c "DROP DATABASE delta_check;"
+  ```
+- If the restore fails part-way, **do not start `delta`**. Fix the restore or
+  restore an older dump first. An application started against a half-restored
+  schema will migrate it.
 
 ### Changing ports, hostname or TLS
 

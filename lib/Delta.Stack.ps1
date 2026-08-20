@@ -471,6 +471,31 @@ function New-DeltaNginxConfiguration {
 # volume belonging to anything else.
 # ---------------------------------------------------------------------------
 
+function Get-DeltaComposeArguments {
+    <#
+      The scoping prefix every Compose call in this installer carries, plus the
+      caller's own arguments. It exists as a function so that the byte-exact
+      transport below cannot drift from the text one: there is one definition of
+      "this installation's Compose project", and both use it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+
+    $composeFile = Join-Path -Path $InstallRoot -ChildPath 'docker-compose.yml'
+    $envFile     = Join-Path -Path $InstallRoot -ChildPath '.env'
+
+    return @(
+        'compose'
+        '--project-name', $ProjectName
+        '--project-directory', $InstallRoot
+        '--file', $composeFile
+        '--env-file', $envFile
+    ) + $Arguments
+}
+
 function Invoke-DeltaCompose {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -479,18 +504,35 @@ function Invoke-DeltaCompose {
         [int]$TimeoutSeconds = 600
     )
 
-    $composeFile = Join-Path -Path $InstallRoot -ChildPath 'docker-compose.yml'
-    $envFile     = Join-Path -Path $InstallRoot -ChildPath '.env'
-
-    $full = @(
-        'compose'
-        '--project-name', $ProjectName
-        '--project-directory', $InstallRoot
-        '--file', $composeFile
-        '--env-file', $envFile
-    ) + $Arguments
-
+    $full = Get-DeltaComposeArguments -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments $Arguments
     return (Invoke-DeltaDockerCommand -Arguments $full -TimeoutSeconds $TimeoutSeconds)
+}
+
+function Invoke-DeltaComposeBinary {
+    <#
+      Invoke-DeltaCompose for a command whose stdout or stdin is binary - which
+      in this product means exactly two things: pg_dump writing a custom-format
+      archive out, and pg_restore reading one back in.
+
+      Same scoping, same project, different transport: the bytes go straight
+      between the child process and a Windows file (A§19.1). Nothing decodes
+      them, and the dump is never written inside the container and copied out.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$OutputFile,
+        [string]$InputFile,
+        [int]$TimeoutSeconds = 1800
+    )
+
+    $full = Get-DeltaComposeArguments -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments $Arguments
+
+    $splat = @{ Arguments = $full; TimeoutSeconds = $TimeoutSeconds }
+    if ($OutputFile) { $splat['OutputFile'] = $OutputFile }
+    if ($InputFile)  { $splat['InputFile']  = $InputFile }
+    return (Invoke-DeltaDockerBinaryStream @splat)
 }
 
 function Test-DeltaComposeConfiguration {

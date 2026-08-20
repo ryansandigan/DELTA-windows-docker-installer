@@ -656,6 +656,7 @@ function Get-DeltaManagementStatus {
         Endpoint      = $null
         Startup       = $null
         StartupTask   = $null
+        Backups       = $null
     }
 
     $status.Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
@@ -749,6 +750,17 @@ function Get-DeltaManagementStatus {
     }
     if ($status.Configuration) {
         $status.StartupTask = Get-DeltaStartupTaskState -ProjectName $status.Configuration.ProjectName
+    }
+
+    # Filesystem only - no second Compose query, which would undo the one-query
+    # rule this function exists to keep (A§17.3).
+    $backups = @(Get-DeltaBackupFile -Directory (Get-DeltaBackupDirectory -InstallRoot $InstallRoot))
+    $totalBytes = 0
+    if ($backups.Count -gt 0) { $totalBytes = ($backups | Measure-Object -Property Length -Sum).Sum }
+    $status.Backups = [PSCustomObject]@{
+        Count      = $backups.Count
+        Latest     = $(if ($backups.Count -gt 0) { $backups[0] } else { $null })
+        TotalBytes = $totalBytes
     }
 
     return $status
@@ -854,6 +866,17 @@ function Show-DeltaManagementStatus {
         }
         if ($Status.StartupTask -and $Status.Startup.mechanism -eq 'startup-task' -and -not $Status.StartupTask.Exists) {
             Write-DeltaStatusRow -Label '' -State '' -Detail "the recorded startup task '$($Status.Startup.taskName)' no longer exists" -Colour 'Yellow'
+        }
+    }
+
+    if ($Status.Backups) {
+        if ($Status.Backups.Count -gt 0) {
+            $latest = $Status.Backups.Latest
+            Write-DeltaStatusRow -Label 'Backups' -State ([string]$Status.Backups.Count) `
+                -Detail ("newest {0} ({1}), {2} on disk" -f $latest.Name, (Format-DeltaByteSize $latest.Length), (Format-DeltaByteSize $Status.Backups.TotalBytes))
+        }
+        else {
+            Write-DeltaStatusRow -Label 'Backups' -State 'None' -Detail 'no database backup has been taken yet - menu option 2 takes one' -Colour 'Yellow'
         }
     }
 
@@ -1732,6 +1755,505 @@ function Initialize-DeltaLogRotation {
 # The menu (A§17.3)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Database backup (A§19)
+#
+# One operation, and it either produces a dump that has been proven to parse or
+# it produces nothing at all. That is not fastidiousness: Phase 9's update takes
+# a backup first and treats it as the only rollback path an irreversible
+# forward-only migration has (A§25). A file left on disk that nobody has read
+# back would be trusted by that update. So every failure - pg_dump exiting
+# non-zero, an empty file, a dump pg_restore cannot parse - ends with the file
+# deleted.
+#
+# Three constraints from the assessment shape the transport:
+#
+#   * pg_dump runs in the db container, never in the delta container. DELTA's
+#     image ships pg_dump 15.19 and the server is 17.x; the client refuses
+#     outright with "aborting because of server version mismatch" (A§19.1, D5).
+#   * `exec -T`, always. A TTY would rewrite the byte stream.
+#   * The bytes go from the child's stdout straight into the Windows file
+#     through Invoke-DeltaComposeBinary. Not via a string, not via a file
+#     written inside the container and copied out.
+#
+# No credential appears anywhere in this path: pg_dump connects over the
+# container's local socket as POSTGRES_USER, so there is no password to pass,
+# on a command line or otherwise.
+# ---------------------------------------------------------------------------
+
+# delta-YYYYMMDD-HHmmss.dump (A§19.2) - sortable, unambiguous, and the only
+# shape retention will ever consider deleting.
+$Script:DeltaBackupNamePattern    = '^delta-(\d{8})-(\d{6})\.dump$'
+$Script:DeltaBackupRetainCount    = 10
+$Script:DeltaBackupRetainDays     = 30
+$Script:DeltaBackupTimeoutSeconds = 1800
+
+# Every PostgreSQL custom-format archive starts with these five bytes. Checking
+# them costs nothing and turns "pg_restore could not read this" into "this is
+# not a dump at all" for the operator; it does not replace the pg_restore parse,
+# which is the actual verification.
+$Script:DeltaBackupMagic = [byte[]]@(0x50, 0x47, 0x44, 0x4D, 0x50)  # "PGDMP"
+
+function Format-DeltaByteSize {
+    param([Parameter(Mandatory)][AllowNull()][object]$Bytes)
+
+    $value = 0.0
+    if ($null -ne $Bytes) { $value = [double]$Bytes }
+    if ($value -ge 1GB) { return ('{0:N2} GB' -f ($value / 1GB)) }
+    if ($value -ge 1MB) { return ('{0:N2} MB' -f ($value / 1MB)) }
+    if ($value -ge 1KB) { return ('{0:N1} KB' -f ($value / 1KB)) }
+    return ('{0:N0} bytes' -f $value)
+}
+
+function Get-DeltaBackupDirectory {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    return (Join-Path -Path $InstallRoot -ChildPath 'backups')
+}
+
+function Get-DeltaBackupFile {
+    <#
+      The dumps in one installation's own backups directory, newest first.
+
+      Only files whose name matches delta-YYYYMMDD-HHmmss.dump exactly are
+      returned. That is what keeps retention away from an operator's .env
+      snapshot, a note, a copy of somebody else's dump, or anything else that
+      happens to be in the folder.
+
+      The effective timestamp is the one encoded in the name, because the name
+      is the record of when the backup was taken; a file whose name does not
+      parse as a date cannot match the pattern at all, so LastWriteTime is only
+      ever a fallback for an unreadable-but-matching name.
+    #>
+    param([Parameter(Mandatory)][string]$Directory)
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return @() }
+
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in (Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue)) {
+        $match = [regex]::Match($item.Name, $Script:DeltaBackupNamePattern)
+        if (-not $match.Success) { continue }
+
+        $stamp = $item.LastWriteTime
+        $parsed = [datetime]::MinValue
+        $text = '{0}-{1}' -f $match.Groups[1].Value, $match.Groups[2].Value
+        if ([datetime]::TryParseExact($text, 'yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            $stamp = $parsed
+        }
+
+        $null = $files.Add([PSCustomObject]@{
+            Name      = $item.Name
+            FullName  = $item.FullName
+            Length    = $item.Length
+            Timestamp = $stamp
+        })
+    }
+
+    return @($files | Sort-Object -Property Timestamp, Name -Descending)
+}
+
+function Test-DeltaBackupArchive {
+    <#
+      Proves that a file on disk is a dump PostgreSQL can actually read back.
+
+      `pg_restore --list` is the verification (A§19.3). It runs in the db
+      container - the same tooling that wrote the dump, the same major version
+      as the server - and the archive reaches it on stdin through the same
+      byte-exact transport that wrote it, so nothing on the Windows side
+      re-encodes it on the way back in.
+
+      A file existing is not evidence. A non-zero size is not evidence. Only a
+      successful parse that yields at least one table-of-contents entry is.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$Path,
+        [int]$TimeoutSeconds = 600
+    )
+
+    $result = [PSCustomObject]@{
+        Verified   = $false
+        SizeBytes  = 0
+        TocEntries = 0
+        Reason     = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "No file was produced at '$Path'."
+        return $result
+    }
+
+    $result.SizeBytes = (Get-Item -LiteralPath $Path).Length
+    if ($result.SizeBytes -le 0) {
+        $result.Reason = 'The dump file is empty (0 bytes).'
+        return $result
+    }
+
+    if ($result.SizeBytes -ge $Script:DeltaBackupMagic.Length) {
+        $header = New-Object byte[] $Script:DeltaBackupMagic.Length
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::OpenRead($Path)
+            $null = $stream.Read($header, 0, $header.Length)
+        }
+        catch {
+            $result.Reason = "The dump file could not be read back: $($_.Exception.Message)"
+            return $result
+        }
+        finally {
+            if ($stream) { $stream.Dispose() }
+        }
+
+        for ($i = 0; $i -lt $header.Length; $i++) {
+            if ($header[$i] -ne $Script:DeltaBackupMagic[$i]) {
+                $result.Reason = 'The file does not begin with the PGDMP marker, so it is not a PostgreSQL custom-format archive.'
+                return $result
+            }
+        }
+    }
+
+    $capture = Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
+        'exec', '-T', 'db', 'pg_restore', '--list'
+    ) -InputFile $Path -TimeoutSeconds $TimeoutSeconds
+
+    if ($capture.ExitCode -ne 0) {
+        $detail = (($capture.StdErr + ' ' + $capture.StdOut)).Trim()
+        if (-not $detail) { $detail = "pg_restore --list exited $($capture.ExitCode)." }
+        $result.Reason = "pg_restore --list could not parse the dump: $detail"
+        return $result
+    }
+
+    # A custom-format archive lists its table of contents as "id; oid oid TYPE
+    # name owner" lines; the ';'-prefixed lines above them are the header
+    # comment and are not entries.
+    $entries = @($capture.StdOut -split "`r?`n" | Where-Object { $_ -match '^\s*\d+;\s' })
+    $result.TocEntries = $entries.Count
+    if ($result.TocEntries -le 0) {
+        $result.Reason = 'pg_restore --list returned no table-of-contents entries, so the archive carries nothing to restore.'
+        return $result
+    }
+
+    $result.Verified = $true
+    $result.Reason = "pg_restore --list parsed the archive: $($result.TocEntries) table-of-contents entries."
+    return $result
+}
+
+function Invoke-DeltaBackupRetention {
+    <#
+      The minimal A§19.3 policy, and nothing more.
+
+      A dump is deleted only when BOTH are true:
+        * it is not among the newest $RetainCount dumps, and
+        * it is older than $RetainDays days.
+
+      So the newest ten survive however old they are, everything from the last
+      thirty days survives however many there are, and only the surplus that is
+      also old goes. Anything not named delta-YYYYMMDD-HHmmss.dump is never
+      examined, let alone deleted, and neither is the backup just created.
+
+      This runs only after a new backup has been verified, and a failure here is
+      reported on its own terms: an old file that could not be deleted has no
+      bearing on whether the new dump is valid.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [int]$RetainCount = $Script:DeltaBackupRetainCount,
+        [int]$RetainDays  = $Script:DeltaBackupRetainDays,
+        [string]$ExcludePath,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded     = $true
+        Removed       = @()
+        RemovedBytes  = 0
+        RetainedCount = 0
+        Failures      = @()
+        Reason        = $null
+    }
+
+    $files = @(Get-DeltaBackupFile -Directory $Directory)
+    if ($files.Count -eq 0) {
+        $result.Reason = 'There are no dumps to consider.'
+        return $result
+    }
+
+    $cutoff = $Now.AddDays(-$RetainDays)
+    $removed = New-Object 'System.Collections.Generic.List[object]'
+    $failures = New-Object 'System.Collections.Generic.List[string]'
+    $retained = 0
+    $index = 0
+
+    foreach ($file in $files) {
+        $index++
+        $withinNewest = ($index -le $RetainCount)
+        $withinWindow = ($file.Timestamp -ge $cutoff)
+        $isNewBackup  = ($ExcludePath -and ($file.FullName -eq $ExcludePath))
+
+        if ($withinNewest -or $withinWindow -or $isNewBackup) {
+            $retained++
+            continue
+        }
+
+        try {
+            $size = $file.Length
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            $null = $removed.Add([PSCustomObject]@{ Name = $file.Name; Length = $size; Timestamp = $file.Timestamp })
+            $result.RemovedBytes += $size
+        }
+        catch {
+            $retained++
+            $null = $failures.Add("$($file.Name) - $($_.Exception.Message)")
+        }
+    }
+
+    $result.Removed       = $removed.ToArray()
+    $result.Failures      = $failures.ToArray()
+    $result.RetainedCount = $retained
+    $result.Succeeded     = ($failures.Count -eq 0)
+    $result.Reason = "$($result.Removed.Count) old dump(s) removed, $retained retained, $(Format-DeltaByteSize $result.RemovedBytes) reclaimed."
+    if ($failures.Count -gt 0) {
+        $result.Reason += " $($failures.Count) could not be deleted."
+    }
+    return $result
+}
+
+function New-DeltaDatabaseBackup {
+    <#
+      Produces <InstallRoot>\backups\delta-YYYYMMDD-HHmmss.dump, or produces
+      nothing.
+
+      The sequence is fixed:
+
+        1. the db container must be running - there is nothing to dump otherwise
+        2. pg_dump -Fc in the db container, stdout streamed byte-for-byte into
+           the target file
+        3. pg_dump must have exited 0
+        4. the file must exist and be non-empty
+        5. pg_restore --list must parse it
+
+      Anything that fails at 2-5 deletes the file before returning. The caller -
+      an operator at the menu today, Phase 9's update tomorrow - is never handed
+      a path to a file that was not read back successfully.
+
+      Retention runs only after verification passes, and its outcome is reported
+      separately: a dump that verified is a valid backup whether or not an old
+      file could be tidied away.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [object]$Configuration,
+        [switch]$SkipRetention,
+        [int]$RetainCount = $Script:DeltaBackupRetainCount,
+        [int]$RetainDays  = $Script:DeltaBackupRetainDays,
+        [int]$TimeoutSeconds = $Script:DeltaBackupTimeoutSeconds
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded    = $false
+        Path         = $null
+        FileName     = $null
+        SizeBytes    = 0
+        DurationSecs = 0
+        Verification = $null
+        Retention    = $null
+        Stage        = 'start'
+        Reason       = $null
+        Deleted      = $false
+    }
+
+    if (-not $Configuration) {
+        $Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
+    }
+    if (-not $Configuration) {
+        $result.Stage = 'configuration'
+        $result.Reason = "'$InstallRoot' has no readable .env, so there is no installation to back up."
+        return $result
+    }
+
+    # The db container has to be running. Starting it here would turn "back up
+    # the database" into a lifecycle operation the operator did not ask for.
+    $services = @(Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName)
+    $db = $services | Where-Object { $_.Service -eq 'db' } | Select-Object -First 1
+    if (-not $db -or $db.State -ne 'running') {
+        $result.Stage = 'precheck'
+        $observed = if ($db) { $db.Status } else { 'no container exists for the db service' }
+        $result.Reason = "The database container is not running ($observed). Start DELTA first, then take the backup."
+        return $result
+    }
+
+    $directory = Get-DeltaBackupDirectory -InstallRoot $InstallRoot
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        try { $null = New-Item -Path $directory -ItemType Directory -Force -ErrorAction Stop }
+        catch {
+            $result.Stage = 'precheck'
+            $result.Reason = "The backups directory '$directory' could not be created: $($_.Exception.Message)"
+            return $result
+        }
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $fileName = "delta-$stamp.dump"
+    $target = Join-Path -Path $directory -ChildPath $fileName
+    if (Test-Path -LiteralPath $target) {
+        # Two backups inside one second. Waiting a second keeps the documented
+        # name shape exact rather than inventing a variant of it.
+        Start-Sleep -Seconds 1
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $fileName = "delta-$stamp.dump"
+        $target = Join-Path -Path $directory -ChildPath $fileName
+    }
+    $result.Path = $target
+    $result.FileName = $fileName
+
+    Write-Step "Backing up database '$($Configuration.PostgresDb)' to $fileName"
+    Write-Detail 'pg_dump -Fc runs inside the db container; the stream is written straight to the file.'
+
+    $started = Get-Date
+    $result.Stage = 'dump'
+    $capture = Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+        'exec', '-T', 'db',
+        'pg_dump', '-U', $Configuration.PostgresUser, '-d', $Configuration.PostgresDb, '-Fc'
+    ) -OutputFile $target -TimeoutSeconds $TimeoutSeconds
+    $result.DurationSecs = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+
+    $failure = $null
+    if ($capture.Error -eq 'not-found') {
+        $failure = 'The docker CLI was not found on PATH, so pg_dump was never run.'
+    }
+    elseif ($capture.TimedOut) {
+        $failure = "pg_dump did not finish within $TimeoutSeconds seconds and was stopped. The partial dump is not a backup."
+    }
+    elseif ($capture.Error) {
+        $failure = "The backup could not be started: $($capture.Error)"
+    }
+    elseif ($capture.ExitCode -ne 0) {
+        $detail = $capture.StdErr
+        if (-not $detail) { $detail = "pg_dump exited $($capture.ExitCode) with no message." }
+        $failure = "pg_dump failed (exit $($capture.ExitCode)): $detail"
+    }
+
+    if ($failure) {
+        $result.Reason = $failure
+        $result.Deleted = Remove-DeltaFailedBackup -Path $target
+        return $result
+    }
+
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+        $result.Reason = 'pg_dump reported success but no file was produced.'
+        return $result
+    }
+
+    $result.SizeBytes = (Get-Item -LiteralPath $target).Length
+    if ($result.SizeBytes -le 0) {
+        $result.Reason = 'pg_dump reported success but the dump file is empty (0 bytes).'
+        $result.Deleted = Remove-DeltaFailedBackup -Path $target
+        return $result
+    }
+
+    Write-Detail "Wrote $(Format-DeltaByteSize $result.SizeBytes) in $($result.DurationSecs)s. Verifying."
+
+    $result.Stage = 'verify'
+    $verification = Test-DeltaBackupArchive -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Path $target
+    $result.Verification = $verification
+    if (-not $verification.Verified) {
+        $result.Reason = "The dump did not verify: $($verification.Reason)"
+        $result.Deleted = Remove-DeltaFailedBackup -Path $target
+        return $result
+    }
+
+    $result.Stage = 'retention'
+    if (-not $SkipRetention) {
+        $result.Retention = Invoke-DeltaBackupRetention -Directory $directory -RetainCount $RetainCount -RetainDays $RetainDays -ExcludePath $target
+    }
+
+    $result.Stage = 'complete'
+    $result.Succeeded = $true
+    $result.Reason = "Verified backup written to $target ($(Format-DeltaByteSize $result.SizeBytes))."
+    return $result
+}
+
+function Remove-DeltaFailedBackup {
+    <#
+      Deletes a dump that did not complete or did not verify.
+
+      This is the guarantee Phase 9 rests on: after a failed backup there is no
+      file in backups\ that anything could later mistake for one. When the
+      deletion itself fails the operator is told loudly and by name, because the
+      residue is then exactly the hazard this function exists to remove.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        Write-Detail "Deleted the unverified dump: $Path"
+        return $true
+    }
+    catch {
+        Write-DeltaWarning "The unverified dump could not be deleted: $Path - $($_.Exception.Message)"
+        Write-DeltaWarning 'Delete it by hand. It is not a backup and must not be relied on.'
+        return $false
+    }
+}
+
+function Invoke-DeltaBackupOperation {
+    <#
+      Menu option 2. Runs the backup and reports it - path, size, verification
+      and retention - in the operator's terms.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
+    Show-Section -Title 'Backup Database' -Subtitle (Get-DeltaBackupDirectory -InstallRoot $InstallRoot)
+
+    $backup = New-DeltaDatabaseBackup -InstallRoot $InstallRoot -Configuration $Configuration
+
+    Write-Host ''
+    if ($backup.Succeeded) {
+        Write-Success 'Backup complete and verified.'
+        Write-Detail "File           $($backup.Path)"
+        Write-Detail "Size           $(Format-DeltaByteSize $backup.SizeBytes)"
+        Write-Detail "Taken in       $($backup.DurationSecs)s"
+        Write-Detail "Verification   $($backup.Verification.Reason)"
+        if ($backup.Retention) {
+            Write-Detail "Retention      $($backup.Retention.Reason)"
+            foreach ($old in $backup.Retention.Removed) {
+                Write-Detail "               removed $($old.Name) ($(Format-DeltaByteSize $old.Length))"
+            }
+            if (-not $backup.Retention.Succeeded) {
+                Write-DeltaWarning 'Some old dumps could not be deleted. This does not affect the backup just taken.'
+                foreach ($failure in $backup.Retention.Failures) { Write-Detail "               $failure" }
+            }
+        }
+        Write-Detail ''
+        Write-Detail 'Restoring is a manual, destructive procedure - see "Restoring the database" in README.md.'
+    }
+    else {
+        Write-DeltaFailure 'The backup failed. No backup was produced.'
+        Write-Detail "Stage reached  $($backup.Stage)"
+        Write-Detail $backup.Reason
+        if ($backup.Path) {
+            if ($backup.Deleted) {
+                Write-Detail 'The partial file was deleted, so nothing in backups\ can be mistaken for a valid backup.'
+            }
+            elseif (Test-Path -LiteralPath $backup.Path -PathType Leaf) {
+                Write-DeltaWarning "A file remains at $($backup.Path). It is NOT a backup."
+            }
+        }
+        Write-Detail 'The database, the stack and every existing backup are unchanged.'
+    }
+
+    Write-Host ''
+    Write-Detail 'Press Enter to return to the menu.'
+    $null = Read-Host
+    return $backup
+}
+
 function Show-DeltaPhasePlaceholder {
     <#
       An operation the completed product has and this build does not yet. It
@@ -1789,7 +2311,7 @@ function Show-DeltaManagementMenu {
     Write-Host ''
     if ($canRun) {
         Write-Host '  1. Update DELTA                  (Phase 9 - not implemented yet)'
-        Write-Host '  2. Backup Database               (Phase 8 - not implemented yet)'
+        Write-Host '  2. Backup Database'
         Write-Host '  3. Stop DELTA'
         Write-Host '  4. Restart DELTA'
         Write-Host '  5. Configure SMTP                (Phase 10 - not implemented yet)'
@@ -1880,8 +2402,7 @@ function Invoke-DeltaManagementMode {
             }
             '2' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Backup Database'; continue }
-                Show-DeltaPhasePlaceholder -Operation 'Backup Database' -Phase 8 `
-                    -Description 'Runs pg_dump inside the db container and writes a verified custom-format dump to the backups folder.'
+                $null = Invoke-DeltaBackupOperation -InstallRoot $InstallRoot -Configuration $status.Configuration
             }
             '3' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Stop DELTA'; continue }

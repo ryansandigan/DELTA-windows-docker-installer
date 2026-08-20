@@ -201,6 +201,253 @@ function Invoke-DeltaDockerCommand {
     return (Invoke-DeltaProcessCapture -FilePath $docker.Source -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds)
 }
 
+function Invoke-DeltaProcessBinaryStream {
+    <#
+      Runs a process whose stdout, stdin, or both carry BINARY data, and moves
+      those bytes between the child and a Windows file without letting anything
+      decode them.
+
+      Invoke-DeltaProcessCapture is the right seam for everything else in this
+      installer and the wrong one here: it reads stdout through .NET's
+      StreamReader, which decodes bytes into a .NET string. That is lossless for
+      text and destructive for a custom-format PostgreSQL dump - every byte that
+      is not valid in the reader's encoding becomes U+FFFD, and .Trim() removes
+      leading and trailing whitespace bytes that are dump content. So this
+      function never touches StandardOutput.ReadToEnd(): it copies
+      StandardOutput.BaseStream straight into a FileStream, which is the same
+      byte-for-byte transport a shell redirect performs.
+
+      The same applies in the other direction: StandardInput.BaseStream, fed
+      from a FileStream, is how a dump file reaches `pg_restore` on stdin.
+
+      Stderr is still read as text - it is a diagnostic message, not payload -
+      and is read asynchronously, because a child that fills the 4 KB stderr
+      pipe buffer while we are draining stdout is the classic redirect deadlock.
+
+      Never throws for a non-zero exit; a failing command is data.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$OutputFile,
+        [string]$InputFile,
+        [int]$TimeoutSeconds = 1800
+    )
+
+    $result = [PSCustomObject]@{
+        FilePath     = $FilePath
+        Arguments    = $Arguments
+        ExitCode     = -1
+        StdOut       = ''
+        StdErr       = ''
+        BytesWritten = 0
+        OutputFile   = $OutputFile
+        TimedOut     = $false
+        Started      = $false
+        Error        = $null
+    }
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName               = $FilePath
+    $startInfo.UseShellExecute        = $false
+    $startInfo.CreateNoWindow         = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError  = $true
+    $startInfo.Arguments              = ConvertTo-DeltaCommandLine -Arguments $Arguments
+    if ($InputFile) { $startInfo.RedirectStandardInput = $true }
+
+    $target = $null
+    $source = $null
+    try {
+        if ($OutputFile) {
+            # Opened before the child starts: if the destination cannot be
+            # created there is no reason to run pg_dump at all, and no partial
+            # file is produced.
+            $target = New-Object System.IO.FileStream(
+                $OutputFile,
+                [System.IO.FileMode]::Create,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+        }
+        if ($InputFile) {
+            $source = New-Object System.IO.FileStream(
+                $InputFile,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read)
+        }
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+        if ($target) { $target.Dispose() }
+        if ($source) { $source.Dispose() }
+        return $result
+    }
+
+    # .NET Framework builds the StandardInput StreamWriter with
+    # Console.InputEncoding and AutoFlush = true during Process.Start(), and
+    # that first flush writes the encoding's preamble into the pipe before this
+    # function has written a single byte. On a UTF-8 console that puts EF BB BF
+    # in front of the payload: measured, a 332,405-byte dump reached the
+    # container as 332,408 bytes and pg_restore rejected it as "not a valid
+    # archive". Handing the process a preamble-free encoding of the SAME code
+    # page is what makes stdin byte-exact; the console's code page is not
+    # changed, only .NET's cached Encoding object for it, and it is put back
+    # as soon as the child has started.
+    $restoreInputEncoding = $null
+    if ($InputFile) {
+        try {
+            $consoleEncoding = [Console]::InputEncoding
+            if ($consoleEncoding -and $consoleEncoding.GetPreamble().Length -gt 0) {
+                if ($consoleEncoding.CodePage -eq 65001) {
+                    [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+                    $restoreInputEncoding = $consoleEncoding
+                }
+                else {
+                    # Fail closed rather than send bytes that are known to be
+                    # wrong: a corrupted stream must never become a "verified"
+                    # answer.
+                    $result.Error = "This console's input encoding (code page $($consoleEncoding.CodePage)) prepends a byte-order mark to child stdin, which would corrupt the stream."
+                    if ($target) { $target.Dispose() }
+                    if ($source) { $source.Dispose() }
+                    return $result
+                }
+            }
+        }
+        catch {
+            $result.Error = "The console input encoding could not be made byte-exact for stdin: $($_.Exception.Message)"
+            if ($target) { $target.Dispose() }
+            if ($source) { $source.Dispose() }
+            return $result
+        }
+    }
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    try {
+        try {
+            $null = $process.Start()
+            $result.Started = $true
+        }
+        catch {
+            $result.Error = $_.Exception.Message
+            return $result
+        }
+        finally {
+            if ($restoreInputEncoding) {
+                try { [Console]::InputEncoding = $restoreInputEncoding } catch { }
+            }
+        }
+
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        $copyTask   = $null
+        $stdoutTask = $null
+        if ($target) {
+            $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($target, 81920)
+        }
+        else {
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        }
+
+        if ($source) {
+            # Written after the readers are attached, and the pipe closed
+            # immediately afterwards so the child sees EOF instead of waiting
+            # for more.
+            #
+            # The BaseStream is closed, NOT the StandardInput StreamWriter that
+            # wraps it. Closing the writer flushes it, and flushing a
+            # never-written UTF-8 StreamWriter emits its 3-byte preamble - which
+            # lands after the payload and corrupts it. Measured: a 332,405-byte
+            # dump arrived inside the container as 332,408 bytes and pg_restore
+            # rejected it as "not a valid archive". Nothing else about the
+            # transport was wrong, which is exactly why it is worth a comment.
+            $stdin = $process.StandardInput.BaseStream
+            $source.CopyTo($stdin, 81920)
+            $stdin.Flush()
+            $stdin.Close()
+        }
+
+        $timeoutMs = $TimeoutSeconds * 1000
+        $timedOut = $false
+        if ($copyTask -and -not $copyTask.Wait($timeoutMs)) { $timedOut = $true }
+        if (-not $timedOut -and -not $process.WaitForExit($timeoutMs)) { $timedOut = $true }
+        if ($timedOut) {
+            try { $process.Kill() } catch { }
+            # Killing the child closes the pipes, which lets the outstanding
+            # reads finish so the streams can be disposed cleanly.
+            if ($copyTask) { try { $null = $copyTask.Wait(5000) } catch { } }
+            try { $null = $process.WaitForExit(5000) } catch { }
+        }
+        $result.TimedOut = $timedOut
+
+        if ($target) {
+            $target.Flush()
+            $result.BytesWritten = $target.Length
+        }
+        if ($stdoutTask) {
+            try { if ($stdoutTask.Wait(15000)) { $result.StdOut = ([string]$stdoutTask.Result).Trim() } } catch { }
+        }
+        try { if ($stderrTask.Wait(15000)) { $result.StdErr = ([string]$stderrTask.Result).Trim() } } catch { }
+
+        if (-not $timedOut) {
+            try { $result.ExitCode = $process.ExitCode } catch { $result.ExitCode = -1 }
+        }
+    }
+    finally {
+        if ($target) { $target.Dispose() }
+        if ($source) { $source.Dispose() }
+        # Guarded: disposing the Process disposes the StandardInput writer over
+        # a pipe this function has already closed, which raises from Dispose.
+        try { $process.Dispose() } catch { }
+    }
+
+    Write-DeltaLogLine -Message ("run: {0} {1} -> exit {2}{3}{4}" -f
+        $FilePath,
+        ($Arguments -join ' '),
+        $result.ExitCode,
+        $(if ($result.TimedOut) { ' (timed out)' } else { '' }),
+        $(if ($OutputFile) { "; $($result.BytesWritten) bytes written" } else { '' })) -Level 'DETAIL'
+    if ($result.StdErr) {
+        Write-DeltaLogLine -Message ("     stderr: " + $result.StdErr) -Level 'DETAIL'
+    }
+    return $result
+}
+
+function Invoke-DeltaDockerBinaryStream {
+    <#
+      Invoke-DeltaDockerCommand's byte-exact counterpart: the docker CLI, with
+      stdout and/or stdin bound to a file rather than to a decoded string.
+      Resolved through Get-Command on every call, for the same reason.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$OutputFile,
+        [string]$InputFile,
+        [int]$TimeoutSeconds = 1800
+    )
+
+    $docker = Get-Command -Name 'docker' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $docker) {
+        return [PSCustomObject]@{
+            FilePath = 'docker'; Arguments = $Arguments; ExitCode = -1
+            StdOut = ''; StdErr = 'The docker CLI was not found on PATH.'
+            BytesWritten = 0; OutputFile = $OutputFile
+            TimedOut = $false; Started = $false; Error = 'not-found'
+        }
+    }
+
+    $splat = @{
+        FilePath       = $docker.Source
+        Arguments      = $Arguments
+        TimeoutSeconds = $TimeoutSeconds
+    }
+    if ($OutputFile) { $splat['OutputFile'] = $OutputFile }
+    if ($InputFile)  { $splat['InputFile']  = $InputFile }
+    return (Invoke-DeltaProcessBinaryStream @splat)
+}
+
 function Invoke-DeltaWslCommand {
     <#
       Runs wsl.exe with WSL_UTF8=1 set first (A§5.3, verified): without it
