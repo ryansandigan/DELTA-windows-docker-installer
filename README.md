@@ -227,18 +227,17 @@ different claims.
   2. Backup Database
   3. Stop DELTA
   4. Restart DELTA
-  5. Configure SMTP                (a later version of this installer)
-  6. Reset Administrator Password  (a later version of this installer)
-  7. Certificate Management        (a later version of this installer)
+  5. Configure SMTP
+  6. Reset Administrator Password
+  7. Certificate Management
   8. DELTA Access Guide
   9. View Logs
   S. Start DELTA                   (shown when something is not running)
   0. Exit
 ```
 
-The entries marked *later* are placeholders in this build: choosing one says so
-and returns to the menu without changing anything. Pressing Enter refreshes the
-status.
+Pressing Enter refreshes the status. Every operation returns to this menu when
+it finishes, when you cancel it, and when it fails.
 
 - **Start DELTA** starts Docker Desktop if it is not running, checks the
   database volume is still there, brings the three containers up in order, and
@@ -255,6 +254,12 @@ status.
   and, if so, updates to it safely — see [Updating DELTA](#updating-delta) below.
 - **Backup Database** writes a verified dump to `C:\DELTA\backups\` — see
   [Backing up the database](#backing-up-the-database) below.
+- **Configure SMTP** sets how DELTA sends email — see
+  [Configuring email](#configuring-email).
+- **Reset Administrator Password** replaces the administrator credential — see
+  [Resetting the administrator password](#resetting-the-administrator-password).
+- **Certificate Management** replaces the TLS certificate — see
+  [Replacing the TLS certificate](#replacing-the-tls-certificate).
 - **DELTA Access Guide** shows the real URLs for this installation, tests the
   endpoint, and tells you plainly if it did not answer.
 
@@ -499,6 +504,140 @@ Notes:
 - If the restore fails part-way, **do not start `delta`**. Fix the restore or
   restore an older dump first. An application started against a half-restored
   schema will migrate it.
+
+### Configuring email
+
+Menu option **5** sets how DELTA sends mail. It shows what is configured now,
+asks for the transport, and — for SMTP — for the server settings.
+
+DELTA supports two transports:
+
+| Transport | What it does |
+|---|---|
+| **File** | Mail is written to the container log instead of being sent. This is DELTA's own default and is what a test installation wants. |
+| **SMTP** | Mail is sent through a mail server you configure. |
+
+For SMTP you are asked for the from address, server host, port, whether to use
+implicit TLS on connect (`true` for port 465, `false` for 587 and 25), the
+username, and the password. The from address and username are optional; the host
+and port are not. Anything already configured is offered as the default — press
+Enter to keep it.
+
+**The password is never displayed.** It is typed masked, entered twice and
+required to match. If a password is already configured, pressing Enter at that
+prompt keeps it — the existing value is not read back, not shown and not
+rewritten. Nothing in this flow prints the password, writes it to a log or puts
+it in the state file; it goes into `C:\DELTA\.env` and nowhere else, and `.env`
+stays restricted to Administrators and SYSTEM.
+
+**Before anything is written**, the installer checks that the SMTP host resolves
+and accepts a connection on the port you gave. That is a sanity check on what
+you typed — it does not test your credentials and it does not send mail. If it
+fails you are told exactly why and offered the settings again; nothing has been
+written at that point.
+
+**Applying the change recreates the DELTA application container.** That is not
+optional and it is not the same as restarting it: environment variables are
+fixed when a container is created, so `docker compose restart` would restart the
+same container with the same settings and change nothing. The database
+container, its data volume, NGINX, your uploads and your certificates are not
+touched. Afterwards the installer reads the settings back **out of the running
+container** and shows them, so you can see that the change actually took effect
+rather than just that a file was written.
+
+**If applying fails**, the previous SMTP settings are written back to `.env` and
+the container is recreated with them. The result is reported as two separate
+facts, because they are two separate things:
+
+```
+.env: the previous SMTP values were written back.
+Runtime: the container was recreated with the previous configuration and is healthy.
+```
+
+If the second line cannot be said truthfully, it is not said. A full timestamped
+copy of the previous `.env` is kept in the installation root either way.
+
+Cancelling at the transport screen changes nothing at all.
+
+### Resetting the administrator password
+
+Menu option **6** replaces the stored credential for the DELTA administrator
+account (`admin@admin.com`). It is the same operation the installer runs during
+a first install.
+
+It asks for confirmation first, then whether to generate a password or let you
+type one. A typed password is entered twice and must match. A generated password
+is shown **once**, at the end — record it then, because nothing on the machine
+keeps a copy.
+
+- The password never appears in a log, in `.env`, or in the state file.
+- It never appears on a command line, so it cannot be read out of a process
+  list: it is passed to PostgreSQL through the process environment and read by
+  `psql` itself.
+- Success is not assumed. The installer confirms that exactly the intended
+  account was updated, that the stored credential actually changed, and that the
+  new password verifies against what is now stored. If any of those is not true,
+  it reports failure rather than success.
+
+**No container is restarted or recreated**, and no other configuration changes —
+this operation touches one database row.
+
+If the account cannot be found, that is reported and nothing is created or
+changed. Cancelling at either prompt leaves the credential alone.
+
+### Replacing the TLS certificate
+
+Menu option **7** replaces the certificate and private key that NGINX serves.
+
+It first shows what is in use — subject, issuer, expiry and thumbprint — then
+asks for the replacement certificate and key. Both must be **PEM** files, and
+the key must not be passphrase-protected (NGINX cannot use one without the
+passphrase stored in plaintext next to it, which gains nothing).
+
+Before anything is touched, the replacement is validated:
+
+- both files exist and can be read;
+- the certificate parses as X.509;
+- the private key parses;
+- **the key matches the certificate** — this is the check that matters, because
+  a mismatch otherwise surfaces as a cryptic NGINX failure;
+- the certificate is currently valid, with a warning if it expires within 30 days.
+
+A defect is reported **by name** — you are told which of the two files is wrong
+and how — and nothing is changed.
+
+If it validates, the current certificate and key are copied aside with a
+timestamp, the new pair is installed with the same restricted permissions the
+old key had, and then:
+
+```
+nginx -t          runs inside the running NGINX container
+nginx -s reload    only if nginx -t passed
+```
+
+**No container is recreated** — not NGINX, not DELTA, not the database. A reload
+signals the running NGINX process, so established connections are drained rather
+than dropped and the site does not go down.
+
+Afterwards the installer requests the site over HTTPS and reads back the
+certificate NGINX is actually presenting, confirming it is the new one. The
+thumbprint and expiry are recorded in `.delta-install.json`; the private key is
+never read into the installer, never logged and never stored anywhere but
+`certs\`.
+
+**If `nginx -t` rejects the new certificate**, NGINX is never signalled — it
+carries on serving the old certificate from memory — the previous files are put
+back, and the restored configuration is re-tested. If the reload or the endpoint
+check fails, the previous certificate is restored and reloaded. The site stays
+up throughout.
+
+> **If HTTPS is not enabled** for this installation, this option says so and
+> stops: there is no certificate in use to replace. Turning HTTPS on changes the
+> published ports and regenerates the NGINX configuration, which is the
+> installer flow — `.\setup.ps1 -Reconfigure`.
+
+There is no automatic renewal and no ACME/Let's Encrypt client. Replacing a
+certificate is a deliberate operator action.
 
 ### Changing ports, hostname or TLS
 

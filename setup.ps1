@@ -138,6 +138,10 @@ $Script:DeltaLibraries = [ordered]@{
     'Delta.Stack.ps1'   = 'Invoke-DeltaStackStage'
     'Delta.Network.ps1' = 'Invoke-DeltaNetworkStage'
     'Delta.Manage.ps1'  = 'Invoke-DeltaManagementMode'
+    # Configuration management (SMTP, administrator credential, certificate
+    # replacement). Loaded after Delta.Manage.ps1 because it composes that
+    # file's primitives rather than duplicating them.
+    'Delta.Configure.ps1' = 'Invoke-DeltaSmtpConfiguration'
 }
 
 foreach ($library in $Script:DeltaLibraries.Keys) {

@@ -1091,6 +1091,60 @@ curl.exe -sk -o NUL -w "%{http_code}" https://localhost:<HTTPS_PORT>/     # 200
 
 **Documentation update.** `README.md` gains SMTP, administrator reset, and certificate replacement sections.
 
+#### Implementation status
+
+**Status: COMPLETE** · 2026-08-20 · commit `8bdd9b0` · **Acceptance gate: met**, with one criterion proven at the database rather than over HTTP — the same qualification Phase 5 recorded, for the same reason. 141/141 Phase 10 assertions pass.
+
+Delivered: `lib\Delta.Configure.ps1` (new); menu wiring for options 5, 6 and 7 in `lib\Delta.Manage.ps1`; the library registration in `setup.ps1`; the SMTP, administrator-reset and certificate sections of `README.md`.
+
+**Reconnaissance findings that changed the plan**
+
+Five things were true of the repository but not of the phase text, and each is recorded because it altered the implementation rather than merely the wording:
+
+1. **No SMTP keys existed anywhere** — not in `templates\env.template`, not in any generated `.env`. The seven variables were verified against the running image (`grep -oE '(SMTP|EMAIL)_[A-Z_]+' /delta/build/server/index.js | sort -u`) and match A§20.1 exactly; the bundle's own default is `EMAIL_TRANSPORT || "file"` with a validator accepting only `file` or `smtp`. Because `env_file: .env` passes every key through, **no Compose template change was needed**, and the template was deliberately left alone so that a fresh install keeps today's behaviour and an installer rerun does not rewrite `.env` for a feature the operator has not used.
+2. **Phase 4 has no hostname/SAN validation.** None was invented — DELTA does not enforce one, and a policy the product does not have is not a policy this phase should add.
+3. **The operator's live installation is HTTP-only** (`TLS_ENABLED=false`, empty `certs\`), so certificate replacement could not be exercised there at all. An isolated TLS installation was stood up for it (below), and the HTTP-only case became a first-class branch rather than an error.
+4. **Phase 9's NGINX finding applies here too.** Recreating `delta` changes its container address and `proxy_pass` has no `resolver`, so the SMTP apply path reuses `Update-DeltaNginxUpstream`. Without it, applying an SMTP change could leave a healthy stack returning 502.
+5. **Menu numbering** is 5 = Configure SMTP, 6 = Reset Administrator Password, 7 = Certificate Management. It was left exactly as Phase 7 established it.
+
+**Implementation decisions**
+
+- **A new file, `lib\Delta.Configure.ps1`,** rather than more of `Delta.Manage.ps1` — the third seam §3 of this plan anticipated. It owns no primitives: certificate validation is Phase 4's, the administrator reset is Phase 5's, the `.env` writer is Phase 1's, Compose invocation is Phase 3's, the NGINX upstream refresh is Phase 9's.
+- **Three independent blast radii.** SMTP writes `.env` and recreates only `delta`; certificate replacement writes two files in `certs\` and reloads NGINX, recreating nothing; the administrator reset changes one database row and touches no container. Each restores only what it changed, and a failure in one cannot reach the other two.
+- **`Update-DeltaApplicationContainer` is shared by the SMTP apply path and its restore path.** That is deliberate: "we put it back" then means exactly the same operation, with the same health gate and endpoint check, as "we applied it". A restore verified more weakly than the change it undoes is how a half-restored installation gets reported as recovered.
+- **Restoration is reported as two facts, never one.** `.env restored` and `the running container was recreated with it` are separate lines on the result object and separate lines on screen, because the second can fail on its own. There is no generic "rolled back" message anywhere.
+- **The SMTP password is never read to be kept.** Bare Enter at the password prompt returns `$null`, which means the key is absent from the write set and that `.env` line is not touched at all — the stored value is never read, echoed or rewritten. `Get-DeltaSmtpConfiguration` returns `HasPassword` as a boolean and never the value.
+- **The container's environment is read back through a redaction that runs inside the container.** The verification command echoes the six non-secret variables with their values and `SMTP_PASS` only as `<set>`/`<unset>`, so the password never crosses the container boundary rather than being stripped afterwards on trust.
+- **Certificate replacement changes no NGINX configuration.** The generated config names fixed files, so replacing a certificate is replacing two files behind a read-only mount and signalling NGINX. `delta.conf` is byte-identical before and after, which the validation asserts.
+
+**Validation** — 141 assertions, all passing: SMTP 51, certificate 47, administrator reset 25, menu and cross-cutting 18.
+
+- **SMTP, against the operator's live installation, with synthetic values only.** A local TCP listener stood in for a mail server so the reachability check had something real to connect to and no external host was contacted. Measured: cancellation writes nothing and takes no backup; the port and transport validators reject bad input; a valid configuration is written and the **running container** reports `EMAIL_TRANSPORT=smtp` and the new host, with `SMTP_PASS` as `<set>`; the endpoint answers 200; the `delta` container is recreated while the **db and nginx containers, `delta_pgdata`, all volumes, unrelated containers and the Phase 8 backups are unchanged**; every unrelated `.env` value and the `.env` ACL are unchanged; "keep the configured password" leaves that line byte-identical while the other settings change.
+- **SMTP failure paths, seam-injected at the narrowest point.** A refused recreation (first `up` returns non-zero) and a health-check timeout (first wait fails) each abort at `apply`, write the previous values back, and then **actually recreate the container with them** — confirmed by reading the restored configuration back out of the running container and by a 200 from the endpoint. The password line is untouched by the failure path, and a full `.env` copy is kept.
+- **Certificates, on an isolated TLS installation** (`C:\Workspace\delta-p10`, project `delta10`, ports 18100/18543, self-signed) built and removed for this phase, so the operator's stack was never involved. Real end to end: a valid replacement passes `nginx -t`, reloads, returns **HTTPS 200**, and **the certificate NGINX actually presents changes** (`BF04D50D…` → `A0615B1F…`) while the **NGINX container ID, the DELTA container, the db container, the volume, `delta.conf` and `.env` are all unchanged**. Rejected by name and with nothing touched: a key/certificate mismatch, an unparseable certificate, an unparseable key, a missing file. A `nginx -t` failure and a reload failure (both seam-injected) restore the previous files, and in the `nginx -t` case NGINX is **never signalled** — the site served the working certificate throughout, verified by reading the served thumbprint before and after.
+- **Administrator reset, on the isolated installation** so the operator's credential was untouched. Cancellation at the confirmation gate and at the method screen both change nothing; a non-existent account is reported precisely and creates nothing; a mismatched confirmation re-prompts (four prompts for two attempts) and only the matching pair is accepted; a successful reset changes the stored hash, verifies the new credential, and an independent check confirms the new password authenticates while a wrong one does not. **No container was recreated**, `.env`, the certificate, the volume and the schema are unchanged.
+- **Menu, driven for real** through 5 → cancel, 7 → the HTTP-only notice, 6 → decline, then Exit: the session returns to the menu after each, exits 0, and leaves `.env`, the state file, every container and the administrator credential byte-identical. Numbering is unchanged and no entry is marked unimplemented.
+- **Security review.** The synthetic SMTP password and the synthetic administrator password appear in no transcript, no state file and no `.env` they should not be in; `SMTP_PASS` is redacted as a key name in transcripts; no private-key material appears in any transcript or in the state file (only thumbprint and expiry are recorded); the configuration library builds no shell strings and contains no bare catch-and-ignore block; the administrator credential still reaches `psql` by environment name and `\getenv`, never as a command-line value; no private key or test credential exists in any tracked file.
+- **Regression.** Phase 8: 19/19 + 28/32 + 4/4. Phase 9: 28/28 + 36/36 + 31/35. **All eight failures are the same stale historical assertion** — suites written in Phases 8 and 9 assert that the Phase 9 and Phase 10 *placeholders still exist*. Later phases legitimately replaced them. Every functional assertion in both suites passes. All ten scripts parse under Windows PowerShell 5.1 with their BOMs intact; the tokenizer scan finds no `down`, `--volumes` or `prune` outside comments and no `docker volume rm` anywhere.
+- **The live installation was handed back unchanged.** After the isolated installation, its containers, network, volume, scheduled task and firewall rules were removed, and the live `.env` was returned to a state whose SHA-256 is **identical to the Phase 9 baseline** (`2ACC0998…`), with the same ACL. Database schema, table count, administrator hash digest, extensions, geometry columns, `delta_pgdata`, published ports, images, networks, scheduled tasks and firewall rules all match the Phase 9 snapshot.
+
+**A test-harness defect worth recording.** The cleanup script rewrote the live `.env` with `[System.IO.File]::WriteAllLines`, which uses `Environment.NewLine` and converted the file from LF to CRLF. Product code does not do this — `Set-DeltaEnvValues` preserves the existing newline style — but the harness did, and it changed a file belonging to the operator. It was detected by the snapshot hash comparison, corrected, and the hash now matches the Phase 9 baseline exactly. A validation script that writes to the installation is held to the same standard as the installer.
+
+**Limitations / operator-required validation**
+
+- **No mail was sent.** The reachability check confirms the host resolves and the port accepts a connection; it does not test credentials, TLS negotiation or delivery. A real send test needs a recipient and a mailbox and belongs to the application (A§20.1). Confirming that DELTA actually delivers through a configured server is an operator check.
+- **Administrator sign-in was proven at the database, not over HTTP** — the stored hash changed and only the new credential verifies against it, which is exactly what the application checks. `POST /en/admin/login` returns HTTP 400 with an identical body for correct and incorrect credentials because the form posts from client-side JavaScript, so it cannot be automated. This is the same qualification Phase 5 recorded. **Browser sign-in with a reset credential remains one manual operator check.**
+- **Certificate replacement was proven on an isolated self-signed installation.** Replacing a certificate on an installation using a CA-issued certificate for a real hostname was not exercised, because this host has neither.
+
+**Phase 6 is untouched and remains PARTIAL.** Nothing here measures, infers or records a reboot result.
+
+**Notes for Phase 11**
+
+- The full A§17.3 menu is now implemented; every entry does the thing it names.
+- `lib\Delta.Configure.ps1` is the tenth script and must be included in the parse/BOM sweep and the destructive-command scan.
+- The stale placeholder assertions in the Phase 8 and Phase 9 suites should be retired or rewritten as "no placeholder remains" when Phase 11 consolidates the regression scripts under `tools\`.
+- Two operator-only checks are outstanding across the product: the Phase 6 reboot test, and browser sign-in after an administrator reset.
+
 ---
 
 ### Phase 11 — Failure Handling, Idempotency & End-to-End Acceptance

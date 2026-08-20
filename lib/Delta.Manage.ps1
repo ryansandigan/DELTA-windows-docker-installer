@@ -3112,9 +3112,9 @@ function Show-DeltaManagementMenu {
         Write-Host '  2. Backup Database'
         Write-Host '  3. Stop DELTA'
         Write-Host '  4. Restart DELTA'
-        Write-Host '  5. Configure SMTP                (Phase 10 - not implemented yet)'
-        Write-Host '  6. Reset Administrator Password  (Phase 10 - not implemented yet)'
-        Write-Host '  7. Certificate Management        (Phase 10 - not implemented yet)'
+        Write-Host '  5. Configure SMTP'
+        Write-Host '  6. Reset Administrator Password'
+        Write-Host '  7. Certificate Management'
     }
     else {
         Write-Host '  Operations 1-7 need the Docker engine and are not offered until it is running.'
@@ -3231,18 +3231,16 @@ function Invoke-DeltaManagementMode {
             }
             '5' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Configure SMTP'; continue }
-                Show-DeltaPhasePlaceholder -Operation 'Configure SMTP' -Phase 10 `
-                    -Description 'Collects the SMTP settings, writes them to .env and applies them by recreating the DELTA container.'
+                $smtp = Invoke-DeltaSmtpConfiguration -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
+                Show-DeltaSmtpOutcome -Outcome $smtp
             }
             '6' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Reset Administrator Password'; continue }
-                Show-DeltaPhasePlaceholder -Operation 'Reset Administrator Password' -Phase 10 `
-                    -Description 'Replaces the stored administrator credential and verifies the replacement against the database.'
+                $null = Invoke-DeltaAdminResetOperation -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
             }
             '7' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Certificate Management'; continue }
-                Show-DeltaPhasePlaceholder -Operation 'Certificate Management' -Phase 10 `
-                    -Description 'Replaces or renews the TLS certificate, validates it, and reloads NGINX only after nginx -t passes.'
+                $null = Invoke-DeltaCertificateOperation -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
             }
             '8' {
                 # No -Endpoint: the guide probes when it is displayed rather
