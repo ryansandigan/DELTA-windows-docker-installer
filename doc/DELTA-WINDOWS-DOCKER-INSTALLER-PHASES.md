@@ -120,7 +120,10 @@ The assessment left five open items (A§26). **U2 has since been resolved and is
 | **8** | Database Backup | A verified, restorable dump exists | 7 | backup operation | `pg_dump` from the **db** container produces a file `pg_restore --list` parses; restore yields a working PostGIS database |
 | **9** | Update DELTA | Safe, digest-aware application updates | 8 | update operation | Unchanged digest → "already current", **no pull**; changed digest → backup, pull, recreate, migration verified, healthy |
 | **10** | Configuration Management: SMTP, Certificates, Admin Reset | Remaining mutating menu operations | 7, 4, 5 | SMTP / cert / admin menu entries | SMTP applied by **recreation** and takes effect; cert replacement validated then reloaded; admin reset authenticates |
-| **11** | Failure Handling, Idempotency & End-to-End Acceptance | The product meets A§27 in full | 6, 9, 10 | failure taxonomy, regression pass | Every A§22 scenario produces its specified diagnostic; full A§27 checklist demonstrated on a clean host |
+| **10.5** | Fresh Install User-Flow Audit & Convenience Adjustments | A first-time administrator can install DELTA without preparing files or knowing Docker | 10 | up-front settings prompt | Hostname asked with `localhost` default; both credentials asked securely; ports silent unless genuinely occupied; SMTP not required to install |
+| **11** | Failure Handling, Idempotency & End-to-End Acceptance | The product meets A§27 in full | 6, 9, 10, 10.5 | failure taxonomy, regression pass | Every A§22 scenario produces its specified diagnostic; full A§27 checklist demonstrated on a clean host |
+
+> **Phase 10.5 was inserted deliberately after Phase 10 was complete and before Phase 11 began.** It is not a redefinition of Phase 11, whose scope below is unchanged. It exists because the first nine phases built the install flow from the *inside out* — each phase proving its own mechanism — and nobody had yet walked the whole thing as an administrator meeting DELTA for the first time. That audit found gaps that are invisible from the component tests (§ Phase 10.5).
 
 ---
 
@@ -1144,6 +1147,75 @@ Five things were true of the repository but not of the phase text, and each is r
 - `lib\Delta.Configure.ps1` is the tenth script and must be included in the parse/BOM sweep and the destructive-command scan.
 - The stale placeholder assertions in the Phase 8 and Phase 9 suites should be retired or rewritten as "no placeholder remains" when Phase 11 consolidates the regression scripts under `tools\`.
 - Two operator-only checks are outstanding across the product: the Phase 6 reboot test, and browser sign-in after an administrator reset.
+
+---
+
+### Phase 10.5 — Fresh Install User-Flow Audit and Convenience Adjustments
+
+> **Inserted 2026-08-20, after Phase 10 completed and before Phase 11 started.** Phase 11's scope is untouched.
+
+**Goal.** An administrator installing DELTA for the first time runs `.\setup.ps1`, answers a short list of questions about things only they can know, and ends with a working, verified installation. They should not have to prepare a configuration file, read the PowerShell source, understand Compose, or know that Docker is involved at all beyond having installed Docker Desktop.
+
+**Why this phase exists here.** Phases 1–10 built the flow from the inside out: each phase proved its own mechanism against the machine, and each was validated by driving functions directly or by scripting answers. Nothing had yet walked the whole path as a person meeting the product for the first time. That is a different test, and it found three things the component tests could not.
+
+**The audit — measured against the code, not the documentation**
+
+| # | Finding | Evidence |
+|---|---|---|
+| **D1** | **The hostname is never asked.** `Invoke-DeltaNetworkStage` takes `-HostName`, otherwise reads `DELTA_HOSTNAME` from `.env`, otherwise uses `localhost`. There is no prompt anywhere in the file — the only `Read-Host` calls are the port loop, the TLS choice and the certificate paths. An administrator installing on a real server silently gets `localhost` and no indication they were entitled to say otherwise. | `lib\Delta.Network.ps1:976`; `grep Read-Host lib\Delta.Network.ps1` returns lines 342, 910, 1053, 1054 only |
+| **D2** | **The database password is never asked and never shown.** `New-DeltaEnvironmentFile` replaces the `__GENERATE__` placeholder with a 32-character CSPRNG value. That is correct and safe, but the administrator cannot know the credential without opening `.env`, which the product otherwise tells them not to do. | `lib\Delta.Stack.ps1:233-235` |
+| **D3** | **The administrator-password question is asked far too late.** It is the generate-or-type screen inside the Phase 5 security bootstrap, which runs *between* "DELTA is healthy" and "start NGINX" — after prerequisites, artefact generation, an image pull of ~700 MB and two health gates. An operator who walks away after starting the installer returns to find it waiting on a question. | `lib\Delta.Stack.ps1` bootstrap hook; measured install transcript ordering |
+
+Two things the audit found to be **already correct**, and which this phase therefore does not touch: ports are adopted silently when free and prompt only on a real conflict, with the owner identified and never disturbed (Phase 4); and SMTP is not part of the install flow at all — DELTA's own default is `EMAIL_TRANSPORT || "file"`, so mail works without configuration and option 5 is available later (Phase 10).
+
+**Reference-implementation precedent, and where it does not apply.** The native installer prompts for a PostgreSQL superuser password (`setup.ps1:2889`) — but it does so to *authenticate against a PostgreSQL it did not create*, retrying until the credential works. The Docker installer creates the cluster itself at first initialisation, so the password is a value it chooses rather than one it must discover; the prompt is therefore an offer, not an interrogation, and must default to generating a strong value. The native installer has **no** hostname prompt at all — it is a localhost-only product — so it provides no precedent for D1, and this phase does not invent one from it.
+
+**Scope**
+- One **Installation settings** step, asked up front, before any long-running work: hostname, database password, administrator password.
+- Hostname prompt defaulting to `localhost` on bare Enter, validated with the project's existing rules; no DNS resolution required.
+- Database and administrator password prompts: masked, confirmed, and each offering "press Enter and I will generate a strong one".
+- The administrator password collected early and *applied* at exactly the same point in the sequence as before — the ordering invariant (credential replaced before NGINX publishes a port) does not move.
+- Non-interactive behaviour audited: no secret may be silently invented to avoid a prompt beyond the generation the operator explicitly opted into.
+
+**Explicit non-scope.** No change to port resolution, TLS modes, certificate validation, the backup/update/configuration operations, or the state model. **No Phase 11 work.** No new secrets platform. No SMTP in the install flow.
+
+**Expected fresh-install flow**
+
+```
+.\setup.ps1                     (elevated, no installation present)
+
+  prerequisites and Docker readiness      automatic, no questions
+  ==> Installation settings
+        Hostname/domain [localhost]:
+        Database password [Enter = generate]:
+        DELTA administrator password [Enter = generate]:
+  ==> Resolving ports and TLS
+        HTTPS: 1 none / 2 supply a certificate / 3 self-signed
+        port question ONLY if the default port is occupied by something else
+  ... everything below is unattended ...
+  artefacts, pull, digest pin, db, DELTA, migration verify,
+  administrator bootstrap, NGINX, health, firewall, startup task
+  completion summary with the real access URL
+```
+
+**Required vs optional prompts**
+
+| Prompt | Required? | Default on bare Enter |
+|---|---|---|
+| Hostname / domain | Always asked | `localhost` |
+| Database password | Always asked | generate a strong one |
+| DELTA administrator password | Always asked | generate one, shown once at the end |
+| HTTPS mode | Always asked | no HTTPS (option 1) |
+| HTTP / HTTPS port | **Only on a real conflict** | the suggested alternative |
+| SMTP | **Never during install** | — (Management Mode option 5) |
+
+**Validation plan.** Physical, on isolated installations only — the operator's `C:\DELTA`, project `delta` and volume `delta_pgdata` are never involved. (A) default convenience path: bare-Enter hostname, HTTP, free port; (B) explicit hostname + supplied certificate over HTTPS; (C) port conflict created with an unrelated container, owner identified, unrelated workload proven untouched afterwards; (D) invalid hostname, invalid port, mismatched password confirmation, bad certificate material; (E) rerun enters Management Mode without replaying the questionnaire; (F) full Phase 7–10 regression; plus the standing security sweep. Every isolated installation removed afterwards, including its own containers, network, volume, root, scheduled task and firewall rules.
+
+**Acceptance gate.** The thirteen items in the phase brief: both credentials requested securely; hostname requested with a `localhost` default; HTTP-only localhost install works; certificates optional; standard ports automatic; alternative port requested only on a real conflict; SMTP not required; a successful install ends verified and usable; a rerun enters Management Mode; Phase 1–10 safety properties intact; unrelated Docker workloads untouched; documentation matches measured behaviour.
+
+#### Implementation status
+
+**Status: NOT STARTED** · audit complete, implementation not begun.
 
 ---
 
