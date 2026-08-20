@@ -833,3 +833,28 @@ A few things it will deliberately refuse to do:
 
 In each case nothing is deleted, and running the installer again after fixing
 the cause continues from where it stopped.
+
+---
+
+## What this installer does not do
+
+Stated plainly so it is not mistaken for a gap:
+
+- **There is no uninstaller.** No `uninstall.ps1`, no menu entry, no removal
+  command. Nothing in this product deletes a database volume, and no code path
+  can reach `docker compose down -v`, `docker volume rm` or `docker system
+  prune`. Removing an installation is a deliberate manual task.
+- **It does not manage anything it did not create.** Other Docker projects,
+  other containers, IIS or whatever else holds a port are identified and
+  reported, never stopped or reconfigured.
+- **It does not renew certificates.** There is no ACME/Let's Encrypt client and
+  no scheduled renewal — replacing a certificate is an operator action
+  (menu option 7).
+- **It does not send test email.** Configuring SMTP checks that the server
+  resolves and accepts a connection; it does not verify credentials or delivery.
+- **It does not roll back an update.** DELTA's schema migrations are
+  forward-only, so recovery from a bad migration is a restore from the backup
+  the update took first — which is why that backup cannot be skipped.
+- **It does not install or manage a Linux distribution.** Docker Desktop's own
+  WSL distribution is Docker's; the installer only talks to `docker`,
+  `docker compose` and `docker desktop`.

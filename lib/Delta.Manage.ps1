@@ -3058,26 +3058,12 @@ function Invoke-DeltaUpdateOperation {
     return $update
 }
 
-function Show-DeltaPhasePlaceholder {
-    <#
-      An operation the completed product has and this build does not yet. It
-      names the phase that delivers it and returns; it never half-does the
-      thing, and it changes nothing.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Operation,
-        [Parameter(Mandatory)][int]$Phase,
-        [Parameter(Mandatory)][string]$Description
-    )
-
-    Show-Section -Title $Operation
-    Write-Detail "$Description"
-    Write-Detail ''
-    Write-Detail "This operation is delivered by Phase $Phase of the installer and is not implemented in"
-    Write-Detail 'this build. Nothing was changed. Press Enter to return to the menu.'
-    Write-DeltaLogLine -Message "Placeholder selected: $Operation (Phase $Phase)" -Level 'DETAIL'
-    $null = Read-Host
-}
+# Show-DeltaPhasePlaceholder lived here. It told the operator that a menu entry
+# was "delivered by Phase N and is not implemented in this build", and it was
+# how options 1, 2, 5, 6 and 7 behaved while those phases were still ahead.
+# Every one of them is now implemented, the function had no callers left, and a
+# shipped product should not carry a helper whose whole purpose is to name a
+# phase that has already happened. Removed in Phase 11.
 
 function Show-DeltaUnavailableOperation {
     <#

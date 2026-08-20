@@ -1,8 +1,10 @@
 # DELTA Windows Docker Installer — Technical Assessment
 
-**Status:** Assessment only. No installer code written or modified.
-**Date:** 2026-08-19
+**Status:** Assessment, written before any code existed. **Left as written**, as the record of what was measured and decided in advance — its verified facts and design decisions are still the source of truth, and are cited throughout the phasing document as *A§n*.
+**Date:** 2026-08-19 · implementation followed in `DELTA-WINDOWS-DOCKER-INSTALLER-PHASES.md` and completed 2026-08-21.
 **Purpose:** Single technical source of truth for the subsequent implementation-phasing task.
+
+> **Where implementation superseded this document, the phasing document wins.** The differences are recorded there rather than edited into the text below, so that the original reasoning stays legible. The material ones: A§18.2 offers `docker manifest inspect` as a fallback for remote digest detection — measurement showed it returns a *different* digest and it is deliberately not used (Phase 9); A§19.1's sketch pipes `pg_dump` through PowerShell, which corrupts a custom-format archive and was replaced with a byte-exact transport (Phase 8); A§16.3 sketched a SYSTEM scheduled task, which measurement showed would provision a second, empty engine, so the task runs as the installing user under S4U (Phase 6). **A§9.3's conditional mention of uninstall describes a constraint on possible future work — no uninstall workflow exists.**
 
 **Evidence legend**
 

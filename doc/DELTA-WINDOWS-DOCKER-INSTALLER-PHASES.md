@@ -1,8 +1,10 @@
 # DELTA Windows Docker Installer — Development Phasing Plan
 
-**Status:** Planning only. No installer code written or modified.
-**Date:** 2026-08-19
+**Status:** Implemented. Phases 1–11 are built; each phase's *Implementation status* section below records what was demonstrated, when, and by which commit. Two phases remain **PARTIAL** by design — Phase 2 (the Docker-absent install path was never executed against a real installer) and Phase 6 (no real unattended reboot has been performed). Nothing else is outstanding.
+**Planning date:** 2026-08-19 · **Implementation completed:** 2026-08-21
 **Companion document:** `doc\DELTA-WINDOWS-DOCKER-INSTALLER-ASSESSMENT.md` — the technical source of truth.
+
+> **This installer has no uninstall workflow, by design.** There is no `uninstall.ps1`, no menu entry, and no removal command anywhere in the product. Removing an installation is a manual operator task. The one conditional mention of uninstall in the assessment (A§9.3, *"Uninstall — if implemented at all …"*) is a constraint on any future work, not a description of anything that exists.
 
 ---
 
@@ -22,8 +24,8 @@ It does not restate the architecture, re-derive verified facts, or redraw the as
 |---|---|
 | `doc\DELTA-WINDOWS-DOCKER-INSTALLER-ASSESSMENT.md` | **Authoritative.** Architecture, verified facts, flows, acceptance criteria. Cited throughout as *A§n*. |
 | `C:\Workspace\DELTA-windows-installer` | Reference implementation. Consult for the functions named in each phase's *Existing Code to Reuse*. Never modified. |
-| `C:\Workspace\DELTA-windows-installer-docker` | Target project. Currently contains only `doc\` and `docs\archived\` — **no code, and not yet a git repository.** |
-| `docs\archived\*` | Superseded prior planning. Do not read, extend, or modify. |
+| `C:\Workspace\DELTA-windows-installer-docker` | Target project. *(As written in 2026-08-19 this held only `doc\` and `docs\archived\`, with no code and no git repository. It is now the implemented installer — see the layout below.)* |
+| ~~`docs\archived\*`~~ | Superseded prior planning. **No longer present in the repository**; the directory was not carried forward. The design lesson drawn from it survives as principle 7 in §3. |
 
 ### Verified baseline the phases must preserve
 
@@ -48,26 +50,33 @@ Carried forward from the assessment without change:
 6. **Prefer Docker's mechanism.** Build our own only where the assessment showed Docker's is insufficient.
 7. **Small installer, not a framework.** Reject speculative abstraction. The archived blueprint's failure mode was inventing subsystems; do not repeat it.
 
-### Indicative project layout
+### Project layout
 
-Phases populate this structure. It is **indicative** — consolidate or split as real code justifies, and do not create a file until a phase needs it.
+This was written as an *indicative* structure to be populated by the phases. It is reproduced below as the layout that actually resulted, with the differences noted — the split of configuration management into its own file, and the two standalone scripts the scheduled tasks run.
 
 ```text
 C:\Workspace\DELTA-windows-installer-docker\
-├── setup.ps1                        single operator entry point
+├── setup.ps1                        single operator entry point (install + management)
+├── start-delta.ps1                  run by the Phase 6 startup task; starts Docker, prechecks, brings the stack up
+├── rotate-nginx-logs.ps1            run by the Phase 7 rotation task
 ├── lib\
 │   ├── Delta.Common.ps1             console output · transcript logging + redaction · elevation · validation
-│   ├── Delta.Config.ps1             .env read/write · install-state file · secret generation
-│   ├── Delta.Docker.ps1             Windows prerequisites · Docker detect/install/validate · engine control
+│   ├── Delta.Config.ps1             .env read/write · install-state file · secret generation · fresh-install prompts
+│   ├── Delta.Docker.ps1             Windows prerequisites · Docker detect/install/validate · engine control · unattended startup · process seams
 │   ├── Delta.Stack.ps1              compose + nginx generation · digest pinning · lifecycle · health · migration verification
-│   ├── Delta.Network.ps1            port detection/resolution · TLS mode · certificate validation · URL construction
-│   └── Delta.Manage.ps1             management menu · status · management operations
+│   ├── Delta.Network.ps1            port detection/resolution · TLS mode · certificate validation · URL construction · firewall
+│   ├── Delta.Manage.ps1             management menu · status · lifecycle · logs · backup · update · administrator reset primitive
+│   └── Delta.Configure.ps1          configuration management: SMTP · administrator reset entry · certificate replacement
 ├── templates\
 │   ├── docker-compose.yml.template
 │   ├── env.template
 │   └── nginx\delta.conf.template
 └── doc\
+    ├── DELTA-WINDOWS-DOCKER-INSTALLER-ASSESSMENT.md
+    └── DELTA-WINDOWS-DOCKER-INSTALLER-PHASES.md
 ```
+
+There is deliberately **no `uninstall.ps1`**. There is no `docs\` directory and no `CHANGELOG.md`; the per-phase implementation-status sections in this document are the change record.
 
 `Delta.Manage.ps1` will grow across Phases 7–10. Split it when it does — the natural seams are backup, update, and configuration management.
 
@@ -1349,6 +1358,55 @@ docker compose ps --format json          # published ports on nginx only
 ```
 
 **Acceptance gate.** Every item in A§27 demonstrated and recorded. No secret appears in any transcript. No `down -v` exists in the codebase. Parity runs completed on the available target OS versions, with any divergence documented.
+
+#### Implementation status
+
+**Status: COMPLETE** · 2026-08-21 · commit `<recorded below>` · **Result: PASS WITH FOLLOW-UP ITEMS.** 402/402 assertions pass. Two limitations remain, both genuinely requiring an operator or an environment that does not exist yet, and both left explicit rather than simulated away.
+
+**What this phase did.** It exercised the product as one thing rather than as twelve phases: a fresh install driven through the real `setup.ps1`, its rerun and `-Reconfigure` behaviour, every management-mode entry in one session, a failure matrix, idempotency of the operations an administrator repeats, and a blast-radius audit — then re-ran every earlier phase's suite against the result.
+
+**Two product defects found and fixed**
+
+1. **A non-interactive call could block forever on a prompt.** `Invoke-DeltaCertificateManagement` and `Invoke-DeltaCertificateOperation` both accept `-AllowPrompt $false`, and both ended with an unconditional `Read-Host` pause — on the HTTP-only notice and on the outcome report. A caller that passed `-AllowPrompt $false` would hang with no indication why, because the prompt is written to the host rather than to any captured stream. Both pauses are now gated on `$AllowPrompt`. This is the only behavioural change Phase 11 made to the product.
+2. **Dead phase scaffolding.** `Show-DeltaPhasePlaceholder` — the helper that told an operator an option was "delivered by Phase N and is not implemented in this build" — had no callers left once Phases 8, 9, 10 and 10.5 implemented every entry it stood in for. Removed. A shipped product should not carry a helper whose only purpose is to name a phase that has already happened.
+
+**Documentation reconciled with the implementation.** The phasing document's header still said *"Planning only. No installer code written or modified."*; §2 still described the target project as containing "only `doc\` and `docs\archived\` — no code, and not yet a git repository"; `docs\archived\` no longer exists at all; and the indicative layout omitted `Delta.Configure.ps1`, `start-delta.ps1` and `rotate-nginx-logs.ps1`. All corrected. The assessment keeps its original text — it is the record of what was measured *before* any code existed — with a header note listing the three places implementation deliberately superseded it (the `manifest inspect` fallback, the `pg_dump` pipe, and the SYSTEM startup task). **No document claimed an uninstaller existed**; the single conditional mention in A§9.3 is a constraint on future work, and that is now stated explicitly in all three documents plus a new "What this installer does not do" section in `README.md`.
+
+**Validation** — 402 assertions, all passing.
+
+| Suite | Result |
+|---|---|
+| Phase 11 Part A — fresh install, application health, rerun, `-Reconfigure` | 48/48 |
+| Phase 11 Part B — management mode, lifecycle, failure matrix, blast radius | 43/43 |
+| Phase 8 — backup | 56/56 |
+| Phase 9 — update | 99/99 |
+| Phase 10 — SMTP 66, certificate 47, administrator 25, menu 18 | 156/156 |
+
+- **Fresh install, observed prompt sequence** (isolated `C:\Workspace\delta-p11`, project `delta11`, port 18170): hostname `[localhost]` → bare Enter; database password + confirm; administrator password + confirm; HTTPS choice. **Six questions. No port question** — the port was free. **No SMTP question.** Exit 0.
+- **Application-level health, not HTTP 200.** `/`, `/en/admin/login`, `/en/user/login` and `/admin/login` each return 200 **and** carry an empty `configErrors` payload. The **negative control** is the load-bearing part: blanking `AUTHENTICATION_SUPPORTED` and recreating the container still returns **HTTP 200**, and the detector sees the error and names the variable — so the clean results mean something. `-Reconfigure` repairs it.
+- **Required application configuration** on a fresh install: `AUTHENTICATION_SUPPORTED=form`, `EMAIL_TRANSPORT=file`, `EMAIL_FROM=noreply@delta.invalid` (the hostname-aware default for a non-dotted host), and **no `SMTP_*` key written at all**.
+- **Rerun idempotency.** Three consecutive reruns enter Management Mode, ask only the menu selection, and pull nothing and regenerate nothing. Across two of them `.env`, the state file, `docker-compose.yml`, `delta.conf`, every container ID, the scheduled-task set, the firewall-rule set, the `.env` ACL and the `.env` line count are **all identical** — no duplicate tasks, rules or configuration lines.
+- **`-Reconfigure` is reconfiguration.** It announces itself, asks **two** questions (hostname, HTTPS) and not the credentials, and leaves the database password, session secret, administrator credential and data volume unchanged. Separately it was used to convert the test installation **from HTTP-only to HTTPS**: HTTPS 200 on all three pages with a clean payload, HTTP 301 redirect, and the served certificate verified by thumbprint.
+- **Management mode, one session, every entry**: 1 (already up to date), 2 (verified backup), 8, 9→0, 5→cancel, 6→decline, 7 (HTTP-only notice), refresh, an invalid selection (reported, not ignored), 0. **No stale placeholder text anywhere.**
+- **Lifecycle idempotency**: Stop when stopped, Start when running, Restart twice — all succeed, and **no container is recreated** by any of it. Backup twice produces two files that both verify and neither overwrites. Two update checks both report already-current. Neither touches the data volume.
+- **Failure matrix**: invalid hostname; Docker unavailable (degraded menu withholds operations 1–7, shows diagnostics, answers a number typed anyway, no "Unknown" rows); registry unreachable (aborts at inspect, takes no backup, changes nothing, and does **not** claim the installation is current); unreachable SMTP host; malformed `EMAIL_FROM`; certificate work on an HTTP-only installation; and the mandatory-backup gate (aborts at `backup` with **zero** compose calls — no pull, no recreation). The installation is application-healthy after the whole matrix.
+- **Blast radius**: a tokenizer pass over all ten scripts finds no `down`, `-v`, `--volumes` or `prune` token outside comments, and no `docker volume rm`, `container rm` or `prune` anywhere in product code. Both data volumes survive every test.
+- **The operator's installation was never the target.** Its `.env`, database container, `delta_pgdata` and the host image list are unchanged by Part A, and every container outside the test project is identical.
+- **PowerShell 5.1**: 10/10 scripts parse under the 5.1 parser and keep their UTF-8 BOM. The `::new()` and `||` hits in a compatibility sweep are false positives (PS 5.0+ syntax, and shell strings passed to containers). The one `WriteAllLines` in product code (`Limit-DeltaLogFile`) was reviewed and is **correct**: the log writer uses `[Environment]::NewLine` and so does `WriteAllLines`, so the trim cannot change the file's newline style.
+- **Secrets**: no secret value, key name, connection URI or private-key material in any transcript, state file or tracked file; `.env` ACL is Administrators + SYSTEM throughout.
+
+**Four test-harness defects, none of them product defects.** Recorded because §19 of this phase exists precisely for them, and because three were repeats of faults earlier phases had already documented: `$LASTEXITCODE` read after a PowerShell *function* (only native executables set it); a degraded-menu script that ran out of answers because `Show-DeltaUnavailableOperation` pauses; `Reset-Libraries` dot-sourcing **inside a function**, which scopes the definitions to that function and silently restored nothing — the same fault Phase 10.5 hit; and `$vol = Select-String …` clobbering the `$VOL` volume-name variable, PowerShell names being case-insensitive — the same class of collision Phase 10.5 found in *product* code. Two stale assertions inherited from Phases 8 and 9 (which asserted that the Phase 9/10 placeholders still existed) were updated to assert the opposite, which is now the truth.
+
+**Phase 6 remains PARTIAL, and Phase 11 did not change that.** No reboot was performed and none was authorised. What is proven: the scheduled task exists, is reconciled, runs as the installing user under S4U, and recovers the stack when run by hand — including from a fully stopped Docker Desktop. What is **not** proven, and cannot be proven by inspection: that a real Windows restart with **no interactive sign-in** leaves DELTA reachable. That measurement requires the operator to restart the machine, not sign in, and request the URL from another machine. Configuring a mechanism and observing that it worked are different claims on different evidence, and the status line the product prints still says *"CONFIGURED but NOT YET PROVEN by a real restart."*
+
+**Operator-required validation and standing limitations**
+
+1. **The Phase 6 reboot test** — above. The single largest remaining unknown.
+2. **A genuinely different DELTA image.** `ghcr.io/preventionweb/delta-country` publishes only `prod-latest`, and it currently resolves to the image already running. Every mechanism around an update is proven; DELTA's own version-to-version schema migration is not, and cannot be without a second image. Publishing a fake tag to manufacture one was explicitly declined.
+3. **Browser sign-in after an administrator reset.** Proven at the database — the stored hash changes and only the new credential verifies — but `POST /en/admin/login` returns an identical 400 for correct and incorrect credentials because the form posts from client-side JavaScript, so it cannot be automated.
+4. **Mail delivery.** SMTP configuration checks that the host resolves and accepts a connection. It does not verify credentials, TLS negotiation or delivery.
+5. **Phase 2's Docker-absent half** — the silent Docker Desktop install, `wsl --install`, and the reboot-and-rerun cycle — remains seam-tested only, because this host has both Docker and WSL and must not be destabilised.
+6. **Server 2022 and Windows 11 parity (U5)** was not exercised. Server 2025 is the only OS this product has run on.
 
 **Dependencies for next phase.** None — this is the release gate.
 

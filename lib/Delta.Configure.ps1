@@ -1157,9 +1157,14 @@ function Invoke-DeltaCertificateManagement {
         Write-Detail 'Nothing was changed.'
         $result.Stage = 'tls-disabled'
         $result.Reason = 'HTTPS is not enabled for this installation, so there is no certificate to replace.'
-        Write-Host ''
-        Write-Detail 'Press Enter to return to the menu.'
-        $null = Read-Host
+        # Only pause when somebody is there to press the key. A non-interactive
+        # caller blocking on Read-Host would hang forever with no indication
+        # why - the prompt is written to the host, not to a captured stream.
+        if ($AllowPrompt) {
+            Write-Host ''
+            Write-Detail 'Press Enter to return to the menu.'
+            $null = Read-Host
+        }
         return $result
     }
 
@@ -1403,8 +1408,12 @@ function Invoke-DeltaCertificateOperation {
         if ($outcome.Restored) { Write-Detail 'The previous certificate has been restored.' }
     }
 
-    Write-Host ''
-    Write-Detail 'Press Enter to return to the menu.'
-    $null = Read-Host
+    # Same rule as the operation itself: pause only for an operator who can
+    # answer. This wrapper accepts -AllowPrompt $false, so it must not block.
+    if ($AllowPrompt) {
+        Write-Host ''
+        Write-Detail 'Press Enter to return to the menu.'
+        $null = Read-Host
+    }
     return $outcome
 }
