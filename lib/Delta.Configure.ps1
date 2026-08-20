@@ -436,9 +436,12 @@ function Invoke-DeltaSmtpConfiguration {
         $collected = [ordered]@{ 'EMAIL_TRANSPORT' = $transport }
 
         Write-Host ''
-        $collected['EMAIL_FROM'] = Read-DeltaEmailSettingValue -Prompt 'From address (EMAIL_FROM)' -CurrentValue $current.From -Optional -Validator {
+        # Required, not optional: DELTA validates EMAIL_FROM on every page load
+        # and shows a configuration-error page when it is missing or has no "@"
+        # and ".". An empty answer here would break the login page.
+        $collected['EMAIL_FROM'] = Read-DeltaEmailSettingValue -Prompt 'From address (EMAIL_FROM)' -CurrentValue $current.From -Validator {
             param($v)
-            if ($v -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return "'$v' does not look like an email address." }
+            if ($v -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return "'$v' does not look like an email address. DELTA requires an '@' and a '.'." }
             return $null
         }
 
@@ -465,9 +468,27 @@ function Invoke-DeltaSmtpConfiguration {
             if ($v -notin @('true', 'false')) { return "Enter true or false." }
             return $null
         }
-        $collected['SMTP_USER'] = Read-DeltaEmailSettingValue -Prompt 'SMTP username (SMTP_USER)' -CurrentValue $current.User -Optional
+        # SMTP_USER and SMTP_PASS are NOT optional once the transport is smtp:
+        # DELTA requires SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS to be
+        # present and reports each missing one as a configuration error on the
+        # login page. An unauthenticated relay is therefore not expressible
+        # through this screen - which is DELTA's constraint, not this
+        # installer's, and it is better to say so here than to write a
+        # configuration that renders an error page.
+        $collected['SMTP_USER'] = Read-DeltaEmailSettingValue -Prompt 'SMTP username (SMTP_USER)' -CurrentValue $current.User -Validator {
+            param($v)
+            if ($v -match '\s') { return 'A username cannot contain spaces.' }
+            return $null
+        }
 
         $secure = Read-DeltaSmtpPassword -HasCurrent $current.HasPassword
+        if (-not $secure -and -not $current.HasPassword) {
+            Write-DeltaWarning 'DELTA requires an SMTP password when the transport is smtp - without one it will'
+            Write-DeltaWarning 'show a configuration error on the login page. Enter one, or choose the file'
+            Write-DeltaWarning 'transport instead.'
+            $current = Get-DeltaSmtpConfiguration -InstallRoot $InstallRoot
+            continue
+        }
         if ($secure) {
             # Converted at the single point it is needed and released
             # immediately afterwards; it is never logged, never displayed and

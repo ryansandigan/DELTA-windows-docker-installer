@@ -105,6 +105,34 @@ function New-DeltaInstallDirectories {
 # Configuration generation
 # ---------------------------------------------------------------------------
 
+function Get-DeltaDefaultEmailFrom {
+    <#
+      A sender address that satisfies DELTA's own rule.
+
+      DELTA requires EMAIL_FROM to contain both an "@" and a "." and otherwise
+      reports "Email sender address appears to be invalid". That rules out the
+      obvious `delta@localhost`, which has no dot - so the default is derived
+      from the configured hostname when that is a dotted name, and falls back
+      to the reserved .invalid TLD when it is not.
+
+      RFC 2606 reserves .invalid precisely so that it can never resolve, which
+      is the right property for an address that exists to satisfy a validator
+      on an installation that is not sending mail. Nothing is ever sent from it
+      while EMAIL_TRANSPORT is "file"; an operator who configures SMTP is asked
+      for a real address at that point.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$HostName)
+
+    $candidate = ([string]$HostName).Trim()
+    $address = [System.Net.IPAddress]::None
+    $isAddress = [System.Net.IPAddress]::TryParse($candidate, [ref]$address)
+
+    if ($candidate -and -not $isAddress -and $candidate.Contains('.')) {
+        return "noreply@$candidate"
+    }
+    return 'noreply@delta.invalid'
+}
+
 function New-DeltaDatabaseUrl {
     <#
       Builds the postgresql:// connection string, percent-encoding the username
@@ -321,6 +349,21 @@ function New-DeltaEnvironmentFile {
     $values['LOG_LEVEL']            = & $resolve 'LOG_LEVEL' 'info'
     $values['LOG_RETENTION_DAYS']   = & $resolve 'LOG_RETENTION_DAYS' '30'
     $values['PUBLIC_URL']           = $publicUrl
+
+    # --- required application configuration -------------------------------
+    # DELTA's validateRequiredEnvVars() runs on every page load and renders a
+    # "System configuration errors" page when any of these is absent. They are
+    # required to be PRESENT, which is a different thing from the runtime
+    # having a fallback: _configAuthSupported() returns "form" when
+    # AUTHENTICATION_SUPPORTED is unset, and the validator still reports it as
+    # missing. Written here as well as in the template so that an installation
+    # created before this existed gains them on its next run.
+    #
+    # Existing values always win, so an operator who has configured SMTP or
+    # SSO keeps exactly what they set.
+    $values['AUTHENTICATION_SUPPORTED'] = & $resolve 'AUTHENTICATION_SUPPORTED' 'form'
+    $values['EMAIL_TRANSPORT']          = & $resolve 'EMAIL_TRANSPORT' 'file'
+    $values['EMAIL_FROM']               = & $resolve 'EMAIL_FROM' (Get-DeltaDefaultEmailFrom -HostName $Network.HostName)
 
     Set-DeltaEnvValues -Path $envPath -Values $values
 

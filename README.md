@@ -72,10 +72,17 @@ tooling.
   without asking. You are only asked for another port when something else
   genuinely owns it — and then you are told *what* owns it. Nothing already
   using the port is ever stopped, moved or reconfigured.
-- **SMTP / email.** DELTA works without it: its default writes mail to the
-  container log rather than sending it. Configure a mail server afterwards,
-  when you want one, from [Configuring email](#configuring-email). Installing
-  DELTA does not require a mail server to exist.
+- **SMTP / email.** DELTA works without it. The installer sets
+  `EMAIL_TRANSPORT=file`, which writes mail to the container log instead of
+  sending it, and a placeholder `EMAIL_FROM` — DELTA requires both to be set
+  even when it is not sending anything, so the installer supplies them.
+  Configure a real mail server afterwards, when you want one, from
+  [Configuring email](#configuring-email). Installing DELTA does not require a
+  mail server to exist.
+- **How people sign in.** `AUTHENTICATION_SUPPORTED=form` is set for you, which
+  is normal local sign-in with an email address and password. (DELTA also
+  accepts `sso_azure_b2c`, which additionally requires three Azure settings —
+  that is a hand edit of `.env`, not something the installer offers.)
 - **Anything about Docker.** Compose project names, internal ports, volumes and
   image digests are the installer's business, not yours.
 
@@ -585,9 +592,14 @@ DELTA supports two transports:
 
 For SMTP you are asked for the from address, server host, port, whether to use
 implicit TLS on connect (`true` for port 465, `false` for 587 and 25), the
-username, and the password. The from address and username are optional; the host
-and port are not. Anything already configured is offered as the default — press
-Enter to keep it.
+username, and the password. **All of them are required** when the transport is
+`smtp`: DELTA reports each missing one as a configuration error on the login
+page, so an unauthenticated relay cannot be expressed here. That is DELTA's
+constraint, not the installer's. Anything already configured is offered as the
+default — press Enter to keep it.
+
+Switching back to **File** leaves the SMTP server settings in `.env` untouched,
+so you can switch to `smtp` again later without retyping them.
 
 **The password is never displayed.** It is typed masked, entered twice and
 required to match. If a password is already configured, pressing Enter at that

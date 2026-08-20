@@ -1215,7 +1215,9 @@ Two things the audit found to be **already correct**, and which this phase there
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · commits `d92c781` (phase inserted, audit) and `92d4fda` (implementation) · **Acceptance gate: met.** All thirteen items demonstrated physically on isolated installations. 100/100 Phase 10.5 assertions pass.
+**Status: COMPLETE** · 2026-08-20 · commits `d92c781` (phase inserted, audit), `92d4fda` (implementation), `af0ca0b` (defect fix) · **Acceptance gate: met — but only after an operator-found defect was fixed. The first acceptance was wrong, and the reason is recorded below because it matters more than the fix.**
+
+> **Acceptance corrected 2026-08-20.** Phase 10.5 was first reported PASS on evidence that included `GET /` = 200 and `GET /en/admin/login` = 200. Manual operator testing then found that `/en/admin/login` was rendering DELTA's **"System configuration errors"** page, listing `EMAIL_TRANSPORT`, `EMAIL_FROM` and `AUTHENTICATION_SUPPORTED` as missing. **That page returns HTTP 200.** Every status-code check in this project, from Phase 3 onward, had been passing over it. The defect and the validation gap are both recorded under "The acceptance defect" below.
 
 Delivered: the fresh-install settings section of `lib\Delta.Config.ps1` (`Test-DeltaHostName`, `Read-DeltaHostName`, `Read-DeltaInstallPassword`, `Read-DeltaFreshInstallSettings`); credential threading through `lib\Delta.Stack.ps1`; `-NewPasswordWasGenerated` on the Phase 5 primitive in `lib\Delta.Manage.ps1`; the settings step in `setup.ps1`; the fresh-install and rerun sections of `README.md`.
 
@@ -1253,7 +1255,42 @@ Delivered: the fresh-install settings section of `lib\Delta.Config.ps1` (`Test-D
 - **Hostname reachability is not tested.** A typed hostname is validated syntactically and threaded through the configuration; whether DNS resolves it, and whether a firewall elsewhere permits it, is not something the installer measures or claims.
 - **`localhost` over plain HTTP remains localhost-only**, as A§6 states: `NODE_ENV=production` marks session cookies `Secure`, so users reaching a real hostname over plain HTTP will not stay signed in. The installer says so at the TLS prompt and again in the summary.
 
+#### The acceptance defect, and the fix
+
+**Root cause.** DELTA runs `validateRequiredEnvVars()` on page load and renders a configuration-error page listing whatever is missing. It requires `EMAIL_TRANSPORT`, `EMAIL_FROM` and `AUTHENTICATION_SUPPORTED` to be **present in the environment** — which is not the same as the runtime having a fallback for them, and that distinction is the whole defect. `_configAuthSupported()` returns `"form"` when `AUTHENTICATION_SUPPORTED` is unset, so DELTA *works*; the validator still reports it missing, so DELTA *complains*. Phase 3's template never carried the three variables, and Phase 10 explicitly decided not to add them — reasoning that DELTA defaults to the file transport anyway. That reasoning was about the runtime and the validator does not share it. This is the cost of that call, and it was mine.
+
+**The contract, read from the running image** (`/delta/build/server/index.js`), not guessed:
+
+| Variable | Requirement | Accepted values |
+|---|---|---|
+| `EMAIL_TRANSPORT` | must be non-empty | `file` or `smtp` only — anything else raises *"Invalid EMAIL_TRANSPORT value. Use 'file' or 'smtp'."* at send time. **`smtp` additionally makes `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` all required**, each reported separately when missing |
+| `EMAIL_FROM` | must be non-empty **and** contain both `@` and `.` | otherwise *"Email sender address appears to be invalid"* |
+| `AUTHENTICATION_SUPPORTED` | must be non-empty | comma-separated, only `form` and `sso_azure_b2c` are recognised; `sso_azure_b2c` then requires `SSO_AZURE_B2C_TENANT`, `_CLIENT_ID` and `_CLIENT_SECRET` |
+
+`PUBLIC_URL` and `SESSION_SECRET` are validated too and were already correct — which is why the operator saw exactly three errors and not five.
+
+**Defaults chosen.** `AUTHENTICATION_SUPPORTED=form`, because form is normal local sign-in and is the only value that needs no further configuration. `EMAIL_TRANSPORT=file`, because it is DELTA's own runtime default and — crucially — the value that makes none of the four SMTP variables mandatory, which is what keeps SMTP out of the fresh-install questionnaire. `EMAIL_FROM` is derived: `noreply@<hostname>` when the hostname is a dotted DNS name, otherwise `noreply@delta.invalid`. The obvious `delta@localhost` is **invalid** here — it has no dot — and `.invalid` is reserved by RFC 2606 precisely so it can never resolve, which is the right property for an address that exists to satisfy a validator on an installation that is not sending mail.
+
+**A second defect the same investigation exposed.** Phase 10's SMTP flow made `EMAIL_FROM`, `SMTP_USER` and `SMTP_PASS` optional. Against this contract, choosing `smtp` and leaving any of them blank produces the same configuration-error page — so menu option 5 could put an installation into exactly the state the operator reported. All three are now required when the transport is `smtp`, and the flow says why.
+
+**Fixed at the source, not in one `.env`.** `templates\env.template` now declares all three with their defaults and documents the contract inline; `New-DeltaEnvironmentFile` also writes them, resolving `EMAIL_FROM` from the hostname, so an installation created before this existed gains them on its next run. Existing values always win, so an operator who has configured SMTP or SSO keeps what they set. The operator's own installation was repaired by running `setup.ps1 -Reconfigure` — the same code path a future operator uses — not by editing its `.env`.
+
+**The validation gap, which is the more important finding.** `GET /` = 200 was never sufficient and never had been: the configuration-error page is a normal 200 response. Worse, the marker string *"System configuration errors"* is the React component's own text and ships in the client bundle on **every** page, so a naive content grep reports it on a perfectly healthy login page — the first corrected detector did exactly that and produced eleven false failures. The real signal is the loader's payload: `"configErrors",[]` when clean, an array of `{variable, message}` objects when not. The suite now asserts on that, and carries a **negative control** that blanks `AUTHENTICATION_SUPPORTED` on an isolated installation, recreates the container, and requires the detector to see the error and name the variable before any "clean" result is trusted.
+
+**Validation of the fix** — 39/40 on an isolated installation (`C:\Workspace\delta-f`), the single failure being a stale precondition in the test (the previous run had already repaired the operator's installation), not a defect:
+
+- A fresh install with the fixed template asks **four questions** on the fully-default path (bare Enter at a password prompt generates one and skips its confirm) and **no SMTP question**; `.env` and the **running container** both carry `AUTHENTICATION_SUPPORTED=form`, `EMAIL_TRANSPORT=file` and a valid `EMAIL_FROM`.
+- `/`, `/en/admin/login`, `/en/user/login` and `/admin/login` all return 200 **and** carry an empty `configErrors` payload.
+- The negative control behaves as required: with `AUTHENTICATION_SUPPORTED` blanked the page still returns **200**, the detector sees the error and names the variable, and `-Reconfigure` repairs it.
+- Menu option 5 still works from the new default state: switching to SMTP sets all four required variables and leaves the pages clean, `AUTHENTICATION_SUPPORTED` is untouched by the SMTP flow, and switching back to `file` is also clean.
+- The operator's installation was repaired through `-Reconfigure` with its database container, `delta_pgdata`, administrator credential, `SESSION_SECRET`, database password and `.env` ACL all unchanged.
+- Regression after the fix: Phase 10 SMTP **53/53** (two assertions updated — the clean baseline is now "transport is `file`", not "transport is absent") and menu 18/18; Phase 8 19/19 + 28/32; Phase 9 28/28 + 36/36. The four Phase 8 failures are the long-standing stale placeholder assertions. No new failures.
+
+**A test-harness fault worth recording.** The Phase 10 SMTP suite's reset helper deleted `EMAIL_TRANSPORT` and `EMAIL_FROM` to create its baseline. After this fix that is no longer a clean baseline — it is a broken installation — and it left the operator's `.env` without them. The helper now restores the defaults instead of removing the keys.
+
 **Phase 6 is untouched and remains PARTIAL.** Nothing here measures, infers or records a reboot result.
+
+**For Phase 11.** Every endpoint assertion in this project that checks only a status code is now known to be weak against this class of failure. Phase 11's acceptance pass should assert on the `configErrors` payload wherever it exercises a page, and should treat "HTTP 200" as necessary but never sufficient.
 
 ---
 
