@@ -1,11 +1,31 @@
 ﻿# =============================================================================
 # Delta.Uninstall.ps1 - removing a DELTA Docker installation (Phase 12)
 #
-# The whole file is written around one asymmetry: putting DELTA back is always
-# possible, and getting an operator's database back is not. So every decision
-# here defaults to keeping things, every deletion is scoped to a resource this
-# installation can prove it owns, and the one irreversible operation is behind
-# a confirmation nobody can answer by reflex.
+# The whole file is built around one property, taken directly from the
+# reference installer's uninstall.ps1:
+#
+#     BACKUP FAILURE MAKES THE DELETION PATH UNREACHABLE.
+#
+# Not "unlikely", not "guarded by a flag somebody remembered to check" -
+# unreachable. Backup-DeltaInstallation throws on every failure rather than
+# returning a status, and Remove-DeltaInstallation cannot be called without a
+# [Delta.VerifiedArchive] object that only Backup-DeltaInstallation produces.
+# A caller cannot pass $true, cannot pass a hashtable, and cannot skip the
+# parameter: PowerShell refuses the binding. The removal function then
+# re-validates the object and the file it names before touching anything.
+#
+# The shape of the operation mirrors the reference installer:
+#
+#     fresh verified database dump
+#         -> quiesce the runtime
+#         -> archive the whole installation root to an external ZIP
+#         -> verify the ZIP by opening it and looking for what must be in it
+#         -> only then remove Docker resources and delete the installation
+#
+# There is one path and one outcome. The external ZIP under C:\DELTA-backups
+# is the preservation mechanism, so there is no second "leave C:\DELTA where
+# it is" mode - the data is preserved by being in the archive, not by being
+# left behind.
 #
 # Ownership is never inferred from a name. It comes from
 # <InstallRoot>\.delta-install.json - the record of what a previous run
@@ -32,11 +52,73 @@
 # a guard that fails loudly beats a rule somebody has to remember.
 $Script:DeltaComposeVolumeFlags = @('-v', '--volumes', '--volume')
 
-# Written into the state file after a preserve-data uninstall so a later run -
-# of setup.ps1, of this script - can tell "never finished installing" from
-# "deliberately uninstalled, data kept".
-$Script:DeltaUninstallModePreserve = 'preserve-data'
-$Script:DeltaUninstallModeComplete = 'complete'
+# Where the external archive goes. The reference installer's convention,
+# reused deliberately: an operator who has uninstalled the native DELTA knows
+# to look in C:\DELTA-backups, and a second convention would only mean two
+# places to search. A single named constant, so the confirmation preview and
+# the code that actually writes the file can never drift into two paths.
+#
+# It is a default, not a hard-coded destination: an installation at D:\DELTA
+# should be able to archive to the same volume, and -BackupRoot exists for
+# that. What it may never be is a directory inside the installation root -
+# see New-DeltaInstallationArchive, which refuses that outright rather than
+# writing an archive into the tree it is archiving.
+$Script:DeltaUninstallBackupRoot = 'C:\DELTA-backups'
+
+# Directories excluded from the installation archive, expressed as paths
+# relative to the installation root.
+#
+# It is empty, and that is a finding rather than an omission.
+#
+# The reference installer excludes node_modules, .next\cache, tmp, cache and
+# service, because in that architecture the DELTA application itself lives in
+# the installation directory: its source, its dependency tree, its build
+# output and a downloaded service wrapper all sit alongside the operator's
+# data, and all of them are reproducible from package.json / a pinned
+# download.
+#
+# In the Docker architecture none of that is true. The application is in the
+# image; it is re-obtained with `docker pull`, not from this directory. What
+# the installation root actually contains was enumerated rather than assumed:
+#
+#     .env, .env.bak-*            configuration and secrets, and their history
+#     .delta-install.json         the installation record
+#     docker-compose.yml          generated, but from operator choices
+#     nginx\conf.d\delta.conf     likewise
+#     certs\                      certificate and private key
+#     uploads\                    user-uploaded files
+#     logs\delta, logs\nginx      application and access logs, incl. rotated
+#     logs\installer              installer and startup transcripts
+#     backups\*.dump              database dumps
+#     backups\env-*.bak           .env snapshots taken before changes
+#
+# Every one of those is either irreplaceable or a record of what an operator
+# did. There is no dependency tree, no build cache and no downloaded binary
+# anywhere in it. So nothing is excluded - which is exactly the instruction
+# "exclude only what is proven reproducible", applied to an architecture where
+# the answer turns out to be nothing.
+#
+# Note in particular what is NOT excluded despite its name: uploads\<tenant>\
+# temp is DELTA's own upload staging directory. It sits inside user data, its
+# contents belong to the application rather than to a build, and excluding a
+# directory because it is called "temp" would be guessing at DELTA's
+# internals. The reference installer draws the same line - its exclusions are
+# matched only at the top level and never inside uploads\ or logs\.
+#
+# The mechanism is kept, and the walk below prunes correctly at a directory
+# boundary, so adding an exclusion later is a one-line change with tested
+# semantics rather than a new traversal.
+$Script:DeltaArchiveExclusionPatterns = @()
+
+# The entries an archive of a DELTA installation must contain to be worth
+# trusting. Checked by name, and the ones marked Critical are checked for
+# non-zero length as well. Relative to the archive's single top-level folder.
+$Script:DeltaArchiveRequiredEntries = @(
+    @{ Path = '.env';                    Description = 'configuration and secrets' }
+    @{ Path = 'docker-compose.yml';      Description = 'the Compose stack definition' }
+    @{ Path = '.delta-install.json';     Description = 'the installation record' }
+    @{ Path = 'nginx/conf.d/delta.conf'; Description = 'the generated NGINX configuration' }
+)
 
 # ---------------------------------------------------------------------------
 # Identity: what is this installation, and what does it own?
@@ -79,7 +161,6 @@ function Get-DeltaUninstallTarget {
         RotationTaskName = $null
         HttpRuleName     = $null
         HttpsRuleName    = $null
-        PreviousUninstall = $null
         StateFile        = $null
         Configuration    = $null
     }
@@ -104,7 +185,6 @@ function Get-DeltaUninstallTarget {
     $properties = @($state.Data.PSObject.Properties.Name)
     $stateProject = if ($properties -contains 'composeProject') { [string]$state.Data.composeProject } else { $null }
     $stateVolume  = if ($properties -contains 'pgDataVolume')   { [string]$state.Data.pgDataVolume }   else { $null }
-    if ($properties -contains 'uninstall') { $target.PreviousUninstall = $state.Data.uninstall }
 
     # .env is read through the same accessor the rest of the product uses, so
     # a configuration that has drifted from the state file is visible instead
@@ -155,7 +235,7 @@ function Get-DeltaUninstallSurvey {
       Separate from Get-DeltaUninstallTarget on purpose: that function answers
       "what would this installation own", which is a question about two files,
       and this one answers "what is still here", which is a question about the
-      machine. Keeping them apart is what lets a rerun after a partial
+      machine. Keeping them apart is what lets a rerun after an interrupted
       uninstall describe itself accurately rather than reporting resources it
       has already removed.
 
@@ -245,6 +325,493 @@ function Get-DeltaUninstallSurvey {
 }
 
 # ---------------------------------------------------------------------------
+# The archive
+#
+# Adapted from the reference installer's New-DeltaApplicationBackupArchive and
+# Get-DeltaApplicationBackupFileList, with the same two structural decisions:
+# a direct ZipArchive rather than Compress-Archive, and an explicit walk that
+# prunes at a directory boundary rather than filtering a full recursive
+# listing afterwards.
+# ---------------------------------------------------------------------------
+
+function Test-DeltaArchivePathExcluded {
+    <#
+      Whether a path relative to the installation root falls under one of the
+      exclusion patterns - an exact match, or a prefix followed by a path
+      separator so a nested path is caught. Never a bare substring match,
+      which would also exclude an unrelated sibling like "backups2" or match
+      "logs" against something merely containing the word. Case-insensitive,
+      matching Windows' own filesystem semantics.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RelativePath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ExclusionPatterns
+    )
+
+    foreach ($pattern in $ExclusionPatterns) {
+        if ($RelativePath -ieq $pattern) { return $true }
+        if ($RelativePath.StartsWith("$pattern\", [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-DeltaArchiveFileList {
+    <#
+      Walks the installation root with an explicit stack rather than
+      Get-ChildItem -Recurse, so an excluded directory is never enumerated at
+      all instead of being enumerated and then filtered out. With the current
+      empty exclusion set that costs nothing; it matters the moment a
+      directory ever does need excluding, and it is the traversal the
+      reference installer settled on for the same reason.
+
+      The root is resolved through Get-Item, not by trimming the string,
+      because the two can disagree - a short 8.3-form path resolves to its
+      long form once the filesystem provider touches it - and every
+      descendant's FullName comes from that same provider. A length mismatch
+      would silently corrupt every relative path computed by Substring below.
+
+      Returns Files (FullName + backslash-separated RelativePath),
+      ExcludedDirectories, TotalBytes.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RootPath,
+        [AllowEmptyCollection()][string[]]$ExclusionPatterns = $Script:DeltaArchiveExclusionPatterns
+    )
+
+    $normalizedRoot = (Get-Item -LiteralPath $RootPath).FullName.TrimEnd('\')
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    $excluded = New-Object 'System.Collections.Generic.List[string]'
+    $totalBytes = [long]0
+
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($normalizedRoot)
+
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($item in (Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue)) {
+            $relative = $item.FullName.Substring($normalizedRoot.Length + 1)
+
+            if ($item.PSIsContainer) {
+                if (Test-DeltaArchivePathExcluded -RelativePath $relative -ExclusionPatterns $ExclusionPatterns) {
+                    $null = $excluded.Add($relative)
+                    continue
+                }
+                $pending.Push($item.FullName)
+                continue
+            }
+
+            if (Test-DeltaArchivePathExcluded -RelativePath $relative -ExclusionPatterns $ExclusionPatterns) {
+                continue
+            }
+            $totalBytes += $item.Length
+            $null = $files.Add([PSCustomObject]@{ FullName = $item.FullName; RelativePath = $relative; Length = $item.Length })
+        }
+    }
+
+    return [PSCustomObject]@{
+        Files               = $files.ToArray()
+        ExcludedDirectories = $excluded.ToArray()
+        TotalBytes          = $totalBytes
+    }
+}
+
+function New-DeltaInstallationArchive {
+    <#
+      Writes every file under the installation root into one ZIP, under a
+      single top-level folder named after the installation directory - the
+      same wrapping shape `Compress-Archive -Path <directory>` produces, and
+      what an operator expects when they open the file.
+
+      Not Compress-Archive, for two measured reasons: Windows PowerShell 5.1's
+      version has no exclude parameter and no way to build an archive from a
+      filtered file list, and it fails on archives past 2 GB - which an
+      installation with real uploads will reach. ZipFile/ZipArchive has
+      neither limit and streams each file in with CreateEntryFromFile, so no
+      staging copy of the tree is ever made on disk.
+
+      It refuses to write into the directory it is archiving. That is not
+      hypothetical tidiness: an archive being written inside its own source
+      tree is a file that grows as it is read, and the walk would either
+      include a partial copy of the archive in itself or fail part-way.
+
+      Every file that cannot be added is collected and returned rather than
+      swallowed. The caller treats any failure as fatal, because a backup
+      missing a file it did not mention is worse than no backup at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceDirectory,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+    $normalizedSource = (Get-Item -LiteralPath $SourceDirectory).FullName.TrimEnd('\')
+    $rootFolderName   = Split-Path -Path $normalizedSource -Leaf
+
+    $destinationFull = [System.IO.Path]::GetFullPath($DestinationPath)
+    if ($destinationFull.StartsWith($normalizedSource + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Stop-Setup "Refusing to write the backup archive to '$destinationFull': it is inside the installation root being archived. Choose a destination outside '$normalizedSource'."
+    }
+
+    $list = Get-DeltaArchiveFileList -RootPath $normalizedSource
+    if ($list.ExcludedDirectories.Count -gt 0) {
+        Write-Detail "Excluded (reproducible): $($list.ExcludedDirectories -join ', ')"
+    }
+    if ($list.Files.Count -eq 0) {
+        Stop-Setup "There are no files under '$normalizedSource' to archive. Nothing was deleted."
+    }
+
+    $parent = Split-Path -Path $destinationFull -Parent
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        $null = New-Item -ItemType Directory -Path $parent -Force
+    }
+    if (Test-Path -LiteralPath $destinationFull -PathType Leaf) {
+        # A name collision means two uninstalls in the same second, which
+        # should not happen - and overwriting somebody's only archive to
+        # resolve it would be the wrong way round.
+        Stop-Setup "A backup archive already exists at '$destinationFull'. Nothing was overwritten and nothing was deleted."
+    }
+
+    $failures = New-Object 'System.Collections.Generic.List[string]'
+    $added = 0
+    $zip = [System.IO.Compression.ZipFile]::Open($destinationFull, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in $list.Files) {
+            $entryName = "$rootFolderName/$($file.RelativePath -replace '\\', '/')"
+            try {
+                $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $file.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $added++
+            }
+            catch {
+                $null = $failures.Add("$($file.RelativePath): $($_.Exception.Message)")
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+
+    return [PSCustomObject]@{
+        Path           = $destinationFull
+        RootFolderName = $rootFolderName
+        FileCount      = $list.Files.Count
+        AddedCount     = $added
+        SourceBytes    = $list.TotalBytes
+        Failures       = $failures.ToArray()
+    }
+}
+
+function Test-DeltaInstallationArchive {
+    <#
+      Proves the archive is worth deleting an installation for.
+
+      The reference installer opens the ZIP and checks the entry count is
+      greater than zero. That catches a truncated or corrupt file, which is
+      most of the value, but it cannot distinguish a good archive from one
+      that opened cleanly and happens to contain nothing that matters. So this
+      does four more things:
+
+        1. Every file that was walked must be present as an entry. A count
+           mismatch means something was dropped between the walk and the
+           write.
+        2. The entries that must exist, must exist - .env, the Compose file,
+           the installation record, the generated NGINX configuration - and
+           each must have non-zero length.
+        3. uploads\ must be represented whenever the source had files in it,
+           with at least as many entries as the source had files. This is the
+           check that would catch "the archive is fine, it just has no user
+           data in it".
+        4. The fresh database dump must be present, its compressed entry must
+           report the same uncompressed length as the file on disk, and the
+           first five bytes read back out of the archive must be PGDMP.
+
+      That last one is the difference between "a file with the right name is
+      in the ZIP" and "the database is in the ZIP". It costs one stream read.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Archive,
+        [Parameter(Mandatory)][object]$Target,
+        [Parameter(Mandatory)][object]$DatabaseBackup
+    )
+
+    $result = [PSCustomObject]@{
+        Verified     = $false
+        EntryCount   = 0
+        SizeBytes    = 0
+        Missing      = @()
+        Reason       = $null
+        DumpEntry    = $null
+        UploadCount  = 0
+    }
+
+    if (-not (Test-Path -LiteralPath $Archive.Path -PathType Leaf)) {
+        $result.Reason = "No archive was created at '$($Archive.Path)'."
+        return $result
+    }
+    $result.SizeBytes = (Get-Item -LiteralPath $Archive.Path).Length
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    $prefix = "$($Archive.RootFolderName)/"
+
+    $zip = $null
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive.Path)
+    }
+    catch {
+        $result.Reason = "The archive at '$($Archive.Path)' could not be opened: $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        $entries = @{}
+        foreach ($entry in $zip.Entries) { $entries[$entry.FullName] = $entry }
+        $result.EntryCount = $zip.Entries.Count
+
+        if ($result.EntryCount -eq 0) {
+            $result.Reason = "The archive at '$($Archive.Path)' is empty."
+            return $result
+        }
+        if ($result.EntryCount -ne $Archive.FileCount) {
+            $result.Reason = "The archive holds $($result.EntryCount) entries but $($Archive.FileCount) files were walked. Something was not written."
+            return $result
+        }
+
+        foreach ($required in $Script:DeltaArchiveRequiredEntries) {
+            $name = "$prefix$($required.Path)"
+            if (-not $entries.ContainsKey($name)) {
+                $null = $missing.Add("$($required.Path) ($($required.Description))")
+                continue
+            }
+            if ($entries[$name].Length -le 0) {
+                $null = $missing.Add("$($required.Path) is present but empty")
+            }
+        }
+
+        # Certificate material, but only when this installation actually has
+        # TLS enabled - demanding delta.crt from a plain-HTTP installation
+        # would be inventing a requirement.
+        if ($Target.Configuration -and $Target.Configuration.TlsEnabled) {
+            foreach ($certFile in @('certs/delta.crt', 'certs/delta.key')) {
+                $name = "$prefix$certFile"
+                if (-not $entries.ContainsKey($name) -or $entries[$name].Length -le 0) {
+                    $null = $missing.Add("$certFile (certificate material for an HTTPS installation)")
+                }
+            }
+        }
+
+        # Uploads, when the source had any.
+        $uploadsPath = Join-Path -Path $Target.InstallRoot -ChildPath 'uploads'
+        $sourceUploads = 0
+        if (Test-Path -LiteralPath $uploadsPath -PathType Container) {
+            $sourceUploads = @(Get-ChildItem -LiteralPath $uploadsPath -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+        }
+        $result.UploadCount = @($zip.Entries | Where-Object { $_.FullName.StartsWith("${prefix}uploads/", [System.StringComparison]::OrdinalIgnoreCase) }).Count
+        if ($sourceUploads -gt 0 -and $result.UploadCount -lt $sourceUploads) {
+            $null = $missing.Add("uploads: $sourceUploads file(s) on disk but $($result.UploadCount) in the archive")
+        }
+
+        # The fresh dump: present, same size, and actually a dump.
+        $dumpName = "${prefix}backups/$($DatabaseBackup.FileName)"
+        $result.DumpEntry = $dumpName
+        if (-not $entries.ContainsKey($dumpName)) {
+            $null = $missing.Add("backups/$($DatabaseBackup.FileName) (the database backup taken for this uninstall)")
+        }
+        else {
+            $dumpEntry = $entries[$dumpName]
+            if ($dumpEntry.Length -ne $DatabaseBackup.SizeBytes) {
+                $null = $missing.Add("the database backup is $($dumpEntry.Length) bytes in the archive but $($DatabaseBackup.SizeBytes) on disk")
+            }
+            else {
+                $magic = New-Object byte[] 5
+                $read = 0
+                $stream = $null
+                try {
+                    $stream = $dumpEntry.Open()
+                    $read = $stream.Read($magic, 0, 5)
+                }
+                catch {
+                    $null = $missing.Add("the database backup could not be read back out of the archive: $($_.Exception.Message)")
+                }
+                finally {
+                    if ($stream) { $stream.Dispose() }
+                }
+                if ($read -eq 5) {
+                    $text = [System.Text.Encoding]::ASCII.GetString($magic)
+                    if ($text -cne 'PGDMP') {
+                        $null = $missing.Add("the database backup in the archive does not begin with PGDMP (found '$text')")
+                    }
+                }
+                elseif ($read -ne 0) {
+                    $null = $missing.Add('the database backup in the archive is too short to be a dump')
+                }
+            }
+        }
+    }
+    finally {
+        if ($zip) { $zip.Dispose() }
+    }
+
+    $result.Missing = $missing.ToArray()
+    if ($result.Missing.Count -gt 0) {
+        $result.Reason = "The archive is missing or cannot confirm: $($result.Missing -join '; ')"
+        return $result
+    }
+
+    $result.Verified = $true
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# The safety gate
+#
+# Everything above is a tool. This is the rule.
+# ---------------------------------------------------------------------------
+
+function Stop-DeltaRuntimeForBackup {
+    <#
+      Quiesces the stack between the database dump and the archive.
+
+      Ordering: the dump needs the db container running, and the archive needs
+      nothing writing into uploads\ or logs\ while it is read. So the dump
+      happens first, against a live database - pg_dump takes a transactionally
+      consistent snapshot, so a running application is not a problem for it -
+      and only then is the stack stopped, so the files being archived are
+      still.
+
+      `stop`, not `down`: this must not remove anything. If the backup fails
+      after this point the installation is stopped but completely intact, and
+      `setup.ps1` or menu option 3 brings it straight back.
+    #>
+    param([Parameter(Mandatory)][object]$Target)
+
+    Write-Step 'Stopping DELTA so the files being archived are not changing'
+
+    if (-not (Test-Path -LiteralPath $Target.ComposeFile -PathType Leaf)) {
+        Write-Detail 'No docker-compose.yml, so there is nothing running to stop.'
+        return
+    }
+
+    $stop = Invoke-DeltaCompose -InstallRoot $Target.InstallRoot -ProjectName $Target.ProjectName -Arguments @('stop') -TimeoutSeconds 300
+    if ($stop.ExitCode -ne 0) {
+        Stop-Setup "The DELTA containers could not be stopped: $((($stop.StdErr + ' ' + $stop.StdOut)).Trim())`nNothing was archived and nothing was deleted."
+    }
+    Write-Detail 'Containers stopped. They are not removed - nothing has been deleted yet.'
+}
+
+function Backup-DeltaInstallation {
+    <#
+      The safety gate. Produces a verified external archive of the whole
+      installation, or throws.
+
+      This function never returns a failure. Every unrecoverable condition
+      goes through Stop-Setup, which the entry point's single top-level catch
+      turns into an abort - so a caller cannot ignore a status it forgot to
+      check, and Remove-DeltaInstallation's code is not reached at all. That
+      is the reference installer's strongest property and it is reproduced
+      here deliberately: the requirement is not "should not delete without a
+      backup", it is "cannot".
+
+      The steps, each a hard prerequisite for the next:
+
+        1. The target must be a registered DELTA installation. Ownership is
+           proven before anything else happens.
+        2. A fresh database backup, produced by Phase 8's own
+           New-DeltaDatabaseBackup - pg_dump -Fc inside the db container, the
+           byte-exact stream transport, and pg_restore --list verification.
+           There is no second database-backup implementation in this product
+           and this function does not add one. Retention is skipped: this dump
+           exists to be archived, not to participate in rotation.
+        3. The runtime is stopped, so the archive is taken of files that are
+           not being written.
+        4. The whole installation root is archived to
+           <BackupRoot>\DELTA-<timestamp>.zip, which is outside it. The dump
+           from step 2 is inside the installation root by then, so it is swept
+           into the same pass with nothing to reconcile afterwards.
+        5. The archive is verified by opening it and looking for what must be
+           there - including reading the dump's first bytes back out of it.
+
+      Returns a [Delta.VerifiedArchive]. That type name is the token
+      Remove-DeltaInstallation demands.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Target,
+        [string]$BackupRoot = $Script:DeltaUninstallBackupRoot
+    )
+
+    # 1. Ownership, restated here rather than assumed from the caller. This
+    #    function is the last place that can refuse cheaply.
+    if (-not $Target.Registered) {
+        Stop-Setup "'$($Target.InstallRoot)' is not a registered DELTA installation. $($Target.Reason) Nothing was backed up and nothing was deleted."
+    }
+    if (-not $Target.Configuration) {
+        Stop-Setup "'$($Target.EnvPath)' could not be read, so the database cannot be reached to back it up. Nothing was deleted."
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+    # 2. The database, through Phase 8's implementation.
+    Write-Step 'Backing up the DELTA database'
+    Write-Detail 'pg_dump -Fc inside the db container, verified with pg_restore --list.'
+    $database = New-DeltaDatabaseBackup -InstallRoot $Target.InstallRoot -Configuration $Target.Configuration -SkipRetention
+    if (-not $database.Succeeded) {
+        Stop-Setup "The database backup failed at stage '$($database.Stage)': $($database.Reason)`nNothing was deleted. DELTA is exactly as it was."
+    }
+    Write-Success "    Database backed up and verified: $($database.FileName) ($(Format-DeltaByteSize $database.SizeBytes))"
+
+    # 3. Quiesce.
+    Stop-DeltaRuntimeForBackup -Target $Target
+
+    # 4. The archive.
+    $archivePath = Join-Path -Path $BackupRoot -ChildPath "DELTA-$timestamp.zip"
+    Write-Step 'Archiving the installation'
+    Write-Detail "From  $($Target.InstallRoot)"
+    Write-Detail "To    $archivePath"
+
+    $archive = $null
+    try {
+        $archive = New-DeltaInstallationArchive -SourceDirectory $Target.InstallRoot -DestinationPath $archivePath
+    }
+    catch {
+        Stop-Setup "The backup archive could not be created: $($_.Exception.Message)`nNothing was deleted. DELTA is exactly as it was."
+    }
+    if ($archive.Failures.Count -gt 0) {
+        Stop-Setup "$($archive.Failures.Count) file(s) could not be added to the archive: $($archive.Failures -join '; ')`nNothing was deleted. A backup that is missing files it did not mention is worse than no backup."
+    }
+    Write-Detail "$($archive.AddedCount) file(s), $(Format-DeltaByteSize $archive.SourceBytes) on disk"
+
+    # 5. Verification.
+    Write-Step 'Verifying the backup archive'
+    $verification = Test-DeltaInstallationArchive -Archive $archive -Target $Target -DatabaseBackup $database
+    if (-not $verification.Verified) {
+        Stop-Setup "The backup archive did not verify: $($verification.Reason)`nNothing was deleted. DELTA is exactly as it was, and the unverified archive was left at '$($archive.Path)' for inspection."
+    }
+
+    Write-Success "    Archive verified: $($archive.Path)"
+    Write-Detail "$($verification.EntryCount) entries, $(Format-DeltaByteSize $verification.SizeBytes) compressed"
+    Write-Detail "Contains .env, docker-compose.yml, the installation record, the NGINX configuration,"
+    Write-Detail "$($verification.UploadCount) upload file(s), and the verified database dump."
+
+    return [PSCustomObject]@{
+        PSTypeName     = 'Delta.VerifiedArchive'
+        Path           = $archive.Path
+        Verified       = $true
+        EntryCount     = $verification.EntryCount
+        SizeBytes      = $verification.SizeBytes
+        SourceBytes    = $archive.SourceBytes
+        FileCount      = $archive.AddedCount
+        UploadCount    = $verification.UploadCount
+        DatabaseDump   = $database.FileName
+        DumpEntry      = $verification.DumpEntry
+        InstallRoot    = $Target.InstallRoot
+        CreatedAt      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Removal primitives
 #
 # Each returns a step record: Resource, Kind, Outcome, Detail. The five
@@ -256,7 +823,7 @@ function Get-DeltaUninstallSurvey {
 function New-DeltaUninstallStep {
     param(
         [Parameter(Mandatory)][string]$Resource,
-        [Parameter(Mandatory)][ValidateSet('container', 'network', 'volume', 'task', 'firewall', 'file', 'state', 'backup')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('container', 'network', 'volume', 'task', 'firewall', 'file', 'archive')][string]$Kind,
         [Parameter(Mandatory)][ValidateSet('Removed', 'Already absent', 'Preserved', 'Failed', 'Could not verify')][string]$Outcome,
         [string]$Detail
     )
@@ -271,10 +838,9 @@ function Invoke-DeltaComposeDown {
       `down` without -v removes the project's containers and its default
       network. It does not remove the named volume (`delta_pgdata` is declared
       with an explicit name: in the compose file, so Compose manages it, and
-      only -v would delete it) and it does not touch a bind mount, because a
-      bind mount is a directory on the host that Docker never owned. That is
-      exactly the preservation boundary this phase needs, which is why `down`
-      is used rather than a stop/rm/network-rm sequence.
+      only -v would delete it), which is why the volume is removed explicitly
+      and separately below - a deletion this size should be its own decision
+      in the code as well as in the UI.
 
       -v is one keystroke from correct, so the argument vector is inspected
       before the call and a volume-removal flag is a refusal, not a warning.
@@ -294,7 +860,7 @@ function Invoke-DeltaComposeDown {
             return [PSCustomObject]@{
                 ExitCode = -1
                 StdOut   = ''
-                StdErr   = "Refusing to run 'docker compose down $normalised': that removes this installation's database volume. Volume removal is a separate, explicitly confirmed operation."
+                StdErr   = "Refusing to run 'docker compose down $normalised': that removes this installation's database volume as a side effect of removing containers. Volume removal is its own explicit step."
                 Refused  = $true
             }
         }
@@ -320,12 +886,6 @@ function Remove-DeltaComposeRuntime {
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
 
-    if (-not $Survey.DockerAvailable) {
-        $null = $steps.Add((New-DeltaUninstallStep -Resource "Compose project '$($Target.ProjectName)'" -Kind 'container' -Outcome 'Could not verify' `
-            -Detail 'The Docker engine is not reachable, so this installation''s containers and network were not removed and could not be inspected.'))
-        return $steps.ToArray()
-    }
-
     $had = @($Survey.Containers).Count
     if ($had -eq 0 -and $Survey.NetworkPresent -ne $true) {
         $null = $steps.Add((New-DeltaUninstallStep -Resource "Compose project '$($Target.ProjectName)'" -Kind 'container' -Outcome 'Already absent' `
@@ -334,10 +894,6 @@ function Remove-DeltaComposeRuntime {
     }
 
     if (-not (Test-Path -LiteralPath $Target.ComposeFile -PathType Leaf)) {
-        # Compose needs the file to know what the project is. Without it the
-        # containers are still identifiable by label, but removing them is a
-        # different operation from the one this function promises, so it says
-        # so instead of improvising.
         $null = $steps.Add((New-DeltaUninstallStep -Resource "Compose project '$($Target.ProjectName)'" -Kind 'container' -Outcome 'Could not verify' `
             -Detail "docker-compose.yml is missing from $($Target.InstallRoot), so the project could not be brought down. $had container(s) remain."))
         return $steps.ToArray()
@@ -454,16 +1010,16 @@ function Remove-DeltaFirewallIntegration {
 
 function Remove-DeltaDataVolume {
     <#
-      The one operation in this file that destroys an operator's database.
+      Removes the PostgreSQL volume. The database is not lost with it: the
+      verified dump inside the archive is the copy that survives, and this
+      function is unreachable unless that archive verified.
 
-      Three things must hold before `docker volume rm` runs: the caller must
-      name the volume this installation registered (not a volume it merely
-      found), the name must be non-empty, and the containers must already be
-      gone - Docker refuses to remove a volume in use, and relying on that
-      refusal rather than checking would turn a design guarantee into a race.
-
-      Docker's own refusal is still respected if it comes: a volume that is
-      still attached to something is reported, not forced.
+      Three things must hold: the caller must name the volume this
+      installation registered, the name must be non-empty, and the containers
+      must already be gone - Docker refuses to remove a volume in use, and
+      relying on that refusal rather than sequencing correctly would turn a
+      design guarantee into a race. Docker's own refusal is still respected if
+      it comes: a volume still attached to something is reported, not forced.
     #>
     param(
         [Parameter(Mandatory)][object]$Target,
@@ -473,10 +1029,6 @@ function Remove-DeltaDataVolume {
     if (-not $Target.PgDataVolume) {
         return (New-DeltaUninstallStep -Resource 'PostgreSQL data volume' -Kind 'volume' -Outcome 'Could not verify' `
             -Detail 'This installation does not record a data volume name, so no volume was removed.')
-    }
-    if (-not $Survey.DockerAvailable) {
-        return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Could not verify' `
-            -Detail 'The Docker engine is not reachable, so the data volume was not removed. The database is intact.')
     }
     if ($Survey.VolumePresent -ne $true) {
         return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Already absent' -Detail $null)
@@ -494,94 +1046,19 @@ function Remove-DeltaDataVolume {
             -Detail 'docker volume rm reported success but the volume is still present.')
     }
 
-    return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Removed' -Detail 'The PostgreSQL data directory and every DELTA record in it.')
-}
-
-function Export-DeltaFinalBackup {
-    <#
-      A verified dump taken immediately before the database is destroyed, and
-      then moved somewhere the destruction will not reach.
-
-      The dump itself is Phase 8's, unchanged - New-DeltaDatabaseBackup, with
-      its pg_dump in the db container, its byte-exact transport and its
-      pg_restore --list verification. Duplicating any of that here would mean
-      two implementations of the one operation whose output has to be
-      trustworthy.
-
-      The move is the part this function adds, and it is not optional: the
-      dump lands in <InstallRoot>\backups, and complete removal deletes
-      <InstallRoot>. A "safety backup" inside the directory about to be
-      deleted is theatre. So the file is copied out first, the copy is
-      verified in its new location by the same archive check, and only the
-      surviving path is reported. Retention is skipped - this backup exists to
-      outlive the installation, not to participate in its rotation.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][string]$Destination
-    )
-
-    $result = [PSCustomObject]@{
-        Succeeded = $false
-        Path      = $null
-        SizeBytes = 0
-        Reason    = $null
-    }
-
-    if (-not $Target.Configuration) {
-        $result.Reason = 'This installation has no readable .env, so the database could not be reached to back it up.'
-        return $result
-    }
-
-    $backup = New-DeltaDatabaseBackup -InstallRoot $Target.InstallRoot -Configuration $Target.Configuration -SkipRetention
-    if (-not $backup.Succeeded) {
-        $result.Reason = $backup.Reason
-        return $result
-    }
-
-    try {
-        if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
-            $null = New-Item -ItemType Directory -Path $Destination -Force
-        }
-        $exported = Join-Path -Path $Destination -ChildPath $backup.FileName
-        if (Test-Path -LiteralPath $exported -PathType Leaf) {
-            # Never overwrite: the file already there may be the only copy of
-            # something. Phase 8 made the same call for the same reason.
-            $result.Reason = "A file named '$($backup.FileName)' already exists in '$Destination'. The backup inside the installation was left in place and nothing was overwritten."
-            return $result
-        }
-        Copy-Item -LiteralPath $backup.Path -Destination $exported -ErrorAction Stop
-    }
-    catch {
-        $result.Reason = "The backup was taken but could not be copied to '$Destination': $($_.Exception.Message)"
-        return $result
-    }
-
-    $verify = Test-DeltaBackupArchive -InstallRoot $Target.InstallRoot -ProjectName $Target.ProjectName -Path $exported
-    if (-not $verify.Verified) {
-        $result.Reason = "The exported copy at '$exported' did not verify: $($verify.Reason)"
-        return $result
-    }
-
-    $result.Succeeded = $true
-    $result.Path = $exported
-    $result.SizeBytes = $verify.SizeBytes
-    return $result
+    return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Removed' -Detail 'The live PostgreSQL data directory. The dump in the archive is the copy that survives.')
 }
 
 function Remove-DeltaInstallationTree {
     <#
-      Deletes the installation root - the last thing complete removal does,
-      and the one place a mistake would be measured in directories rather than
-      in containers.
+      Deletes the installation root, and verifies it is gone.
 
       It refuses unless the target is Registered: a state file that exists,
       parses, and names a Compose project. That is what makes
       `uninstall.ps1 -InstallRoot C:\Windows` a refusal rather than a
       catastrophe, and it is checked here as well as at the entry point
-      because this function is the one holding the recursive delete.
-
-      A drive root is refused outright regardless of what it contains.
+      because this function is the one holding the recursive delete. A drive
+      root is refused outright regardless of what it contains.
     #>
     param([Parameter(Mandatory)][object]$Target)
 
@@ -605,193 +1082,89 @@ function Remove-DeltaInstallationTree {
         return (New-DeltaUninstallStep -Resource $path -Kind 'file' -Outcome 'Failed' -Detail $_.Exception.Message)
     }
 
+    # The explicit post-condition: Test-Path must be false.
     if (Test-Path -LiteralPath $path) {
         return (New-DeltaUninstallStep -Resource $path -Kind 'file' -Outcome 'Failed' `
-            -Detail 'The directory still exists. A file in it is probably held open by another process.')
+            -Detail 'The directory still exists after deletion. A file in it is probably held open by another process.')
     }
-    return (New-DeltaUninstallStep -Resource $path -Kind 'file' -Outcome 'Removed' -Detail 'The installation root and everything under it.')
-}
-
-function Set-DeltaUninstalledState {
-    <#
-      Records what just happened, in the state file, without inventing a new
-      state vocabulary to do it.
-
-      `state` moves from 'installed' to 'partial'. That is not a fudge:
-      'partial' already means "evidence exists but the installation is not
-      registered as complete", which after a preserve-data uninstall is
-      exactly the truth - the data is there and the runtime is not. It also
-      produces the behaviour the operator wants from setup.ps1, which opens
-      the management menu for 'installed' and runs the installation flow for
-      anything else. A menu offering to restart containers that no longer
-      exist would be worse than useless.
-
-      Everything else in the file is left alone, deliberately. pgDataVolume is
-      what a later run needs to find the preserved database; composeProject is
-      what a later uninstall needs to identify Docker resources. Clearing them
-      would make the preserved data harder to recover, which is the opposite
-      of the point.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][string]$Mode,
-        [Parameter(Mandatory)][object[]]$Steps,
-        [string[]]$Preserved = @(),
-        [string]$BackupPath
-    )
-
-    $removed = @($Steps | Where-Object { $_.Outcome -eq 'Removed' } | ForEach-Object { $_.Resource })
-    $unresolved = @($Steps | Where-Object { $_.Outcome -in @('Failed', 'Could not verify') } | ForEach-Object { $_.Resource })
-
-    $record = [ordered]@{
-        at         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        mode       = $Mode
-        removed    = $removed
-        preserved  = $Preserved
-        unresolved = $unresolved
-    }
-    if ($BackupPath) { $record['finalBackup'] = $BackupPath }
-
-    try {
-        $path = Write-DeltaInstallState -InstallRoot $Target.InstallRoot -Properties ([ordered]@{
-            'state'     = 'partial'
-            'uninstall' = $record
-        })
-        return (New-DeltaUninstallStep -Resource $path -Kind 'state' -Outcome 'Preserved' `
-            -Detail "Kept, and marked uninstalled (state = partial). It identifies the preserved data and lets setup.ps1 rebuild the runtime.")
-    }
-    catch {
-        return (New-DeltaUninstallStep -Resource $Target.StatePath -Kind 'state' -Outcome 'Failed' -Detail $_.Exception.Message)
-    }
+    return (New-DeltaUninstallStep -Resource $path -Kind 'file' -Outcome 'Removed' -Detail 'The installation root and everything under it. Verified gone.')
 }
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Removal, which cannot be entered without a verified archive
 # ---------------------------------------------------------------------------
 
-function Invoke-DeltaUninstall {
+function Remove-DeltaInstallation {
     <#
-      Runs one uninstall, in one mode, and returns what happened rather than
-      printing a verdict.
+      Removes the DELTA runtime and the installation directory.
 
-      Ordering is not arbitrary, and one step of it is easy to get wrong.
+      -VerifiedArchive is mandatory and is typed [Delta.VerifiedArchive],
+      which only Backup-DeltaInstallation produces. PowerShell refuses to bind
+      anything else - $true, a hashtable, a path string, an ordinary
+      PSCustomObject all fail at the parameter, before a single line of this
+      function runs. That is the structural difference between this and a
+      boolean a caller could ignore: there is no way to express "delete
+      anyway" at the call site.
 
-      The final backup runs FIRST, before anything is removed. It is produced
-      by pg_dump inside the db container, so it needs that container running -
-      taking it after `compose down`, which is where it naturally wants to sit
-      in a list of destructive steps, would mean every complete removal
-      reported "the database container is not running, so no backup was
-      taken". Measured during Phase 12 development, before the ordering was
-      corrected.
+      The object is then re-validated, because a token that was verified ten
+      minutes ago and names a file that no longer exists is not evidence of
+      anything.
 
-      Then the runtime, because a container holding the volume open blocks its
-      removal and a container with restart: unless-stopped would otherwise
-      resurrect itself mid-uninstall. Then the scheduled tasks, because a
-      startup task that survived would bring the stack back at the next boot.
-      Then the volume, then the installation root.
-
-      The state file is written last in preserve mode, and in complete mode it
-      is not written at all - the directory holding it is gone.
-
-      Nothing here prompts. Every decision was already made by the caller;
-      this function performs them and records the outcome, which is what makes
-      it testable without a person at the keyboard.
+      Order: containers and network first, because a container with
+      restart: unless-stopped would otherwise resurrect itself and because one
+      holding the volume open blocks its removal. Then the scheduled tasks,
+      because a startup task that survived would bring the stack back at the
+      next boot. Then the volume. Then the directory.
     #>
     param(
         [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][ValidateSet('preserve-data', 'complete')][string]$Mode,
-        [bool]$DockerAvailable = $true,
-        [string]$FinalBackupDestination
+        [Parameter(Mandatory)][PSTypeName('Delta.VerifiedArchive')]$VerifiedArchive,
+        [bool]$DockerAvailable = $true
     )
+
+    if ($VerifiedArchive.Verified -ne $true) {
+        Stop-Setup 'Refusing to remove DELTA: the supplied archive record is not marked verified. Nothing was deleted.'
+    }
+    if (-not (Test-Path -LiteralPath $VerifiedArchive.Path -PathType Leaf)) {
+        Stop-Setup "Refusing to remove DELTA: the verified archive '$($VerifiedArchive.Path)' is no longer on disk. Nothing was deleted."
+    }
+    if ($VerifiedArchive.InstallRoot -ne $Target.InstallRoot) {
+        Stop-Setup "Refusing to remove DELTA: the archive was taken from '$($VerifiedArchive.InstallRoot)' but removal was asked for '$($Target.InstallRoot)'. Nothing was deleted."
+    }
 
     $result = [PSCustomObject]@{
-        Mode       = $Mode
-        Outcome    = 'partial'
-        Steps      = @()
-        Preserved  = @()
-        BackupPath = $null
-        BackupReason = $null
-        Reason     = $null
+        Outcome     = 'partial'
+        Steps       = @()
+        ArchivePath = $VerifiedArchive.Path
+        Reason      = $null
     }
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
     $survey = Get-DeltaUninstallSurvey -Target $Target -DockerAvailable $DockerAvailable
 
-    # 1. The final backup, while the database container is still running.
-    if ($Mode -eq $Script:DeltaUninstallModeComplete -and $FinalBackupDestination) {
-        Write-Step 'Taking a final verified backup'
-        $backup = Export-DeltaFinalBackup -Target $Target -Destination $FinalBackupDestination
-        if ($backup.Succeeded) {
-            $result.BackupPath = $backup.Path
-            $step = New-DeltaUninstallStep -Resource $backup.Path -Kind 'backup' -Outcome 'Preserved' `
-                -Detail "Verified, $(Format-DeltaByteSize $backup.SizeBytes), outside the installation root."
-        }
-        else {
-            $result.BackupReason = $backup.Reason
-            $step = New-DeltaUninstallStep -Resource 'Final backup' -Kind 'backup' -Outcome 'Failed' -Detail $backup.Reason
-        }
-        $null = $steps.Add($step)
-        Write-DeltaUninstallStepLine -Step $step
-    }
+    $null = $steps.Add((New-DeltaUninstallStep -Resource $VerifiedArchive.Path -Kind 'archive' -Outcome 'Preserved' `
+        -Detail "$($VerifiedArchive.EntryCount) entries, $(Format-DeltaByteSize $VerifiedArchive.SizeBytes), including the verified database dump."))
 
-    # 2. The runtime: containers and the project network.
     Write-Step 'Removing the DELTA containers'
     foreach ($step in (Remove-DeltaComposeRuntime -Target $Target -Survey $survey)) {
-        $null = $steps.Add($step)
-        Write-DeltaUninstallStepLine -Step $step
+        $null = $steps.Add($step); Write-DeltaUninstallStepLine -Step $step
     }
 
-    # 3. Windows integration that would otherwise outlive the installation.
     Write-Step 'Removing the Windows integration'
     foreach ($step in (Remove-DeltaScheduledIntegration -Target $Target)) {
-        $null = $steps.Add($step)
-        Write-DeltaUninstallStepLine -Step $step
+        $null = $steps.Add($step); Write-DeltaUninstallStepLine -Step $step
     }
     foreach ($step in (Remove-DeltaFirewallIntegration -Target $Target -Survey $survey)) {
-        $null = $steps.Add($step)
-        Write-DeltaUninstallStepLine -Step $step
+        $null = $steps.Add($step); Write-DeltaUninstallStepLine -Step $step
     }
 
-    if ($Mode -eq $Script:DeltaUninstallModePreserve) {
-        $preserved = New-Object 'System.Collections.Generic.List[string]'
-        if ($Target.PgDataVolume) {
-            $present = if ($survey.VolumePresent -eq $true) { 'Preserved' } elseif ($survey.DockerAvailable) { 'Already absent' } else { 'Could not verify' }
-            $detail = switch ($present) {
-                'Preserved'      { 'The PostgreSQL database, untouched.' }
-                'Already absent' { 'This installation records a data volume, but it does not exist on this host.' }
-                default          { 'The Docker engine is not reachable, so the data volume could not be inspected. Nothing was removed.' }
-            }
-            $null = $steps.Add((New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome $present -Detail $detail))
-            if ($present -eq 'Preserved') { $null = $preserved.Add("Database volume $($Target.PgDataVolume)") }
-        }
-        foreach ($directory in $survey.Directories) {
-            if (-not $directory.Exists) { continue }
-            $null = $steps.Add((New-DeltaUninstallStep -Resource $directory.Path -Kind 'file' -Outcome 'Preserved' `
-                -Detail "$($directory.Items) file(s), $(Format-DeltaByteSize $directory.Bytes)"))
-            $null = $preserved.Add($directory.Path)
-        }
-        foreach ($file in $survey.Files) {
-            if (-not $file.Exists -or $file.Name -eq $Script:DeltaInstallStateFileName) { continue }
-            $null = $steps.Add((New-DeltaUninstallStep -Resource $file.Path -Kind 'file' -Outcome 'Preserved' `
-                -Detail $(if ($file.Name -eq '.env') { 'Configuration and secrets. Its restrictive ACL is untouched.' } else { 'Generated configuration.' })))
-            $null = $preserved.Add($file.Path)
-        }
-        $result.Preserved = $preserved.ToArray()
+    Write-Step 'Removing the database volume'
+    $volumeStep = Remove-DeltaDataVolume -Target $Target -Survey $survey
+    $null = $steps.Add($volumeStep); Write-DeltaUninstallStepLine -Step $volumeStep
 
-        $null = $steps.Add((Set-DeltaUninstalledState -Target $Target -Mode $Mode -Steps $steps.ToArray() -Preserved $result.Preserved))
-    }
-    else {
-        # 4. The data volume, then the installation root.
-        Write-Step 'Removing the database volume'
-        $volumeStep = Remove-DeltaDataVolume -Target $Target -Survey $survey
-        $null = $steps.Add($volumeStep)
-        Write-DeltaUninstallStepLine -Step $volumeStep
-
-        Write-Step 'Removing the installation directory'
-        $treeStep = Remove-DeltaInstallationTree -Target $Target
-        $null = $steps.Add($treeStep)
-        Write-DeltaUninstallStepLine -Step $treeStep
-    }
+    Write-Step 'Removing the installation directory'
+    $treeStep = Remove-DeltaInstallationTree -Target $Target
+    $null = $steps.Add($treeStep); Write-DeltaUninstallStepLine -Step $treeStep
 
     $result.Steps = $steps.ToArray()
 
@@ -800,10 +1173,8 @@ function Invoke-DeltaUninstall {
         $result.Outcome = 'success'
     }
     else {
-        $result.Outcome = 'partial'
         $result.Reason = "$($unresolved.Count) resource(s) were not removed or could not be checked."
     }
-
     return $result
 }
 
@@ -833,16 +1204,18 @@ function Write-DeltaUninstallStepLine {
 
 function Show-DeltaUninstallPlan {
     <#
-      What the operator sees before choosing: the installation that was found,
-      what it is doing right now, and - stated as two lists rather than as
-      prose - what a normal uninstall removes and what it keeps.
+      What the operator sees before deciding: the installation that was found,
+      what is running, what will be archived, and what will then be removed.
 
-      The preserved list carries sizes. "Backups" is an abstraction; "backups,
-      47 files, 14.6 MB" is a thing somebody can decide about.
+      The archive is described first and in the most detail, because it is the
+      answer to the question the operator is actually asking - "am I going to
+      lose this?" - and because the size and file count are what make it
+      credible rather than reassuring.
     #>
     param(
         [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][object]$Survey
+        [Parameter(Mandatory)][object]$Survey,
+        [Parameter(Mandatory)][string]$BackupRoot
     )
 
     Write-Host ''
@@ -856,23 +1229,18 @@ function Show-DeltaUninstallPlan {
     if ($Target.Disagreements.Count -gt 0) {
         Write-Host ''
         Write-DeltaWarning 'The installation record and .env do not agree:'
-        foreach ($disagreement in $Target.Disagreements) {
-            Write-DeltaWarning "  $disagreement"
-        }
+        foreach ($disagreement in $Target.Disagreements) { Write-DeltaWarning "  $disagreement" }
         Write-DeltaWarning 'The installation record is used, because it is what previous runs acted on.'
     }
 
     Write-Host ''
     Write-Host 'Current state'
     if (-not $Survey.DockerAvailable) {
-        Write-DeltaWarning '    Docker is not reachable. Containers, the network and the database volume'
-        Write-DeltaWarning '    cannot be inspected or removed in this run.'
+        Write-DeltaWarning '    Docker is not reachable.'
     }
     else {
         $containers = @($Survey.Containers)
-        if ($containers.Count -eq 0) {
-            Write-Detail 'Containers         none'
-        }
+        if ($containers.Count -eq 0) { Write-Detail 'Containers         none' }
         else {
             foreach ($container in $containers) {
                 Write-Detail ("Container          {0,-24} {1}" -f $container.Name, $container.State)
@@ -882,103 +1250,73 @@ function Show-DeltaUninstallPlan {
     }
     Write-Detail "Startup task       $(if ($Survey.StartupTask) { 'registered' } else { 'absent' })"
     Write-Detail "Log rotation task  $(if ($Survey.RotationTask) { 'registered' } else { 'absent' })"
-    Write-Detail "Firewall rules     $((@(if ($Survey.HttpRule) { 'HTTP' }) + @(if ($Survey.HttpsRule) { 'HTTPS' }) | Where-Object { $_ }) -join ', ')$(if (-not ($Survey.HttpRule -or $Survey.HttpsRule)) { 'none' })"
 
     Write-Host ''
-    Write-Host 'A normal uninstall removes'
-    Write-Detail 'The DELTA, database and NGINX containers'
-    Write-Detail 'The Docker network they share'
-    Write-Detail 'The scheduled task that starts DELTA at boot'
-    Write-Detail 'The scheduled task that rotates the NGINX logs'
-    Write-Detail 'The Windows Firewall rules for this installation'
-
+    Write-Host 'Everything is backed up first, to one archive outside this installation:'
+    Write-Detail "$BackupRoot\DELTA-<timestamp>.zip"
     Write-Host ''
-    Write-Host 'and preserves'
-    Write-Detail "The database                 volume $($Target.PgDataVolume)"
+    Write-Detail 'It contains a fresh, verified database dump taken for this uninstall, plus:'
     foreach ($directory in $Survey.Directories) {
         if (-not $directory.Exists) { continue }
-        Write-Detail ("{0,-28} {1}, {2} file(s)" -f $directory.Name, (Format-DeltaByteSize $directory.Bytes), $directory.Items)
+        Write-Detail ("  {0,-10} {1,10}  {2} file(s)" -f $directory.Name, (Format-DeltaByteSize $directory.Bytes), $directory.Items)
     }
-    Write-Detail 'Configuration                .env, docker-compose.yml'
+    Write-Detail '  .env, docker-compose.yml and the installation record'
+    Write-Host ''
+    Write-Detail 'The uninstall does not start unless that archive is created and verified.'
+
+    Write-Host ''
+    Write-Host 'Then this is removed:'
+    Write-Detail 'The DELTA, database and NGINX containers'
+    Write-Detail 'The Docker network they share'
+    Write-Detail "The database volume $($Target.PgDataVolume)"
+    Write-Detail 'The scheduled tasks for startup and log rotation'
+    Write-Detail 'The Windows Firewall rules for this installation'
+    Write-Detail "$($Target.InstallRoot), entirely"
 
     Write-Host ''
     Write-Detail 'Docker Desktop, WSL and every other program on this machine are left alone.'
 }
 
-function Read-DeltaUninstallMode {
-    <#
-      The mode menu. Preservation is 1 because it is the answer almost
-      everybody wants; complete removal is 2 and is labelled with what it
-      actually does rather than with the word "full", which reads like a
-      thoroughness setting rather than a data-destruction one.
-
-      Anything that is not 1 or 2 - including a bare Enter - cancels.
-    #>
-    param([Parameter(Mandatory)][object]$Target)
-
-    Write-Host ''
-    Write-Host 'Choose:'
-    Write-Host ''
-    Write-Host '  1. Uninstall DELTA and preserve data'
-    Write-Host '     Removes the containers and the Windows integration. The database,'
-    Write-Host '     uploads, backups, certificates and configuration are kept, and'
-    Write-Host '     setup.ps1 can rebuild the installation over them.'
-    Write-Host ''
-    Write-Host '  2. Completely remove DELTA and its data' -ForegroundColor Yellow
-    Write-Host "     Everything above, and then deletes the database volume" -ForegroundColor Yellow
-    Write-Host "     $($Target.PgDataVolume) and the whole of $($Target.InstallRoot)." -ForegroundColor Yellow
-    Write-Host '     This cannot be undone.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  0. Cancel'
-    Write-Host ''
-
-    $choice = Read-Host -Prompt 'Selection'
-    switch (([string]$choice).Trim()) {
-        '1' { return $Script:DeltaUninstallModePreserve }
-        '2' { return $Script:DeltaUninstallModeComplete }
-        default { return $null }
-    }
-}
-
-function Read-DeltaDestructiveConfirmation {
+function Read-DeltaUninstallConfirmation {
     <#
       The gate in front of the only irreversible thing this product does.
 
       It is a typed word, not [y/N], and that is the entire design. The rest of
       this installer uses [y/N] with blank meaning no, which is right for a
-      question somebody might answer wrongly and recover from. This question
-      has no recovery, and an operator who has already pressed y to four
-      prompts will press it to a fifth. Typing DELETE cannot be done by
-      momentum.
+      question somebody might answer wrongly and recover from. An operator who
+      has already pressed y to four prompts will press it to a fifth. Typing
+      DELETE cannot be done by momentum.
 
       Everything that will be destroyed is enumerated immediately above the
-      prompt, with sizes, so the decision is made against facts rather than
-      against the word "completely".
+      prompt, with sizes, and so is the archive that will exist afterwards -
+      the decision is between two concrete states, not between a word and a
+      feeling.
     #>
     param(
         [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][object]$Survey
+        [Parameter(Mandatory)][object]$Survey,
+        [Parameter(Mandatory)][string]$BackupRoot
     )
 
     $rule = '-' * $Script:DeltaBannerWidth
     Write-Host ''
     Write-Host $rule
     Write-Host ''
-    Write-Host 'This will permanently delete:' -ForegroundColor Yellow
+    Write-Host 'After this, DELTA will be gone from this machine:' -ForegroundColor Yellow
     Write-Host ''
     if ($Survey.VolumePresent) {
-        Write-Detail "Docker volume $($Target.PgDataVolume)"
-        Write-Detail '  the entire DELTA database - every record, user and upload reference'
+        Write-Detail "Docker volume $($Target.PgDataVolume) - the live database"
     }
     foreach ($directory in $Survey.Directories) {
         if (-not $directory.Exists -or $directory.Items -eq 0) { continue }
-        Write-Detail "$($directory.Path)"
-        Write-Detail "  $($directory.Items) file(s), $(Format-DeltaByteSize $directory.Bytes)"
+        Write-Detail "$($directory.Path) - $($directory.Items) file(s), $(Format-DeltaByteSize $directory.Bytes)"
     }
-    Write-Detail "$($Target.InstallRoot)"
-    Write-Detail '  the installation root itself, including .env and docker-compose.yml'
+    Write-Detail "$($Target.InstallRoot) - the installation root itself"
     Write-Host ''
-    Write-Host 'There is no undo. A backup taken now is the only way to get any of it back.' -ForegroundColor Yellow
+    Write-Host 'What will remain is the archive:' -ForegroundColor Yellow
+    Write-Detail "$BackupRoot\DELTA-<timestamp>.zip"
+    Write-Detail 'It is written and verified before anything is removed. If it cannot be'
+    Write-Detail 'created or verified, the uninstall stops and nothing is deleted.'
     Write-Host ''
     Write-Host 'Type DELETE to confirm, or anything else to cancel.'
     Write-Host ''
@@ -990,133 +1328,59 @@ function Read-DeltaDestructiveConfirmation {
     # Case-sensitive and exact. "delete" is what somebody types while thinking
     # about something else.
     $confirmed = ([string]$answer).Trim() -ceq 'DELETE'
-    Write-DeltaLogLine -Message "Destructive uninstall confirmation: $(if ($confirmed) { 'confirmed' } else { 'declined' })" -Level 'DETAIL'
+    Write-DeltaLogLine -Message "Uninstall confirmation: $(if ($confirmed) { 'confirmed' } else { 'declined' })" -Level 'DETAIL'
     return $confirmed
-}
-
-function Read-DeltaFinalBackupChoice {
-    <#
-      Offered only on the destructive path, and only when there is a running
-      database to dump. Declining is a legitimate answer - somebody
-      decommissioning a test installation does not need a dump of it - so the
-      consequence is stated once, plainly, instead of being argued.
-
-      The destination defaults outside the installation root, because a
-      backup inside a directory that is about to be deleted is not a backup.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][object]$Survey
-    )
-
-    $result = [PSCustomObject]@{ Wanted = $false; Destination = $null; Reason = $null }
-
-    $db = @($Survey.Containers) | Where-Object { $_.Name -match '-db-\d+$' -and $_.State -eq 'running' }
-    if (-not $Survey.DockerAvailable) {
-        $result.Reason = 'Docker is not reachable, so no final backup can be taken.'
-        return $result
-    }
-    if (-not $db) {
-        $result.Reason = 'The database container is not running, so no final backup can be taken. Any existing dumps in the backups directory will be deleted with the installation root - copy them out first if you want them.'
-        return $result
-    }
-
-    $default = Join-Path -Path (Split-Path -Path $Target.InstallRoot -Parent) -ChildPath "$(Split-Path -Path $Target.InstallRoot -Leaf)-final-backup"
-
-    $wanted = Read-DeltaYesNoConfirmation -Body {
-        Write-Host 'Take a final verified backup of the database before deleting it?'
-        Write-Host ''
-        Write-Detail 'It is written outside the installation root, so it survives the removal.'
-        Write-Detail "Default location:  $default"
-        Write-Host ''
-        Write-Detail 'Answering no means the database is deleted with no copy kept.'
-    }
-    if (-not $wanted) {
-        $result.Reason = 'Declined. The database will be deleted with no backup.'
-        return $result
-    }
-
-    Write-Host ''
-    $answer = Read-Host -Prompt "Backup directory [$default]"
-    $destination = ([string]$answer).Trim()
-    if (-not $destination) { $destination = $default }
-
-    $full = $destination
-    try { $full = [System.IO.Path]::GetFullPath($destination).TrimEnd('\') } catch { }
-    if ($full.ToLowerInvariant() -eq $Target.InstallRoot.ToLowerInvariant() -or
-        $full.ToLowerInvariant().StartsWith($Target.InstallRoot.ToLowerInvariant() + '\')) {
-        $result.Reason = "'$full' is inside the installation root, which is about to be deleted. Using $default instead."
-        $full = $default
-    }
-
-    $result.Wanted = $true
-    $result.Destination = $full
-    return $result
 }
 
 function Show-DeltaUninstallOutcome {
     <#
       The closing report. Two rules govern it, both learned the hard way
-      elsewhere in this project:
-
-      Never say "completely removed" while something remains. A preserve-data
-      uninstall says what it kept and where, because an operator who believes
-      DELTA is gone and later finds 14 MB of backups has been told something
-      untrue.
+      elsewhere in this project.
 
       Never report success over an unresolved step. A container that could not
-      be removed, or a Docker engine that could not be reached, makes the run
-      PARTIAL - and the remaining resources are named, so finishing the job by
-      hand is possible.
+      be removed makes the run PARTIAL, and the remaining resources are named
+      so finishing by hand is possible.
+
+      Never leave the operator wondering where their data went. The archive
+      path is the last thing on the screen either way, because it is the only
+      thing left.
     #>
     param(
         [Parameter(Mandatory)][object]$Result,
-        [Parameter(Mandatory)][object]$Target
+        [Parameter(Mandatory)][object]$Target,
+        [Parameter(Mandatory)][object]$Archive
     )
 
     $unresolved = @($Result.Steps | Where-Object { $_.Outcome -in @('Failed', 'Could not verify') })
 
     Write-Host ''
     if ($unresolved.Count -gt 0) {
-        Write-DeltaWarning 'PARTIAL - DELTA was not completely uninstalled.'
+        Write-DeltaWarning 'PARTIAL - DELTA was not completely removed.'
         Write-Host ''
         Write-Detail 'These were not removed, or could not be checked:'
-        foreach ($step in $unresolved) {
-            Write-Detail "  $($step.Resource) - $($step.Detail)"
-        }
+        foreach ($step in $unresolved) { Write-Detail "  $($step.Resource) - $($step.Detail)" }
         Write-Host ''
-        Write-Detail 'Nothing else was changed. Re-run this script once the cause is resolved;'
-        Write-Detail 'it continues from wherever the installation actually is.'
-    }
-    elseif ($Result.Mode -eq $Script:DeltaUninstallModeComplete) {
-        Write-Success 'DELTA has been completely removed.'
-        Write-Host ''
-        Write-Detail "The containers, network, database volume and $($Target.InstallRoot) are gone."
-        if ($Result.BackupPath) {
-            Write-Detail "A verified final backup was kept at:"
-            Write-Detail "  $($Result.BackupPath)"
-        }
-        else {
-            Write-Detail 'No backup was kept. This installation cannot be recovered.'
-        }
+        Write-Detail 'Re-run this script once the cause is resolved; it continues from wherever'
+        Write-Detail 'the installation actually is, and takes a fresh archive when it does.'
     }
     else {
-        Write-Success 'The DELTA runtime has been removed. Your data was preserved.'
+        Write-Success 'DELTA has been removed from this machine.'
         Write-Host ''
-        Write-Detail 'Preserved:'
-        Write-Detail "  the database        volume $($Target.PgDataVolume)"
-        foreach ($step in @($Result.Steps | Where-Object { $_.Kind -eq 'file' -and $_.Outcome -eq 'Preserved' })) {
-            Write-Detail "  $($step.Resource)"
-        }
-        Write-Host ''
-        Write-Detail 'To bring DELTA back with this data, run setup.ps1 again against the same'
-        Write-Detail 'installation root:'
-        Write-Detail ''
-        Write-Detail "    .\setup.ps1 -InstallRoot `"$($Target.InstallRoot)`""
-        Write-Detail ''
-        Write-Detail 'To delete the preserved data as well, run this script again and choose'
-        Write-Detail 'complete removal.'
+        Write-Detail "$($Target.InstallRoot) no longer exists."
+        Write-Detail 'The containers, the network, the database volume, the scheduled tasks and'
+        Write-Detail 'the firewall rules are gone.'
     }
+
+    Write-Host ''
+    Write-Host 'Your data is here:'
+    Write-Detail $Archive.Path
+    Write-Detail "$($Archive.EntryCount) entries, $(Format-DeltaByteSize $Archive.SizeBytes)"
+    Write-Detail "Database dump   $($Archive.DatabaseDump) (verified)"
+    Write-Detail "Uploads         $($Archive.UploadCount) file(s)"
+    Write-Detail 'Also .env, docker-compose.yml, certificates, logs and previous backups.'
+    Write-Host ''
+    Write-Detail 'To bring DELTA back: install it again with setup.ps1, then restore the dump'
+    Write-Detail 'from inside that archive - the restore procedure is in README.md.'
 
     Write-Host ''
     Write-Detail 'Docker Desktop, WSL and the other software on this machine were not changed.'

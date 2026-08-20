@@ -753,125 +753,148 @@ pins are preserved.
 .\uninstall.ps1
 ```
 
-It shows what it found and what each choice does, then asks:
+It backs everything up first, and only then removes DELTA. When it finishes:
 
 ```
-  1. Uninstall DELTA and preserve data
-  2. Completely remove DELTA and its data
-  0. Cancel
+C:\DELTA                              gone
+C:\DELTA-backups\DELTA-<date>.zip     present, and verified
 ```
 
-**Uninstalling never means deleting your data.** Option 1 is the normal answer
-and it keeps everything that would hurt to lose.
+That ZIP is how your data is preserved. Nothing is deleted until it exists and
+has been checked.
 
-### Option 1 — uninstall and preserve data
+### What happens, in order
 
-| Removed | Preserved |
+1. **It proves this is a DELTA installation it created**, by reading
+   `C:\DELTA\.delta-install.json`. A directory without that file is refused.
+2. **It backs up the database** — `pg_dump` inside the database container, then
+   `pg_restore --list` to prove the dump is readable. Same implementation as
+   menu option 2.
+3. **It stops the containers**, so nothing is writing to `uploads\` or `logs\`
+   while they are being read. Stopped, not removed: if a later step fails, the
+   installation is completely intact and `setup.ps1` brings it back.
+4. **It archives the whole of `C:\DELTA`** into
+   `C:\DELTA-backups\DELTA-<timestamp>.zip`.
+5. **It verifies the archive** by opening it and confirming what has to be
+   there actually is — including reading the database dump back out of the ZIP
+   and checking it really is a PostgreSQL dump.
+6. **Only then** does it remove the containers, the network, the database
+   volume, the two scheduled tasks, the firewall rules and `C:\DELTA` itself.
+
+**If step 2, 4 or 5 fails, the uninstall stops and nothing is removed.** There
+is no "continue anyway" and no switch that skips the backup — not for
+convenience, not for automation. Deleting data you could not back up is the one
+thing this script is built to make impossible.
+
+### What is in the archive
+
+Everything under the installation root, with nothing excluded:
+
+| | |
 |---|---|
-| The `delta`, `db` and `nginx` containers | The **database**, in its Docker volume |
-| The Docker network they shared | `uploads\` |
-| The scheduled task that starts DELTA at boot | `backups\` — every dump you have taken |
-| The scheduled task that rotates the NGINX logs | `certs\` |
-| This installation's Windows Firewall rules | `logs\` |
-| | `.env` and `docker-compose.yml` |
-| | The installation directory itself |
+| `backups\delta-<timestamp>.dump` | the **fresh** database dump taken for this uninstall, plus every earlier one |
+| `uploads\` | every file your users uploaded |
+| `certs\` | the certificate and its private key |
+| `.env` | configuration and secrets |
+| `docker-compose.yml` | the stack definition |
+| `nginx\conf.d\delta.conf` | the generated NGINX site |
+| `.delta-install.json` | what the installation was — ports, hostname, image digests |
+| `logs\` | application, access and installer logs |
 
-To bring DELTA back afterwards, with all of that still in place:
+Nothing is left out. In this architecture the DELTA application itself lives in
+the Docker image and comes back with `docker pull`, so unlike a from-source
+install there is no dependency tree or build cache in the installation folder to
+skip — every byte of it is either configuration, secrets or data.
+
+> `C:\DELTA-backups` is also where the **non-Docker** DELTA uninstaller writes
+> its archives, deliberately: one place to look. Both use
+> `DELTA-<timestamp>.zip`, so archives from the two sit side by side in
+> timestamp order.
+
+### Bringing DELTA back
+
+Install it again, then restore the dump from inside the archive:
 
 ```powershell
+# 1. Install DELTA again.
 .\setup.ps1
+
+# 2. Get the dump out of the archive.
+Expand-Archive C:\DELTA-backups\DELTA-20260821-013000.zip -DestinationPath C:\temp\delta-restore
 ```
 
-It rebuilds the containers over the existing database. Your records, users,
-uploads and administrator password are exactly as you left them; you are not
-asked for a new password, because the old one still applies.
+Then follow [Restoring the database](#restoring-the-database) with the extracted
+`backups\delta-<timestamp>.dump`. Copy `uploads\` back into `C:\DELTA\uploads`
+at the same time if you had any.
 
-The uninstaller says so at the end rather than claiming DELTA is gone:
-
-```
-The DELTA runtime has been removed. Your data was preserved.
-
-Preserved:
-  the database        volume delta_pgdata
-  C:\DELTA\uploads
-  C:\DELTA\backups
-  ...
-```
-
-### Option 2 — complete removal
-
-This deletes the database volume and the whole installation directory. It
-cannot be undone, so three things happen first:
-
-1. **It lists exactly what will be destroyed** — the volume by name, and every
-   directory with its size and file count.
-2. **It offers a final verified backup.** The dump is taken with the database
-   still running, verified with `pg_restore --list`, and written **outside** the
-   installation directory so it survives the deletion. The surviving path is
-   printed. A backup written inside a directory that is about to be deleted
-   would not be a backup, so it is never left there.
-3. **It requires you to type `DELETE`.** Not `y`, not `yes`, not Enter — the
-   whole word, in capitals. Everything else cancels and changes nothing.
-
-If you decline the backup, it says plainly that the database will be deleted
-with no copy kept.
+The old `.env` is in the archive too. Do not copy it over the new one wholesale
+— the new installation has its own database password and session secret — but
+it is there if you need to read a setting off it.
 
 ### What it never touches
 
-Docker Desktop, WSL, Hyper-V, Windows features, Git, PowerShell — none of them
-are removed, in either mode. They are shared with the rest of the machine, and
-the fact that `setup.ps1` can install Docker Desktop does not make Docker
-Desktop DELTA's to delete.
+Docker Desktop, WSL, Hyper-V, Windows features, Git, PowerShell. None of them
+are removed. They are shared with the rest of the machine, and the fact that
+`setup.ps1` can install Docker Desktop does not make Docker Desktop DELTA's to
+delete.
 
 Nor does it touch any Docker resource it did not create. It identifies this
-installation from its own `.delta-install.json`, not by looking for names that
-resemble DELTA's, so another Compose project, another container, another volume
-or a similarly named scheduled task is never a candidate. Point it at a
-directory that is not a registered DELTA installation and it refuses:
+installation from its own state file — not by looking for names that resemble
+DELTA's — so another Compose project, another container, another volume or a
+similarly named scheduled task is never a candidate. Point it somewhere it does
+not belong and it refuses:
 
 ```powershell
 .\uninstall.ps1 -InstallRoot C:\Some\Other\Folder
 # No DELTA Docker installation was found. Nothing was changed.
 ```
 
-### Running it more than once
+### Docker has to be running
 
-It is safe to re-run. Anything already gone is reported as *absent* rather than
-as an error, and a partly-finished uninstall — one interrupted, or one where
-Docker was not running — continues from wherever the installation actually is.
-Run it on an installation that is already uninstalled and it tells you so, with
-the preserved data listed, and exits without changing anything.
+The database backup runs inside the database container, so without a working
+Docker engine there is no way to produce the dump the archive must contain —
+and therefore no way to reach a state where deleting anything is allowed. If
+Docker is down, the script says so and stops, without touching the scheduled
+tasks or firewall rules. Start Docker Desktop and run it again.
 
-### If something could not be removed
-
-The uninstaller distinguishes *removed*, *already absent*, *preserved*, *failed*
-and *could not verify*, and it will not call a run successful when something
-survived. If Docker is not running, for instance, the scheduled tasks and
-firewall rules are still removed, but the containers and the volume are reported
-as **not removed** — not as gone — and the installation record is deliberately
-kept so they can still be identified:
-
-```
-PARTIAL - DELTA was not completely uninstalled.
-
-These were not removed, or could not be checked:
-  Compose project 'delta' - The Docker engine is not reachable, ...
-```
-
-Start Docker Desktop and run it again.
-
-### For scripted teardown
+### Options
 
 ```powershell
-.\uninstall.ps1 -Mode preserve-data -NonInteractive
-.\uninstall.ps1 -Mode complete -ConfirmDataDeletion -FinalBackupPath D:\delta-final
+.\uninstall.ps1 -InstallRoot D:\DELTA           # a different installation
+.\uninstall.ps1 -BackupRoot E:\delta-archives   # put the ZIP somewhere else
+```
+
+`-BackupRoot` may not be inside the installation root; an archive written into
+the directory being archived is refused rather than worked around.
+
+For scripted teardown:
+
+```powershell
+.\uninstall.ps1 -ConfirmDataDeletion
 ```
 
 `-ConfirmDataDeletion` is the non-interactive equivalent of typing `DELETE`, and
-it is spelled that way on purpose. There is no `-Force`, and no flag skips the
-ownership checks — an unregistered installation root is refused either way.
+it is spelled that way on purpose. It authorises the deletion; it does **not**
+skip the backup. The archive is still created and still verified, and the
+uninstall still stops if either fails.
 
----
+### If something could not be removed
+
+The uninstaller distinguishes *removed*, *already absent*, *preserved*,
+*failed* and *could not verify*, and will not report success when something
+survived:
+
+```
+PARTIAL - DELTA was not completely removed.
+
+These were not removed, or could not be checked:
+  DELTA (Docker) - delta - HTTP - The rule exists and could not be removed. ...
+```
+
+The archive still exists and is still valid — it was made before any of this.
+Re-run the script once the cause is resolved; it continues from wherever the
+installation actually is, and takes a fresh archive when it does.
+
 
 ## After a Windows restart
 
@@ -969,8 +992,12 @@ Stated plainly so it is not mistaken for a gap:
 - **Nothing deletes your data by accident.** `setup.ps1` and the management
   menu never remove a database volume, and no code path anywhere reaches
   `docker compose down -v`, `docker volume prune` or `docker system prune`.
-  Removal happens only through `uninstall.ps1`, which preserves data unless you
-  explicitly choose otherwise — see [Removing DELTA](#removing-delta).
+  Deletion happens only through `uninstall.ps1`, which cannot reach it until it
+  has written and verified a full archive — see
+  [Removing DELTA](#removing-delta).
+- **There is no way to uninstall without a backup.** No switch, no flag, no
+  prompt. If the database dump or the archive verification fails, the uninstall
+  stops with the installation untouched.
 - **The uninstaller does not remove Docker Desktop, WSL or any prerequisite.**
   Those are shared with everything else on the machine. Removing them is your
   decision, made in Windows, not a side effect of removing DELTA.

@@ -1,93 +1,93 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    DELTA Windows Docker Uninstaller - removes the DELTA runtime, and preserves
-    your data unless you explicitly ask for it to be deleted.
+    DELTA Windows Docker Uninstaller - archives everything, then removes DELTA.
 
 .DESCRIPTION
-    The counterpart to setup.ps1, and deliberately not its mirror image.
-    setup.ps1 builds a running installation out of nothing; this script takes
-    the running part away and, by default, leaves everything that would be
-    painful to lose exactly where it is.
+    The counterpart to setup.ps1. It does one thing, in one order, and the
+    order is the whole design:
 
-    Two modes, chosen from a menu:
+        1. Prove this is a DELTA installation this installer created.
+        2. Take a fresh database backup with the installer's own verified
+           pg_dump implementation.
+        3. Stop the containers so the files being archived are not changing.
+        4. Archive the entire installation root - including that fresh dump -
+           to C:\DELTA-backups\DELTA-<timestamp>.zip.
+        5. Verify that archive by opening it and confirming what must be in it
+           actually is, down to reading the database dump's first bytes back
+           out of it.
+        6. Only then remove the containers, the network, the database volume,
+           the scheduled tasks, the firewall rules and the installation
+           directory.
 
-      1. Uninstall and preserve data (the default, and what almost everybody
-         wants). Removes the three containers, the Compose network, the
-         scheduled task that starts DELTA at boot, the scheduled task that
-         rotates the NGINX logs, and this installation's firewall rules. Keeps
-         the PostgreSQL data volume, uploads, backups, certificates, logs,
-         .env and docker-compose.yml. setup.ps1 run afterwards against the same
-         installation root rebuilds the runtime over the preserved data.
+    If step 2, 4 or 5 fails, the run stops and nothing is removed. That is not
+    a policy this script checks - it is the shape of the code. The backup
+    function throws rather than returning a status, and the removal function
+    cannot be called without the [Delta.VerifiedArchive] object that only a
+    successful backup produces. There is no "continue anyway", and no switch
+    that skips the backup.
 
-      2. Complete removal. Everything above, plus the database volume and the
-         whole installation root. Enumerates exactly what will be destroyed,
-         offers a final verified backup written outside the installation root,
-         and then requires the word DELETE to be typed in full. Nothing else -
-         not y, not yes, not Enter - authorises it.
+    The final state after a successful run:
 
-    What this script never removes, in either mode: Docker Desktop, WSL, Hyper-V,
-    any Windows optional feature, Git, PowerShell, any other Compose project, or
-    any container, volume, network, scheduled task or firewall rule that this
-    installation did not create. setup.ps1 being able to install Docker Desktop
-    does not make Docker Desktop DELTA's property - it is shared infrastructure
-    that other things on this machine may depend on.
+        C:\DELTA                       gone
+        C:\DELTA-backups\DELTA-*.zip   present and verified
 
-    Ownership is read from <InstallRoot>\.delta-install.json, the record of what
-    a previous run actually did, with .env as a secondary source for the two
-    identifiers that appear in both. Nothing is removed because its name looks
-    like DELTA's. An installation root with no readable state file is refused
-    rather than guessed at, which is what stops a mistyped -InstallRoot from
-    becoming a recursive delete of somebody's documents.
+    The archive is how your data is preserved. Everything an operator would
+    miss is in it: the database dump, uploads, certificates, .env,
+    docker-compose.yml, the generated NGINX configuration, the installation
+    record, every previous backup and every log.
 
-    There is no -Force. A switch that skips the confirmation would exist purely
-    to make the irreversible operation easy to automate, and that is the one
-    thing it should not be.
+    What this script never removes: Docker Desktop, WSL, Hyper-V, any Windows
+    optional feature, Git, PowerShell, any other Compose project, or any
+    container, volume, network, scheduled task or firewall rule that this
+    installation did not create. setup.ps1 being able to install Docker
+    Desktop does not make Docker Desktop DELTA's property.
+
+    Ownership is read from <InstallRoot>\.delta-install.json, the record of
+    what a previous run actually did. Nothing is removed because its name
+    looks like DELTA's, and an installation root with no readable state file
+    is refused rather than guessed at - which is what stops a mistyped
+    -InstallRoot from becoming a recursive delete of somebody's documents.
 
 .PARAMETER InstallRoot
     The installation to remove. Defaults to C:\DELTA.
 
+.PARAMETER BackupRoot
+    Where the archive is written. Defaults to C:\DELTA-backups, the same
+    convention the native DELTA uninstaller uses. It must not be inside the
+    installation root; that is refused rather than worked around.
+
 .PARAMETER LogDirectory
     Directory for the transcript. Defaults to logs\installer next to this
-    script - not inside the installation root, which complete removal deletes.
-
-.PARAMETER Mode
-    preserve-data | complete. Supplied non-interactively, it selects the mode
-    without showing the menu. `complete` still requires the typed confirmation
-    unless -ConfirmDataDeletion is also given.
+    script - never inside the installation root, which this script deletes.
 
 .PARAMETER ConfirmDataDeletion
     The non-interactive equivalent of typing DELETE. It exists for scripted
-    teardown of test installations and is named so that nobody adds it to a
-    command line by accident. It has no effect in preserve-data mode, and it
-    does not bypass the ownership checks: an unregistered installation root is
-    still refused.
+    teardown and is named so that nobody adds it to a command line by
+    accident. It does not skip the backup - nothing does - and it does not
+    bypass the ownership checks.
 
-.PARAMETER FinalBackupPath
-    Where a final backup is written on the complete-removal path. Must be
-    outside the installation root. Without it, and interactively, the script
-    asks.
-
-.PARAMETER SkipFinalBackup
-    Do not offer or take a final backup before complete removal.
+.PARAMETER NonInteractive
+    Never prompt. Requires -ConfirmDataDeletion to do anything.
 
 .NOTES
     Exit codes:
-      0  the uninstall completed, or there was nothing installed to remove
-      1  unhandled failure
+      0  DELTA was removed, or there was nothing installed to remove
+      1  the run stopped before removing anything - including because the
+         database backup or the archive verification failed. Nothing was
+         removed and the installation is intact.
       2  not elevated
       3  the installation root is not a registered DELTA installation
+      4  Docker is not usable, so the mandatory backup cannot be taken
       6  the operator cancelled
-      7  PARTIAL - something could not be removed or could not be checked
+      7  PARTIAL - the backup succeeded and something could not be removed
 #>
 [CmdletBinding()]
 param(
     [string]$InstallRoot = 'C:\DELTA',
+    [string]$BackupRoot,
     [string]$LogDirectory,
-    [ValidateSet('preserve-data', 'complete')][string]$Mode,
     [switch]$ConfirmDataDeletion,
-    [string]$FinalBackupPath,
-    [switch]$SkipFinalBackup,
     [switch]$NonInteractive
 )
 
@@ -110,9 +110,9 @@ $Script:DeltaLibraries = [ordered]@{
     'Delta.Docker.ps1'    = 'Get-DeltaStartupTaskName'
     'Delta.Stack.ps1'     = 'Invoke-DeltaCompose'
     'Delta.Network.ps1'   = 'Get-DeltaFirewallRuleName'
-    'Delta.Manage.ps1'    = 'Unregister-DeltaLogRotationTask'
+    'Delta.Manage.ps1'    = 'New-DeltaDatabaseBackup'
     'Delta.Configure.ps1' = 'Invoke-DeltaSmtpConfiguration'
-    'Delta.Uninstall.ps1' = 'Invoke-DeltaUninstall'
+    'Delta.Uninstall.ps1' = 'Backup-DeltaInstallation'
 }
 
 foreach ($library in $Script:DeltaLibraries.Keys) {
@@ -138,6 +138,9 @@ foreach ($library in $Script:DeltaLibraries.Keys) {
 if (-not $LogDirectory) {
     $LogDirectory = Join-Path -Path $Script:DeltaScriptRoot -ChildPath 'logs\installer'
 }
+if (-not $BackupRoot) {
+    $BackupRoot = $Script:DeltaUninstallBackupRoot
+}
 
 # ---------------------------------------------------------------------------
 # Stages
@@ -145,8 +148,8 @@ if (-not $LogDirectory) {
 
 function Test-DeltaUninstallElevation {
     <#
-      Checked before anything is inspected. Scheduled tasks, firewall rules and
-      an ACL-restricted .env all require it, and discovering that half-way
+      Checked before anything is inspected. Scheduled tasks, firewall rules
+      and an ACL-restricted .env all require it, and discovering it half-way
       through would leave an installation in a state neither this script nor
       setup.ps1 designed for.
     #>
@@ -165,16 +168,19 @@ function Test-DeltaUninstallElevation {
     return $false
 }
 
-function Get-DeltaUninstallDockerAvailability {
+function Test-DeltaUninstallDockerReady {
     <#
-      Whether Docker can be talked to at all.
+      Docker is a hard prerequisite for this script, and that follows from the
+      backup rule rather than from anything about removal.
 
-      This is not a prerequisite check. An uninstall that cannot reach Docker
-      can still remove the scheduled tasks, the firewall rules and the files -
-      all of which are Windows-side and all of which would otherwise outlive
-      the installation. What it must not do is claim the containers are gone
-      because it could not look, so the answer is threaded through the whole
-      run and turns those rows into "could not verify" instead of "absent".
+      The database lives in a Docker volume. Backing it up means running
+      pg_dump inside the db container. If the engine is unreachable there is
+      no way to produce the verified dump the archive must contain - so there
+      is no way to reach a state where deletion is permitted. Reporting that
+      plainly is better than removing the scheduled tasks and firewall rules
+      of an installation that then cannot be finished.
+
+      Nothing is changed on this path.
     #>
     Write-Step 'Checking Docker'
 
@@ -184,10 +190,15 @@ function Get-DeltaUninstallDockerAvailability {
         return $true
     }
 
-    Write-DeltaWarning "The Docker engine is not usable ($($engine.Status)): $($engine.Detail)"
-    Write-Detail 'Containers, the Compose network and the database volume cannot be removed'
-    Write-Detail 'or inspected in this run. Everything on the Windows side still can be, and'
-    Write-Detail 'what remains will be named at the end.'
+    Write-DeltaFailure ''
+    Write-DeltaFailure "The Docker engine is not usable ($($engine.Status))."
+    Write-Detail $engine.Detail
+    Write-Detail ''
+    Write-Detail 'DELTA cannot be uninstalled without it, because the database backup that has'
+    Write-Detail 'to succeed first runs inside the database container. Start Docker Desktop and'
+    Write-Detail 'run this again.'
+    Write-Detail ''
+    Write-Detail 'Nothing was changed. DELTA is exactly as it was.'
     return $false
 }
 
@@ -195,9 +206,9 @@ function Show-DeltaUninstallNotInstalled {
     <#
       The "already gone" report, which is a success and is worded like one.
 
-      An uninstaller that fails with a stack trace because the thing is already
-      uninstalled has misunderstood its job: the operator asked for a machine
-      with no DELTA runtime on it, and that is what they have.
+      An uninstaller that fails with a stack trace because the thing is
+      already uninstalled has misunderstood its job: the operator asked for a
+      machine with no DELTA on it, and that is what they have.
     #>
     param([Parameter(Mandatory)][object]$Target)
 
@@ -211,60 +222,12 @@ function Show-DeltaUninstallNotInstalled {
     Write-Detail '    .\uninstall.ps1 -InstallRoot D:\DELTA'
 }
 
-function Show-DeltaAlreadyUninstalled {
-    <#
-      A second run after a preserve-data uninstall. The runtime is already
-      gone; what is left is the data the operator chose to keep, and the two
-      things they can do with it. Saying that is more useful than reporting
-      "nothing to do" over 200 MB of preserved database.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Target,
-        [Parameter(Mandatory)][object]$Survey
-    )
-
-    Write-Host ''
-    Write-Success 'The DELTA runtime is already uninstalled. Nothing was changed.'
-    Write-Host ''
-    Write-Detail "Uninstalled   $($Target.PreviousUninstall.at) ($($Target.PreviousUninstall.mode))"
-    Write-Detail ''
-    Write-Detail 'Preserved data is still here:'
-    if ($Survey.VolumePresent) { Write-Detail "  the database    volume $($Target.PgDataVolume)" }
-    foreach ($directory in $Survey.Directories) {
-        if (-not $directory.Exists -or $directory.Items -eq 0) { continue }
-        Write-Detail ("  {0,-14} {1}, {2} file(s)" -f $directory.Name, (Format-DeltaByteSize $directory.Bytes), $directory.Items)
-    }
-    Write-Detail ''
-    Write-Detail 'To bring DELTA back with this data:'
-    Write-Detail "    .\setup.ps1 -InstallRoot `"$($Target.InstallRoot)`""
-    Write-Detail ''
-    Write-Detail 'To delete the preserved data as well, run this script again and choose'
-    Write-Detail 'complete removal.'
-}
-
-function Test-DeltaUninstallReconciled {
-    <#
-      Whether there is anything left for this script to do.
-
-      Deliberately a question about the machine and not about the state file: a
-      previous run that recorded a preserve-data uninstall may still have left
-      a firewall rule behind, and this must return false in that case so the
-      rerun finishes the job. "Already uninstalled" means every removable
-      resource is actually absent - not that something once said so.
-    #>
-    param([Parameter(Mandatory)][object]$Survey)
-
-    if ($Survey.DockerAvailable) {
-        if (@($Survey.Containers).Count -gt 0) { return $false }
-        if ($Survey.NetworkPresent) { return $false }
-    }
-    if ($Survey.StartupTask -or $Survey.RotationTask) { return $false }
-    if ($Survey.HttpRule -or $Survey.HttpsRule) { return $false }
-    return $true
-}
-
 # ---------------------------------------------------------------------------
 # main
+#
+# The gate is expressed here as well as in the library: $archive only exists
+# if Backup-DeltaInstallation returned, and Remove-DeltaInstallation will not
+# bind anything else to -VerifiedArchive.
 # ---------------------------------------------------------------------------
 
 $exitCode = $Script:DeltaExitSuccess
@@ -294,95 +257,54 @@ try {
                 $Script:DeltaExitSuccess
             }
         }
+        elseif (-not (Test-DeltaUninstallDockerReady)) {
+            $exitCode = $Script:DeltaExitPrerequisiteFailed
+        }
         else {
-            $dockerAvailable = Get-DeltaUninstallDockerAvailability
-            $survey = Get-DeltaUninstallSurvey -Target $target -DockerAvailable $dockerAvailable
+            $survey = Get-DeltaUninstallSurvey -Target $target -DockerAvailable $true
+            Show-DeltaUninstallPlan -Target $target -Survey $survey -BackupRoot $BackupRoot
 
-            $reconciled = Test-DeltaUninstallReconciled -Survey $survey
-            $previouslyUninstalled = ($null -ne $target.PreviousUninstall)
-
-            if ($reconciled -and $previouslyUninstalled -and -not $Mode) {
-                # Already reconciled, and the state file says why. Interactively
-                # this is the end of the run; a caller that explicitly asked for
-                # complete removal still gets to ask for it below.
-                Show-DeltaAlreadyUninstalled -Target $target -Survey $survey
+            $confirmed = $false
+            if ($ConfirmDataDeletion) {
+                Write-Host ''
+                Write-DeltaWarning '-ConfirmDataDeletion was supplied, so the typed confirmation is not shown.'
+                Write-DeltaWarning "$($target.InstallRoot) and the volume $($target.PgDataVolume) will be removed once the archive verifies."
+                $confirmed = $true
+            }
+            elseif ($NonInteractive) {
+                Write-Host ''
+                Write-DeltaFailure 'Uninstall was requested non-interactively without -ConfirmDataDeletion.'
+                Write-Detail 'Nothing was changed.'
             }
             else {
-                Show-DeltaUninstallPlan -Target $target -Survey $survey
-
-                $chosen = $Mode
-                if (-not $chosen) {
-                    if ($NonInteractive) {
-                        Write-Host ''
-                        Write-DeltaFailure 'No mode was chosen.'
-                        Write-Detail '-NonInteractive was supplied without -Mode, and this script will not pick'
-                        Write-Detail 'between preserving and destroying data on the operator''s behalf.'
-                        $chosen = $null
-                    }
-                    else {
-                        $chosen = Read-DeltaUninstallMode -Target $target
-                    }
-                }
-
-                if (-not $chosen) {
+                $confirmed = Read-DeltaUninstallConfirmation -Target $target -Survey $survey -BackupRoot $BackupRoot
+                if (-not $confirmed) {
                     Write-Host ''
-                    Write-Detail 'Cancelled. Nothing was changed.'
-                    $exitCode = $Script:DeltaExitOperatorDeclined
+                    Write-Detail 'Cancelled. Nothing was changed - the installation is exactly as it was.'
                 }
-                else {
-                    $proceed = $true
-                    $backupDestination = $null
+            }
 
-                    if ($chosen -eq 'complete') {
-                        # Order matters: the backup is offered before the
-                        # confirmation, so the operator decides about the
-                        # safety net while they still have one, and the
-                        # confirmation is the last thing between them and the
-                        # deletion.
-                        if (-not $SkipFinalBackup) {
-                            if ($FinalBackupPath) {
-                                $backupDestination = $FinalBackupPath
-                            }
-                            elseif (-not $NonInteractive) {
-                                $choice = Read-DeltaFinalBackupChoice -Target $target -Survey $survey
-                                if ($choice.Wanted) { $backupDestination = $choice.Destination }
-                                if ($choice.Reason) { Write-Host ''; Write-Detail $choice.Reason }
-                            }
-                        }
+            if (-not $confirmed) {
+                $exitCode = $Script:DeltaExitOperatorDeclined
+            }
+            else {
+                # ---------------------------------------------------------------
+                # The safety gate.
+                #
+                # Backup-DeltaInstallation either returns a verified archive or
+                # throws. There is no third outcome and no status to inspect, so
+                # the lines below this one are simply not reached unless the
+                # backup and its verification both succeeded.
+                # ---------------------------------------------------------------
+                Write-Host ''
+                $archive = Backup-DeltaInstallation -Target $target -BackupRoot $BackupRoot
 
-                        if ($ConfirmDataDeletion) {
-                            Write-Host ''
-                            Write-DeltaWarning '-ConfirmDataDeletion was supplied, so the typed confirmation is not shown.'
-                            Write-DeltaWarning "The database volume $($target.PgDataVolume) and $($target.InstallRoot) will be deleted."
-                        }
-                        elseif ($NonInteractive) {
-                            Write-Host ''
-                            Write-DeltaFailure 'Complete removal was requested non-interactively without -ConfirmDataDeletion.'
-                            Write-Detail 'Nothing was deleted.'
-                            $proceed = $false
-                        }
-                        else {
-                            $proceed = Read-DeltaDestructiveConfirmation -Target $target -Survey $survey
-                            if (-not $proceed) {
-                                Write-Host ''
-                                Write-Detail 'Cancelled. Nothing was deleted - the installation is exactly as it was.'
-                            }
-                        }
-                    }
+                Write-Host ''
+                $result = Remove-DeltaInstallation -Target $target -VerifiedArchive $archive -DockerAvailable $true
 
-                    if (-not $proceed) {
-                        $exitCode = $Script:DeltaExitOperatorDeclined
-                    }
-                    else {
-                        Write-Host ''
-                        $result = Invoke-DeltaUninstall -Target $target -Mode $chosen `
-                            -DockerAvailable $dockerAvailable -FinalBackupDestination $backupDestination
-
-                        Show-DeltaUninstallOutcome -Result $result -Target $target
-                        if ($result.Outcome -ne 'success') {
-                            $exitCode = $Script:DeltaExitStackFailed
-                        }
-                    }
+                Show-DeltaUninstallOutcome -Result $result -Target $target -Archive $archive
+                if ($result.Outcome -ne 'success') {
+                    $exitCode = $Script:DeltaExitStackFailed
                 }
             }
         }
@@ -391,9 +313,12 @@ try {
     Write-Host ''
 }
 catch {
+    # Every failure inside Backup-DeltaInstallation arrives here, which is
+    # exactly why that function throws instead of returning: this is the
+    # abort, and it happens with the installation untouched.
     $exitCode = $Script:DeltaExitFailure
     Write-DeltaFailure ''
-    Write-DeltaFailure 'The uninstaller stopped with an error.'
+    Write-DeltaFailure 'The uninstall stopped. Nothing was removed.'
     Write-Detail $_.Exception.Message
     if ($_.ScriptStackTrace) {
         Write-DeltaLogLine -Message $_.ScriptStackTrace -Level 'ERROR'
