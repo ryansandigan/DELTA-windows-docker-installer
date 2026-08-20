@@ -1093,7 +1093,7 @@ curl.exe -sk -o NUL -w "%{http_code}" https://localhost:<HTTPS_PORT>/     # 200
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · commit `8bdd9b0` · **Acceptance gate: met**, with one criterion proven at the database rather than over HTTP — the same qualification Phase 5 recorded, for the same reason. 141/141 Phase 10 assertions pass.
+**Status: COMPLETE** · 2026-08-20 · commit `e40bfea` · **Acceptance gate: met**, with one criterion proven at the database rather than over HTTP — the same qualification Phase 5 recorded, for the same reason. 141/141 Phase 10 assertions pass.
 
 Delivered: `lib\Delta.Configure.ps1` (new); menu wiring for options 5, 6 and 7 in `lib\Delta.Manage.ps1`; the library registration in `setup.ps1`; the SMTP, administrator-reset and certificate sections of `README.md`.
 
