@@ -373,7 +373,12 @@ function Invoke-DeltaAdminPasswordReset {
         [string]$Email = $Script:DeltaSeededAdminEmail,
         [switch]$Automatic,
         [bool]$AllowPrompt = $true,
-        [SecureString]$NewPassword
+        [SecureString]$NewPassword,
+        # Set when the caller generated $NewPassword rather than the operator
+        # choosing it. It changes nothing about the reset - only whether the
+        # completion summary shows the credential once, which it must do for a
+        # generated one and must never do for one the operator already knows.
+        [bool]$NewPasswordWasGenerated = $false
     )
 
     $result = [PSCustomObject]@{
@@ -416,7 +421,8 @@ function Invoke-DeltaAdminPasswordReset {
 
     # --- choose the new credential ----------------------------------------
     if ($NewPassword) {
-        $result.Method = 'Supplied'
+        $result.Method = if ($NewPasswordWasGenerated) { 'Generated' } else { 'Supplied' }
+        $result.WasGenerated = $NewPasswordWasGenerated
         $password = $NewPassword
     }
     else {

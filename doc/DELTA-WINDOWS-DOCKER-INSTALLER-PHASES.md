@@ -1215,7 +1215,45 @@ Two things the audit found to be **already correct**, and which this phase there
 
 #### Implementation status
 
-**Status: NOT STARTED** · audit complete, implementation not begun.
+**Status: COMPLETE** · 2026-08-20 · commit `ba4c1e6` · **Acceptance gate: met.** All thirteen items demonstrated physically on isolated installations. 100/100 Phase 10.5 assertions pass.
+
+Delivered: the fresh-install settings section of `lib\Delta.Config.ps1` (`Test-DeltaHostName`, `Read-DeltaHostName`, `Read-DeltaInstallPassword`, `Read-DeltaFreshInstallSettings`); credential threading through `lib\Delta.Stack.ps1`; `-NewPasswordWasGenerated` on the Phase 5 primitive in `lib\Delta.Manage.ps1`; the settings step in `setup.ps1`; the fresh-install and rerun sections of `README.md`.
+
+**What changed, against each audit finding**
+
+- **D1 — the hostname is now asked**, defaulting to `localhost` on bare Enter, validated by `Test-DeltaHostName`. The validator accepts a DNS name or an IP literal and **deliberately resolves nothing**: installing on a server whose DNS entry does not exist yet is normal, and refusing a name because a lookup failed would be the installer inventing a prerequisite. It rejects what would actually break the generated configuration — whitespace, a scheme, a path, a port, bad label syntax, over-length labels — and names the specific defect.
+- **D2 — the database password is now offered.** Bare Enter generates a 32-character CSPRNG value, exactly as before; typing one stores that instead. It is used **only when `.env` does not already have one**, because the cluster applies `POSTGRES_PASSWORD` at first initialisation only (A§7.5) and overwriting it later changes what DELTA presents without changing what PostgreSQL expects.
+- **D3 — the administrator password is now asked at the front.** The *question* moved; the *application* did not. The credential is collected at the settings step and applied at exactly the same point in the sequence as before — after DELTA is healthy, before NGINX publishes a port. It travels to the bootstrap as a scriptblock **argument**, not as captured state, for the reason Phase 5 recorded.
+
+**Implementation decisions**
+
+- **Everything is asked before anything slow happens.** The settings step runs after the Docker readiness checks and before artefact generation, the image pull and the health gates.
+- **What is asked depends on what the installation already has**, which is what keeps a rerun quiet and `-Reconfigure` honest: the hostname is always offered, the database password only when there is not one, the administrator password only when the bootstrap has not completed.
+- **Non-interactive behaviour is unchanged and nothing new is invented.** With `-NonInteractive` the step asks nothing and supplies only `localhost`; the generation that follows is the pre-existing `__GENERATE__` behaviour from Phase 3 and Phase 5, not a default introduced to dodge a prompt. Asserted by test.
+- **Ports and SMTP were audited and left alone.** Both were already correct, and changing correct behaviour to satisfy a phase brief would be the wrong move.
+
+**A defect this phase introduced and caught.** The first implementation named the new parameter `$PostgresPassword`, which — PowerShell variable names being case-insensitive — *is* the existing local `$postgresPassword` in `New-DeltaEnvironmentFile`. Assigning the generated string to it failed at run time against the `[SecureString]` type constraint, and the install aborted at "Generating configuration". Renamed to `$SuppliedPostgresPassword`, with the reason recorded in the parameter's comment so it is not reintroduced. It was caught by the first physical fresh install, not by static review.
+
+**Validation** — 100 assertions, all passing, on isolated installations only. The operator's `C:\DELTA`, project `delta` and volume `delta_pgdata` were never the target of any test.
+
+- **A — default convenience path** (`C:\Workspace\delta-a`, project `deltaa`, port 18110). Bare Enter for the hostname, typed passwords, HTTP. **Exactly six questions were asked**, recorded verbatim: hostname, database password + confirm, administrator password + confirm, HTTPS choice. **No port question. No SMTP question.** Exit 0. Then measured: hostname is `localhost`, `PUBLIC_URL` and the NGINX `server_name` follow it, the typed database password is what `.env` holds and the database is reachable with it, the typed administrator password authenticates while the published default does not, `GET http://localhost:18110/` returns **200**, the access guide shows the real URL, and **no SMTP key exists in `.env`**.
+- **B — explicit hostname and a supplied certificate** (`delta-b`, `delta.test.invalid`, HTTPS 18553). Both passwords by bare Enter — which asked **no confirm prompt**, as designed. Measured: the typed hostname is taken through to `server_name` and `PUBLIC_URL`, `nginx -t` accepts the TLS configuration, HTTPS returns **200**, the certificate NGINX serves is the one supplied, and the generated administrator credential was shown once.
+- **C — a genuine port conflict.** No `-HttpPort`, so the candidate was the default 80 — **held by the operator's own DELTA installation**, a different Compose project. Measured: the conflict was detected, the owner identified, an alternative requested, and the installation completed on 18140. Afterwards the operator's NGINX, database and DELTA container IDs, their `.env`, their site on port 80 and the unrelated `apc-2026` container were **all unchanged**.
+- **D — invalid input.** In the same run: an invalid hostname re-prompted then accepted a valid one; a non-numeric port and an already-occupied port each re-prompted before a valid port was accepted; separately, a mismatched password confirmation re-prompted and only the matching pair was taken. Nothing partial was written in any case.
+- **E — rerun.** `.\setup.ps1` on the registered installation opened **Management Mode**, asked exactly one question (the menu selection), and left `.env`, the state file and every container byte-identical. (The *first* management run legitimately registers the Phase 7 log-rotation task and writes the state file once; the baseline is taken after that.)
+- **`-Reconfigure`** runs the installation flow, says so plainly, re-offers the hostname and HTTPS, and **does not re-ask either credential** — verified from the recorded prompt list: two questions, not four. The database password and the administrator credential were unchanged afterwards and the site still served.
+- **F — regression.** Phase 10: SMTP 51/51, certificate 47/47, administrator 25/25, menu 18/18. Phase 8: 19/19 + 28/32 + 4/4. Phase 9: 28/28 + 36/36 + 31/35. The **eight failures are the same stale placeholder assertions** documented in Phase 10 — suites that assert the Phase 9/10 placeholders still exist. No new failure appeared. All ten scripts parse under Windows PowerShell 5.1 with their BOMs; the tokenizer scan finds no `down`, `--volumes` or `prune` outside comments and no `docker volume rm`; no secret value, key name, connection URI or private-key material appears in any transcript, state file or tracked file.
+- **Cleanup.** All three isolated installations removed by name — containers, network, volume, scheduled tasks, firewall rules and installation root — with no global operation of any kind. The host ends with only `delta_pgdata`, the operator's three containers, their two scheduled tasks and their one firewall rule; `apc-2026` and both `deltaprobe-*` containers are untouched. The operator's `.env` is **byte-identical to the Phase 9 baseline** (`2ACC0998…`) with its original ACL, and the site answers 200.
+
+**A test-harness defect, recorded because it recurred.** The Phase 10 SMTP suite's own reset helper used `[System.IO.File]::WriteAllLines`, which rewrites every line ending as CRLF; `.env` has always been LF. It silently reformatted the operator's file — the same fault as in the Phase 10 cleanup, from the same API. Both the helper and the file are fixed, and the hash comparison against the Phase 9 baseline is what caught it. A validation script that writes into the installation is held to the installer's own standard.
+
+**Limitations / operator-required validation**
+
+- **No browser sign-in.** The administrator password is proven at the database — the stored hash changes and only the new credential verifies — because `POST /en/admin/login` returns an identical 400 for correct and incorrect credentials, the form being posted by client-side JavaScript. This is the standing Phase 5 qualification and is unchanged.
+- **Hostname reachability is not tested.** A typed hostname is validated syntactically and threaded through the configuration; whether DNS resolves it, and whether a firewall elsewhere permits it, is not something the installer measures or claims.
+- **`localhost` over plain HTTP remains localhost-only**, as A§6 states: `NODE_ENV=production` marks session cookies `Secure`, so users reaching a real hostname over plain HTTP will not stay signed in. The installer says so at the TLS prompt and again in the summary.
+
+**Phase 6 is untouched and remains PARTIAL.** Nothing here measures, infers or records a reboot result.
 
 ---
 

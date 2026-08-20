@@ -602,6 +602,17 @@ try {
                 $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
 
                 if ($runtime.Outcome -eq 'ready') {
+                    # Everything the administrator has to decide is asked here,
+                    # before the image pull and the health gates - so a person
+                    # who starts the installer and walks away comes back to a
+                    # finished installation rather than to a waiting prompt.
+                    # What is asked depends on what the installation already
+                    # has, so a rerun and -Reconfigure stay quiet.
+                    $settings = Read-DeltaFreshInstallSettings `
+                        -InstallRoot $InstallRoot `
+                        -AllowPrompt (-not $NonInteractive) `
+                        -HostName $Hostname
+
                     $stack = Invoke-DeltaStackStage `
                         -InstallRoot $InstallRoot `
                         -ScriptRoot $Script:DeltaScriptRoot `
@@ -609,12 +620,15 @@ try {
                         -Runtime $runtime `
                         -HttpPort $HttpPort `
                         -HttpsPort $HttpsPort `
-                        -HostName $Hostname `
+                        -HostName $settings.HostName `
                         -TlsMode $TlsMode `
                         -CertificatePath $CertificatePath `
                         -CertificateKeyPath $CertificateKeyPath `
                         -ComposeProject $ComposeProject `
                         -PgDataVolume $PgDataVolume `
+                        -PostgresPassword $settings.PostgresPassword `
+                        -AdminPassword $settings.AdminPassword `
+                        -AdminPasswordWasGenerated $settings.AdminPasswordWasGenerated `
                         -AllowPrompt (-not $NonInteractive)
 
                     $exitCode = Show-DeltaStackOutcome -Stack $stack

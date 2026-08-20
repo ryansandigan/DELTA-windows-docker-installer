@@ -192,7 +192,16 @@ function New-DeltaEnvironmentFile {
         [Parameter(Mandatory)][string]$ScriptRoot,
         [Parameter(Mandatory)][object]$Network,
         [string]$ComposeProject,
-        [string]$PgDataVolume
+        [string]$PgDataVolume,
+        # Supplied when the administrator chose or delegated it at the
+        # Installation settings step (Phase 10.5). Absent on a rerun, where the
+        # existing value is authoritative and must never be replaced.
+        #
+        # Named "Supplied..." deliberately: PowerShell variable names are
+        # case-insensitive, so a parameter called $PostgresPassword would BE
+        # the local $postgresPassword below, and assigning the generated string
+        # to it fails at run time against the [SecureString] type constraint.
+        [SecureString]$SuppliedPostgresPassword
     )
 
     Write-Step 'Generating configuration'
@@ -230,7 +239,17 @@ function New-DeltaEnvironmentFile {
     $values = [ordered]@{}
 
     # Secrets: generated once, then preserved for the life of the installation.
+    #
+    # An existing value always wins. The cluster applies POSTGRES_PASSWORD only
+    # at first initialisation, so overwriting it later changes what DELTA
+    # presents without changing what PostgreSQL expects (A§7.5) - which is why
+    # a supplied password is used only when there is nothing there yet.
     $postgresPassword = & $resolve 'POSTGRES_PASSWORD' $null
+    if (-not $postgresPassword -and $SuppliedPostgresPassword) {
+        $postgresPassword = ConvertTo-DeltaPlainText -SecureString $SuppliedPostgresPassword
+        Register-DeltaSecretValue -Value $postgresPassword
+        Write-Detail 'Using the database credential chosen during installation.'
+    }
     if (-not $postgresPassword) {
         $postgresPassword = New-DeltaPassword -Length 32
         # Worded without the word "password" on purpose: the acceptance check
@@ -1280,7 +1299,11 @@ function Start-DeltaStack {
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][object]$Configuration,
         [scriptblock]$SecurityBootstrap,
-        [bool]$AllowPrompt = $true
+        [bool]$AllowPrompt = $true,
+        # Passed straight through to the bootstrap callback. Held only for the
+        # length of this call; never written to .env or to installer state.
+        [SecureString]$BootstrapPassword,
+        [bool]$BootstrapPasswordWasGenerated = $false
     )
 
     $result = [PSCustomObject]@{
@@ -1370,7 +1393,12 @@ function Start-DeltaStack {
         $result.Stage = 'bootstrap'
         # Everything the callback needs is passed in, so it never depends on
         # what happens to be in scope where it runs.
-        $result.Bootstrap = & $SecurityBootstrap $InstallRoot $Configuration $AllowPrompt
+        # The credential collected at the Installation settings step travels as
+        # a fourth argument rather than as captured state, for the same reason
+        # the other three do: a scriptblock that reads ambient variables
+        # resolves differently depending on how the installer was loaded, and
+        # this is the one step where that must never be in question.
+        $result.Bootstrap = & $SecurityBootstrap $InstallRoot $Configuration $AllowPrompt $BootstrapPassword $BootstrapPasswordWasGenerated
         if (-not $result.Bootstrap -or -not $result.Bootstrap.Succeeded) {
             Write-DeltaFailure ''
             Write-DeltaFailure 'The administrator account could not be secured.'
@@ -1479,7 +1507,13 @@ function Invoke-DeltaStackStage {
         [string]$PgDataVolume,
         [bool]$AllowPrompt = $true,
         [System.Collections.IDictionary]$PendingFacts,
-        [object]$Runtime
+        [object]$Runtime,
+        # Collected at the Installation settings step (Phase 10.5). Both are
+        # optional: without them the pre-existing behaviour is unchanged - the
+        # database credential is generated and the bootstrap asks.
+        [SecureString]$PostgresPassword,
+        [SecureString]$AdminPassword,
+        [bool]$AdminPasswordWasGenerated = $false
     )
 
     $result = [PSCustomObject]@{
@@ -1534,7 +1568,7 @@ function Invoke-DeltaStackStage {
 
     # --- configuration ----------------------------------------------------
     $configuration = New-DeltaEnvironmentFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Network $network `
-        -ComposeProject $ComposeProject -PgDataVolume $PgDataVolume
+        -ComposeProject $ComposeProject -PgDataVolume $PgDataVolume -SuppliedPostgresPassword $PostgresPassword
     $result.Configuration = $configuration
 
     $null = New-DeltaComposeFile -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -TlsEnabled ([bool]$network.TlsEnabled)
@@ -1638,17 +1672,33 @@ function Invoke-DeltaStackStage {
         # call in this file does, and everything it needs arrives as an
         # argument rather than as captured ambient state.
         $bootstrapBlock = {
-            param($BootstrapInstallRoot, $BootstrapConfiguration, $BootstrapAllowPrompt)
-            Invoke-DeltaAdminPasswordReset `
-                -InstallRoot $BootstrapInstallRoot `
-                -Configuration $BootstrapConfiguration `
-                -Automatic `
-                -AllowPrompt $BootstrapAllowPrompt
+            param($BootstrapInstallRoot, $BootstrapConfiguration, $BootstrapAllowPrompt, $BootstrapNewPassword, $BootstrapWasGenerated)
+            if ($BootstrapNewPassword) {
+                # Already chosen (or delegated) at the Installation settings
+                # step, so nothing is asked here - the credential is simply
+                # applied at the point in the sequence it has always been
+                # applied: after DELTA is healthy, before NGINX publishes.
+                Invoke-DeltaAdminPasswordReset `
+                    -InstallRoot $BootstrapInstallRoot `
+                    -Configuration $BootstrapConfiguration `
+                    -Automatic `
+                    -AllowPrompt $BootstrapAllowPrompt `
+                    -NewPassword $BootstrapNewPassword `
+                    -NewPasswordWasGenerated:([bool]$BootstrapWasGenerated)
+            }
+            else {
+                Invoke-DeltaAdminPasswordReset `
+                    -InstallRoot $BootstrapInstallRoot `
+                    -Configuration $BootstrapConfiguration `
+                    -Automatic `
+                    -AllowPrompt $BootstrapAllowPrompt
+            }
         }
     }
 
     $result.Start = Start-DeltaStack -InstallRoot $InstallRoot -Configuration $configuration `
-        -SecurityBootstrap $bootstrapBlock -AllowPrompt $AllowPrompt
+        -SecurityBootstrap $bootstrapBlock -AllowPrompt $AllowPrompt `
+        -BootstrapPassword $AdminPassword -BootstrapPasswordWasGenerated $AdminPasswordWasGenerated
 
     if (-not $result.Start.Succeeded) {
         $result.Reason = $result.Start.Reason

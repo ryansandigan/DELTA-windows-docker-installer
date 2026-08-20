@@ -40,14 +40,52 @@ From an elevated PowerShell prompt, in the folder containing `setup.ps1`:
 .\setup.ps1
 ```
 
-That is the whole thing. It installs to `C:\DELTA` unless you say otherwise,
-and it asks only what it genuinely cannot work out:
+That is the whole thing. It installs to `C:\DELTA` unless you say otherwise.
+You do not prepare a configuration file, create a database, create an
+administrator account, start any container, or touch Docker directly.
 
-- **Ports.** If 80 and 443 are free, it takes them without asking. If something
-  else already has one, it tells you what, and asks you for another port. It
-  never stops or reconfigures whatever is already using the port.
-- **HTTPS.** It asks whether you want none, your own certificate, or a
-  self-signed one.
+### What you will be asked
+
+Four things, all at the start, before the installer does anything slow:
+
+| Question | Default if you just press Enter |
+|---|---|
+| **Hostname or domain** — the name people will use in a browser | `localhost` |
+| **Database password** — for the PostgreSQL database it creates for DELTA | a strong one is generated |
+| **DELTA administrator password** — for signing in as `admin@admin.com` | a generated one, shown once at the end |
+| **HTTPS** — none, your own certificate, or a self-signed one | none (plain HTTP) |
+
+`localhost` is a deliberate default, not a placeholder. It lets you install
+DELTA on a machine and try it from that machine immediately, without owning a
+DNS name or a certificate. Nothing looks the name up, so a hostname whose DNS
+entry does not exist yet is accepted — you can point DNS at it later.
+
+Both password prompts are masked, and a password you type is asked for twice
+and must match. Choosing "generate" is a perfectly good answer for the database
+password: the database is never published to the network and nothing outside
+this machine can reach it. Type your own if you want to connect with other
+tooling.
+
+### What you will *not* be asked
+
+- **Ports.** If port 80 (and 443 with HTTPS) is free, the installer takes it
+  without asking. You are only asked for another port when something else
+  genuinely owns it — and then you are told *what* owns it. Nothing already
+  using the port is ever stopped, moved or reconfigured.
+- **SMTP / email.** DELTA works without it: its default writes mail to the
+  container log rather than sending it. Configure a mail server afterwards,
+  when you want one, from [Configuring email](#configuring-email). Installing
+  DELTA does not require a mail server to exist.
+- **Anything about Docker.** Compose project names, internal ports, volumes and
+  image digests are the installer's business, not yours.
+
+Everything after those four questions runs unattended: the installer creates the
+folder layout, generates the configuration, pulls and pins the images, starts
+PostgreSQL, lets DELTA initialise its own schema and verifies that it did,
+replaces the published default administrator credential *before* anything is
+reachable, starts NGINX, requests the site to prove it answers, opens the
+firewall for the port it published, configures unattended startup, and prints
+the access details.
 
 Useful switches:
 
@@ -60,7 +98,35 @@ Useful switches:
 .\setup.ps1 -NonInteractive                # never prompt (for automation)
 ```
 
+Anything you supply as a switch is not asked for again. `-NonInteractive` asks
+nothing at all: the hostname falls back to `localhost` and both passwords are
+generated, which is the same generation the interactive prompts offer — it does
+not invent a weaker default to avoid a question. A generated administrator
+password is still printed once at the end of the run, so capture the output.
+
 Run `Get-Help .\setup.ps1 -Full` for the rest.
+
+### Running setup.ps1 again
+
+Once DELTA is installed, `.\setup.ps1` opens the
+[management utility](#running-setupps1-again--the-management-utility) instead of
+installing. It does not ask the installation questions again, does not
+regenerate anything, and does not recreate any container just because you
+opened it.
+
+To change installation-level settings — hostname, ports, HTTPS — run the
+installer flow explicitly:
+
+```powershell
+.\setup.ps1 -Reconfigure
+```
+
+That re-offers the hostname and the HTTPS choice. It deliberately does **not**
+re-ask either password: the database password is applied only when the database
+is first created, so changing it there would not change what PostgreSQL expects,
+and the administrator credential is left to
+[menu option 6](#resetting-the-administrator-password), which is the operation
+that actually knows how to replace it.
 
 ### What a first install does
 

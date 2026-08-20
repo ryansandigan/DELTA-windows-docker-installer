@@ -846,3 +846,300 @@ function Get-DeltaInstallationState {
 
     return $result
 }
+
+# ---------------------------------------------------------------------------
+# Fresh-install settings (Phase 10.5)
+#
+# The three things only the administrator can tell the installer, asked once,
+# up front, before anything slow or irreversible happens. Everything else the
+# installation needs it either detects or generates.
+#
+# The ordering matters more than it looks. Before this, the administrator
+# password was asked by the security bootstrap - which runs after the
+# prerequisite checks, artefact generation, a ~700 MB image pull and two health
+# gates. Somebody who started the installer and went to make coffee came back
+# to a prompt. Questions belong at the front, where a person is still watching.
+# ---------------------------------------------------------------------------
+
+function Test-DeltaHostName {
+    <#
+      Whether a string is usable as the name this installation is reached by.
+
+      Accepts 'localhost', a DNS name, or an IP literal. Deliberately does NOT
+      resolve anything: an administrator installing on a server whose DNS entry
+      does not exist yet is doing something completely normal, and refusing
+      their hostname because a lookup failed would be this installer inventing
+      a prerequisite. The name drives NGINX's server_name and PUBLIC_URL; DNS
+      is somebody else's job and is reported, never enforced.
+
+      The rules are the ones that would actually break the generated
+      configuration: no whitespace, no scheme, no path, no port, and DNS label
+      syntax where it is a name rather than an address.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $result = [PSCustomObject]@{ IsValid = $false; Reason = $null; IsAddress = $false }
+
+    $candidate = $Value.Trim()
+    if (-not $candidate) {
+        $result.Reason = 'A hostname is required.'
+        return $result
+    }
+    if ($candidate -match '\s') {
+        $result.Reason = 'A hostname cannot contain spaces.'
+        return $result
+    }
+    if ($candidate -match '://') {
+        $result.Reason = "Enter the hostname only, without a scheme - '$($candidate -replace '^.*://', '')' rather than '$candidate'."
+        return $result
+    }
+    if ($candidate -match '/') {
+        $result.Reason = 'Enter the hostname only, without a path.'
+        return $result
+    }
+    # A bare IPv6 literal contains colons and is fine; anything else with a
+    # colon is somebody adding a port, which belongs to the port question.
+    $address = [System.Net.IPAddress]::None
+    if ([System.Net.IPAddress]::TryParse($candidate, [ref]$address)) {
+        $result.IsValid = $true
+        $result.IsAddress = $true
+        return $result
+    }
+    if ($candidate -match ':') {
+        $result.Reason = 'Enter the hostname only, without a port - the port is asked for separately if it is needed.'
+        return $result
+    }
+    if ($candidate.Length -gt 253) {
+        $result.Reason = 'A hostname cannot be longer than 253 characters.'
+        return $result
+    }
+    foreach ($label in $candidate.Split('.')) {
+        if (-not $label) {
+            $result.Reason = "'$candidate' has an empty part - check for a doubled or trailing dot."
+            return $result
+        }
+        if ($label.Length -gt 63) {
+            $result.Reason = "'$label' is longer than the 63 characters a hostname part allows."
+            return $result
+        }
+        if ($label -notmatch '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$') {
+            $result.Reason = "'$label' is not a valid hostname part - use letters, digits and hyphens, not starting or ending with a hyphen."
+            return $result
+        }
+    }
+
+    $result.IsValid = $true
+    return $result
+}
+
+function Read-DeltaHostName {
+    <#
+      Asks for the name users will reach DELTA by, defaulting to localhost.
+
+      The default is the point of the prompt. An administrator should be able
+      to install DELTA on a machine, press Enter, and immediately try it from
+      that machine - without owning a DNS name, and without the installer
+      pretending it needs one. A real hostname is accepted just as readily and
+      then drives NGINX, PUBLIC_URL, the certificate subject when one is
+      generated, and the access guide.
+    #>
+    param(
+        [string]$Current,
+        [string]$Default = 'localhost'
+    )
+
+    $shown = if ($Current) { $Current } else { $Default }
+
+    Write-Host ''
+    Write-Host 'Hostname or domain'
+    Write-Detail 'The name people will use to reach DELTA in a browser. Press Enter to keep'
+    Write-Detail "'$shown', which is right for installing and testing on this machine."
+    Write-Detail 'A name does not have to resolve in DNS yet - nothing here looks it up.'
+    Write-Host ''
+
+    while ($true) {
+        $answer = ([string](Read-Host -Prompt "Hostname/domain [$shown]")).Trim()
+        if (-not $answer) { return $shown }
+
+        $check = Test-DeltaHostName -Value $answer
+        if ($check.IsValid) { return $answer }
+        Write-DeltaWarning $check.Reason
+    }
+}
+
+function Read-DeltaInstallPassword {
+    <#
+      A credential the administrator may either choose or delegate.
+
+      Bare Enter means "generate a strong one", which is what makes this a
+      convenience rather than an interrogation: the installer creates both the
+      PostgreSQL cluster and the DELTA administrator account, so it does not
+      need to be *told* either password - it offers the choice to an operator
+      who wants one they can use elsewhere.
+
+      A typed password is entered twice and must match. Nothing is echoed, and
+      the value is returned as a SecureString so it is converted to plain text
+      only at the single point it is used.
+
+      Returns the SecureString plus whether it was generated, because the
+      completion summary has to show a generated credential exactly once and
+      must never show one the operator chose and already knows.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [string[]]$Explanation = @(),
+        [int]$GeneratedLength = 24,
+        [int]$MinimumLength = 8
+    )
+
+    Write-Host ''
+    Write-Host $Title
+    foreach ($line in $Explanation) { Write-Detail $line }
+    Write-Detail 'Press Enter to have a strong one generated for you.'
+    Write-Host ''
+
+    while ($true) {
+        $first = Read-Host -Prompt "$Prompt [Enter = generate]" -AsSecureString
+        $plainFirst = ConvertTo-DeltaPlainText -SecureString $first
+        try {
+            if ($plainFirst.Length -eq 0) {
+                $generated = New-DeltaPassword -Length $GeneratedLength
+                try {
+                    Register-DeltaSecretValue -Value $generated
+                    Write-Detail 'A strong password will be generated.'
+                    return [PSCustomObject]@{
+                        Password     = (ConvertTo-SecureString -String $generated -AsPlainText -Force)
+                        WasGenerated = $true
+                    }
+                }
+                finally { $generated = $null }
+            }
+
+            if ($plainFirst.Length -lt $MinimumLength) {
+                Write-DeltaWarning "Use at least $MinimumLength characters, or press Enter to have one generated."
+                continue
+            }
+            # The one shape .env cannot represent, refused while it can still
+            # be retyped rather than silently mangled later.
+            if ($plainFirst.Contains('"') -and $plainFirst.Contains("'")) {
+                Write-DeltaWarning 'A password cannot contain both single and double quotes.'
+                continue
+            }
+
+            $second = Read-Host -Prompt 'Confirm' -AsSecureString
+            $plainSecond = ConvertTo-DeltaPlainText -SecureString $second
+            try {
+                if ($plainFirst -cne $plainSecond) {
+                    Write-DeltaWarning 'The two entries did not match. Try again.'
+                    continue
+                }
+            }
+            finally { $plainSecond = $null }
+
+            Register-DeltaSecretValue -Value $plainFirst
+            return [PSCustomObject]@{ Password = $first; WasGenerated = $false }
+        }
+        finally { $plainFirst = $null }
+    }
+}
+
+function Read-DeltaFreshInstallSettings {
+    <#
+      The Installation settings step: everything the administrator is asked
+      before the installer starts doing slow or irreversible work.
+
+      What is asked depends on what the installation already has, which is what
+      keeps a rerun quiet and a -Reconfigure honest:
+
+        hostname            always offered, current value as the default
+        database password   only when there is not one yet. Changing it later
+                            does not change what the cluster expects, so
+                            re-asking on a rerun would be offering a foot-gun
+                            (A§7.5)
+        administrator        only when the security bootstrap has not already
+                            completed, so a rerun never silently replaces a
+                            credential somebody is using
+
+      In a non-interactive run nothing is asked and nothing is invented beyond
+      the generation the project has always done: the .env template ships
+      __GENERATE__ for the database password and Phase 5 generates the
+      administrator credential when it cannot prompt. That is pre-existing,
+      documented behaviour, not a default introduced to dodge a question.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [bool]$AllowPrompt = $true,
+        [string]$HostName
+    )
+
+    $result = [PSCustomObject]@{
+        HostName                 = $null
+        PostgresPassword         = $null
+        AdminPassword            = $null
+        AdminPasswordWasGenerated = $false
+        AskedHostName            = $false
+        AskedPostgresPassword    = $false
+        AskedAdminPassword       = $false
+    }
+
+    $envPath = Join-Path -Path $InstallRoot -ChildPath '.env'
+    $existingHost = Get-DeltaEnvValue -Path $envPath -Key 'DELTA_HOSTNAME'
+    $existingPostgres = Get-DeltaEnvValue -Path $envPath -Key 'POSTGRES_PASSWORD'
+    $needsPostgres = ([string]::IsNullOrWhiteSpace($existingPostgres) -or $existingPostgres -eq '__GENERATE__')
+
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $alreadyBootstrapped = $false
+    if ($state.Exists -and $state.IsValid -and (@($state.Data.PSObject.Properties.Name) -contains 'adminBootstrap')) {
+        $alreadyBootstrapped = [bool]$state.Data.adminBootstrap.completed
+    }
+
+    # A hostname supplied on the command line is an answer, not a default.
+    if ($HostName) { $result.HostName = $HostName }
+
+    if (-not $AllowPrompt) {
+        if (-not $result.HostName) {
+            $result.HostName = if ($existingHost) { $existingHost } else { 'localhost' }
+        }
+        return $result
+    }
+
+    if (-not $result.HostName -or $needsPostgres -or -not $alreadyBootstrapped) {
+        Show-Section -Title 'Installation settings'
+        Write-Host 'A few things only you can tell the installer. Everything else is detected or'
+        Write-Host 'generated, and nothing below needs a file prepared in advance.'
+    }
+
+    if (-not $result.HostName) {
+        $result.HostName = Read-DeltaHostName -Current $existingHost
+        $result.AskedHostName = $true
+    }
+
+    if ($needsPostgres) {
+        $answer = Read-DeltaInstallPassword -Title 'Database password' `
+            -Prompt 'Database password' `
+            -Explanation @(
+                'The installer creates the PostgreSQL database for DELTA and sets this password'
+                'on it. Nothing outside this machine can reach that database - it is never'
+                'published to the network - so a generated password is a perfectly good answer.'
+                'Choose your own if you want to connect with other tooling.'
+            ) -GeneratedLength 32
+        $result.PostgresPassword = $answer.Password
+        $result.AskedPostgresPassword = $true
+    }
+
+    if (-not $alreadyBootstrapped) {
+        $answer = Read-DeltaInstallPassword -Title 'DELTA administrator password' `
+            -Prompt 'Administrator password' `
+            -Explanation @(
+                'The password for signing in to DELTA as admin@admin.com. The image ships a'
+                'publicly known default, so the installer always replaces it before DELTA is'
+                'reachable. A generated one is shown once at the end.'
+            ) -GeneratedLength 20
+        $result.AdminPassword = $answer.Password
+        $result.AdminPasswordWasGenerated = $answer.WasGenerated
+        $result.AskedAdminPassword = $true
+    }
+
+    return $result
+}
