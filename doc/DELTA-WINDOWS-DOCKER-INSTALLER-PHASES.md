@@ -991,7 +991,7 @@ Get-Content C:\DELTA\uploads\... ; docker compose ps   # uploads and data intact
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · commit `84e5545` · **Acceptance gate: met**, with one limitation stated plainly: a *genuinely different* DELTA image does not exist to update to (see below). 99/99 Phase 9 assertions pass against the operator's live installation at `C:\DELTA`.
+**Status: COMPLETE** · 2026-08-20 · commit `59a7c77` · **Acceptance gate: met**, with one limitation stated plainly: a *genuinely different* DELTA image does not exist to update to (see below). 99/99 Phase 9 assertions pass against the operator's live installation at `C:\DELTA`.
 
 Delivered: the update section of `lib\Delta.Manage.ps1` (`Get-DeltaImageRepository`, `Get-DeltaRemoteImageDigest`, `Get-DeltaRunningImageIdentity`, `Test-DeltaUpdateAvailable`, `Show-DeltaUpdateConfirmation`, `Copy-DeltaEnvSnapshot`, `Update-DeltaNginxUpstream`, `Invoke-DeltaUpdate`, `Invoke-DeltaUpdateOperation`, the option-1 menu wiring); the update section of `README.md`.
 
