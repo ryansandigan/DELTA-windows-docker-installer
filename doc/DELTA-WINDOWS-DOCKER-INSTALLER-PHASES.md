@@ -1,10 +1,12 @@
 # DELTA Windows Docker Installer — Development Phasing Plan
 
-**Status:** Implemented. Phases 1–11 are built; each phase's *Implementation status* section below records what was demonstrated, when, and by which commit. Two phases remain **PARTIAL** by design — Phase 2 (the Docker-absent install path was never executed against a real installer) and Phase 6 (no real unattended reboot has been performed). Nothing else is outstanding.
+**Status:** Implemented. Phases 1–12 are built; each phase's *Implementation status* section below records what was demonstrated, when, and by which commit. Two phases remain **PARTIAL** by design — Phase 2 (the Docker-absent install path was never executed against a real installer) and Phase 6 (no real unattended reboot has been performed). Nothing else is outstanding.
 **Planning date:** 2026-08-19 · **Implementation completed:** 2026-08-21
 **Companion document:** `doc\DELTA-WINDOWS-DOCKER-INSTALLER-ASSESSMENT.md` — the technical source of truth.
 
-> **This installer has no uninstall workflow, by design.** There is no `uninstall.ps1`, no menu entry, and no removal command anywhere in the product. Removing an installation is a manual operator task. The one conditional mention of uninstall in the assessment (A§9.3, *"Uninstall — if implemented at all …"*) is a constraint on any future work, not a description of anything that exists.
+> **Uninstall exists as of Phase 12, and it preserves data by default.** `uninstall.ps1` removes the containers, the Compose network, the two scheduled tasks and the firewall rules, and keeps the database volume, uploads, backups, certificates and configuration; `setup.ps1` run afterwards rebuilds the runtime over them. Deleting the data is a second, separately confirmed mode that enumerates what it will destroy, offers a final verified backup written outside the installation root, and requires the word `DELETE` to be typed in full. It never removes Docker Desktop, WSL, or any other shared prerequisite.
+>
+> This supersedes the "no uninstall workflow" statement that stood here through Phase 11, which was accurate for Phase 11: the capability was deliberately out of scope then and was added under its own contract afterwards. The assessment's one conditional mention (A§9.3, *"Uninstall — if implemented at all — must require explicit typed confirmation and must offer a final backup first"*) is a **constraint that the implementation satisfies**.
 
 ---
 
@@ -52,11 +54,12 @@ Carried forward from the assessment without change:
 
 ### Project layout
 
-This was written as an *indicative* structure to be populated by the phases. It is reproduced below as the layout that actually resulted, with the differences noted — the split of configuration management into its own file, and the two standalone scripts the scheduled tasks run.
+This was written as an *indicative* structure to be populated by the phases. It is reproduced below as the layout that actually resulted, with the differences noted — the split of configuration management into its own file, the two standalone scripts the scheduled tasks run, and the Phase 12 uninstaller.
 
 ```text
 C:\Workspace\DELTA-windows-installer-docker\
 ├── setup.ps1                        single operator entry point (install + management)
+├── uninstall.ps1                    removal, preserving data by default (Phase 12)
 ├── start-delta.ps1                  run by the Phase 6 startup task; starts Docker, prechecks, brings the stack up
 ├── rotate-nginx-logs.ps1            run by the Phase 7 rotation task
 ├── lib\
@@ -66,7 +69,8 @@ C:\Workspace\DELTA-windows-installer-docker\
 │   ├── Delta.Stack.ps1              compose + nginx generation · digest pinning · lifecycle · health · migration verification
 │   ├── Delta.Network.ps1            port detection/resolution · TLS mode · certificate validation · URL construction · firewall
 │   ├── Delta.Manage.ps1             management menu · status · lifecycle · logs · backup · update · administrator reset primitive
-│   └── Delta.Configure.ps1          configuration management: SMTP · administrator reset entry · certificate replacement
+│   ├── Delta.Configure.ps1          configuration management: SMTP · administrator reset entry · certificate replacement
+│   └── Delta.Uninstall.ps1          ownership resolution · guarded compose down · removal primitives · preservation reporting
 ├── templates\
 │   ├── docker-compose.yml.template
 │   ├── env.template
@@ -76,7 +80,7 @@ C:\Workspace\DELTA-windows-installer-docker\
     └── DELTA-WINDOWS-DOCKER-INSTALLER-PHASES.md
 ```
 
-There is deliberately **no `uninstall.ps1`**. There is no `docs\` directory and no `CHANGELOG.md`; the per-phase implementation-status sections in this document are the change record.
+`uninstall.ps1` was added by Phase 12; through Phase 11 there was deliberately none. There is no `docs\` directory and no `CHANGELOG.md`; the per-phase implementation-status sections in this document are the change record.
 
 `Delta.Manage.ps1` will grow across Phases 7–10. Split it when it does — the natural seams are backup, update, and configuration management.
 
@@ -131,6 +135,7 @@ The assessment left five open items (A§26). **U2 has since been resolved and is
 | **10** | Configuration Management: SMTP, Certificates, Admin Reset | Remaining mutating menu operations | 7, 4, 5 | SMTP / cert / admin menu entries | SMTP applied by **recreation** and takes effect; cert replacement validated then reloaded; admin reset authenticates |
 | **10.5** | Fresh Install User-Flow Audit & Convenience Adjustments | A first-time administrator can install DELTA without preparing files or knowing Docker | 10 | up-front settings prompt | Hostname asked with `localhost` default; both credentials asked securely; ports silent unless genuinely occupied; SMTP not required to install |
 | **11** | Failure Handling, Idempotency & End-to-End Acceptance | The product meets A§27 in full | 6, 9, 10, 10.5 | failure taxonomy, regression pass | Every A§22 scenario produces its specified diagnostic; full A§27 checklist demonstrated on a clean host |
+| **12** | DELTA Uninstall & Removal | An administrator can remove DELTA without losing data, and can delete the data deliberately | 11 | `uninstall.ps1`, `Delta.Uninstall.ps1` | Preserve-data uninstall leaves the database recoverable and `setup.ps1` rebuilds over it with synthetic data intact; complete removal requires a typed `DELETE` and offers a verified backup outside the installation root; no unrelated resource is touched |
 
 > **Phase 10.5 was inserted deliberately after Phase 10 was complete and before Phase 11 began.** It is not a redefinition of Phase 11, whose scope below is unchanged. It exists because the first nine phases built the install flow from the *inside out* — each phase proving its own mechanism — and nobody had yet walked the whole thing as an administrator meeting DELTA for the first time. That audit found gaps that are invisible from the component tests (§ Phase 10.5).
 
@@ -1411,6 +1416,166 @@ docker compose ps --format json          # published ports on nginx only
 **Dependencies for next phase.** None — this is the release gate.
 
 **Documentation update.** Final `README.md` pass. Record the A§27 results and any U5 divergence. **Do not modify the assessment.**
+
+---
+
+### Phase 12 — DELTA Uninstall & Removal
+
+**Status: COMPLETE** · 2026-08-21 · commit `<recorded below>` · **Result: PASS.** 236 Phase 12 assertions and 351 regression assertions pass — 587 in total. Every item of the acceptance contract below was demonstrated physically, on isolated installations.
+
+**Goal.** A safe, administrator-friendly `uninstall.ps1` that removes DELTA's runnable Docker installation while preserving operator data by default, and that can — on a separate, explicitly confirmed choice — remove the data too.
+
+**Why this phase exists, given that Phase 11 said there is no uninstaller.** Phase 11's statement was accurate for Phase 11: no uninstall workflow existed, and its absence was deliberate scope, not an omission. This phase adds the capability as new work under its own contract. It does not reopen or redesign anything Phase 11 accepted.
+
+**The core principle.** *Uninstall DELTA* never means *delete DELTA's data.* The default run removes the runtime and leaves every byte of operator data recoverable. Destruction is a second, separate, unmistakably-labelled decision.
+
+#### The ownership model, established from the implementation
+
+An installation is identified by its **state file**, `<InstallRoot>\.delta-install.json`, and by the `.env` beside it. Nothing is removed because its name resembles "DELTA". Every removable resource derives its identity from one of these:
+
+| Resource | Identity comes from | Kind |
+|---|---|---|
+| Compose project | `composeProject` in the state file; `COMPOSE_PROJECT_NAME` in `.env` | Docker |
+| `delta`, `db`, `nginx` containers | membership of that Compose project, scoped by `-f <InstallRoot>\docker-compose.yml` | Docker |
+| Compose network `<project>_default` | created and removed by Compose with the project | Docker |
+| PostgreSQL data | **named volume**, `pgDataVolume` / `PGDATA_VOLUME` — declared with an explicit `name:` so it is *not* project-prefixed | Docker named volume |
+| uploads | `<InstallRoot>\uploads` | **bind mount** |
+| DELTA logs | `<InstallRoot>\logs\delta` | **bind mount** |
+| NGINX logs | `<InstallRoot>\logs\nginx` | **bind mount** |
+| NGINX config | `<InstallRoot>\nginx\conf.d` | **bind mount**, read-only |
+| certificates | `<InstallRoot>\certs` | **bind mount**, read-only |
+| backups | `<InstallRoot>\backups` | plain directory, not mounted |
+| installer transcripts | `<InstallRoot>\logs\installer` | plain directory |
+| `.env`, `docker-compose.yml`, `.delta-install.json` | `<InstallRoot>` | generated files |
+| startup task | `Get-DeltaStartupTaskName` → `DELTA (Docker) - <project> - Startup` | Scheduled task |
+| log-rotation task | `Get-DeltaLogRotationTaskName` → `DELTA (Docker) - <project> - NGINX log rotation` | Scheduled task |
+| firewall rules | `Get-DeltaFirewallRuleName` → `DELTA (Docker) - <project> - HTTP` / `- HTTPS`, **and** group `DELTA (Docker)` | Firewall rule |
+
+**Persistence is not one thing.** The database lives in a Docker named volume; everything else operators care about lives in bind-mounted or plain directories under the installation root. The two require completely different removal mechanics, and conflating them is the single easiest way to destroy data by accident.
+
+**Never touched, in either mode:** Docker Desktop, WSL/WSL2, Hyper-V, Windows optional features, Git, PowerShell, any other Compose project, any container/volume/network/task/rule not identified above. Docker Desktop is shared host infrastructure; the fact that `setup.ps1` can install it does not make it DELTA-owned state.
+
+#### Scope
+
+- `uninstall.ps1` at the repository root, sharing `lib\` and the existing conventions (elevation check, transcript, banner/step/detail output, exit-code constants).
+- Two modes, chosen from a menu: **preserve data** (default) and **complete removal**.
+- Reuse of existing primitives — task, firewall, state, configuration and backup — rather than reimplementation.
+
+**Explicit non-scope.** No removal of prerequisites. No `docker system prune`, `volume prune`, `container prune`, `network prune`. No name-pattern deletion. No repair or migration subsystem. No `-Force` switch that skips the destructive confirmation.
+
+#### Mode 1 — Uninstall and preserve data (the default)
+
+**Removes:** the three containers and the Compose network, via one project-scoped `docker compose down` **without** `-v`; the startup task; the log-rotation task; the HTTP and HTTPS firewall rules.
+
+**Preserves:** the `pgDataVolume` named volume with the entire database; `uploads\`; `backups\`; `certs\`; `logs\`; `.env` (with its restrictive ACL intact); `docker-compose.yml`; `nginx\conf.d\delta.conf`; and the installation root itself.
+
+**State.** `.delta-install.json` is **kept**, its `state` field moved from `installed` to `partial`, and an `uninstall` block added recording when, in which mode, what was removed and what was preserved. `partial` is the existing vocabulary for "evidence exists but the installation is not registered as complete", which is exactly true. Keeping the file is what lets a later `uninstall.ps1` still identify the Docker volume, and what lets `setup.ps1` reconstruct the runtime over the preserved data. **No state migration and no new schema version.**
+
+#### Mode 2 — Complete removal
+
+Everything in mode 1, plus the `pgDataVolume` named volume and the whole installation root.
+
+**Confirmation.** Before anything is removed, the exact resources are enumerated — volume name, install root, every directory with its size — and the operator must type **`DELETE`** in full. Bare Enter, `y`, `yes` and every other answer cancel. This is deliberately a different gesture from the project's ordinary `[y/N]` convention, so it cannot be answered out of habit.
+
+**Final backup.** Before destroying the volume, if the database is reachable the operator is offered a final verified backup produced by the **existing Phase 8 primitive** — no second `pg_dump` implementation. Because a backup written inside a directory that is about to be deleted is not protection, it is copied to a destination **outside the installation root** and verified there; the surviving path is reported. Declining is allowed, and is stated plainly as eliminating that recovery path.
+
+#### Behaviour that must hold
+
+- **Idempotent.** Already-absent is *reconciled*, not an error. A second run reports that there is no DELTA runtime installation and exits 0.
+- **Degraded states.** Stopped stack, missing containers, missing network, missing task, missing rule, missing files, an installation root whose state file is incomplete — all handled. Docker being unavailable does not prevent removing tasks, rules and files; it means the Docker-owned resources are honestly reported as **not removed**, and the state file is **kept** so they remain identifiable.
+- **Per-step outcomes.** Every step reports one of `Removed` / `Already absent` / `Preserved` / `Failed` / `Could not verify`. A run where a Docker-owned resource survives reports **PARTIAL**, never SUCCESS.
+- **No arbitrary path deletion.** An `-InstallRoot` that is not a registered DELTA installation is refused by `Test-DeltaInstallRootOwned` before any recursive delete.
+- **Honest wording.** "DELTA runtime removed. Preserved data remains at …" — never "completely removed" while anything remains.
+- **Secrets.** No password, secret, connection URI or key material printed. Preserved `.env` and `certs\` keep their ACLs.
+
+#### Acceptance contract
+
+| # | Criterion |
+|---|---|
+| A | Healthy isolated installation → preserve-data uninstall: containers and network gone, tasks and rules gone, volume present, `uploads\`/`backups\`/`certs\`/`.env` present, `.env` ACL unchanged, state `partial`. |
+| B | Re-running immediately reports everything already absent, changes nothing, exits 0. |
+| C | `setup.ps1` after a preserve-data uninstall rebuilds the runtime, and **synthetic data written before the uninstall is still readable afterwards** — proven by content, not by directory existence. |
+| D | Complete removal on an isolated installation deletes the volume and the install root, only after `DELETE` is typed. |
+| E | Cancelling at the mode menu, and answering the destructive prompt with anything but `DELETE`, both change nothing. |
+| F | Partially-removed installations reconcile rather than fail. |
+| G | With Docker unavailable, tasks/rules/files are still removed, Docker resources are reported as not removed, the state file is kept, and the result is PARTIAL. |
+| H | An unregistered `-InstallRoot` is refused and nothing is deleted. |
+| I | `apc-2026`, `deltaprobe-*` and every other unrelated container, volume, network, task and rule are byte-identical afterwards. |
+| J | After the mode-C reinstall, `/`, `/en/admin/login` and `/en/user/login` return 200 **and** report no configuration errors. |
+| K | No `-v`, `--volumes` or `prune` token reaches any Docker invocation; the one `down` call site is guarded by a function that refuses volume-removal flags. |
+| L | Phases 8–11 regression suites still pass; `setup.ps1`, management mode, backup, update and configuration are unchanged. |
+
+**Validation.** Isolated installations only. The operator's `C:\DELTA` is never a target for either mode.
+
+**Documentation update.** `README.md` gains an uninstall section covering both modes, exactly what each removes and preserves, and the reinstall path. The "What this installer does not do" section is corrected. The assessment is **not** rewritten — a note records that implementation now supersedes its original no-uninstall scope.
+
+#### Implementation status
+
+**What was built.** `uninstall.ps1` at the repository root and `lib\Delta.Uninstall.ps1` behind it, in the same shape as `setup.ps1`: the entry point owns elevation, the transcript, the mode decision and the closing report; the library owns identity, survey and the removal primitives, and prompts for nothing. `Unregister-DeltaLogRotationTask` was added to `Delta.Manage.ps1` — registration had always had a matching removal for the startup task and none for the rotation task, because until an uninstaller existed nothing ever needed to retire one. **That is the entire change to pre-existing product code.** Phases 1–11 are untouched.
+
+**One defect found and fixed during development, in Phase 12's own code.** The final backup was ordered with the other destructive steps, *after* `compose down`. `pg_dump` runs inside the db container, so every complete removal would have reported "the database container is not running, so no final backup can be taken" — the safety net failing silently in exactly the situation it exists for. The backup now runs first, before anything is removed, and the reason is recorded in `Invoke-DeltaUninstall`'s header so the ordering is not "tidied" back later.
+
+**The ownership model, and why nothing is matched by name.** Identity comes from `.delta-install.json`, with `.env` as a secondary source for the two identifiers that appear in both; a disagreement between them is reported to the operator, and the state file wins because it is what previous runs acted on. Containers are found by `label=com.docker.compose.project`, not by name — a container called `delta12-db-1` created by something else carries no such label. Tasks and firewall rules use the installer's own name builders, and rules must additionally carry the installer's firewall group. An installation root with no readable state file is `Registered = $false` and nothing is deleted.
+
+**The `down` decision, measured rather than assumed.** `docker compose down` without `-v` removes the project's containers and its default network, leaves the named volume (declared with an explicit `name:`, so Compose manages it and only `-v` deletes it), and cannot touch a bind mount, because a bind mount is a host directory Docker never owned. That is exactly the preservation boundary, so `down` is used rather than a stop/rm/network-rm sequence — and it was verified by measurement, not by reading: the volume, `uploads\`, `backups\`, `certs\`, `logs\` and every generated file survive it.
+
+Because `-v` is one keystroke from correct, `Invoke-DeltaComposeDown` is the single call site in the product and it **inspects its own argument vector**, refusing `-v`, `--volumes` and `--volume` before invoking Compose. The guard was tested by passing each flag: all refused, exit `-1`, the volume still present and the stack still running afterwards. A comment saying "never pass `-v`" would not have failed a test.
+
+**Preservation and removal, exactly**
+
+| | Mode 1 — preserve data (default) | Mode 2 — complete removal |
+|---|---|---|
+| containers, project network | removed | removed |
+| startup task, rotation task | removed | removed |
+| HTTP / HTTPS firewall rules | removed | removed |
+| PostgreSQL data volume | **preserved** | deleted |
+| `uploads\`, `backups\`, `certs\`, `logs\`, `nginx\` | **preserved** | deleted |
+| `.env` (ACL untouched), `docker-compose.yml` | **preserved** | deleted |
+| installation root | **preserved** | deleted |
+| `.delta-install.json` | **kept**, `state` → `partial`, `uninstall` record added | deleted with the root |
+| Docker Desktop, WSL, Hyper-V, features, Git, PowerShell | never touched | never touched |
+
+**State handling.** `state` moves `installed` → `partial` and an `uninstall` block records the time, the mode, what was removed, what was preserved and what could not be resolved. `partial` is the existing vocabulary — "evidence exists but the installation is not registered as complete" — which after a preserve-data uninstall is precisely true, and it produces the behaviour an operator wants from `setup.ps1`, which opens the menu for `installed` and runs the install flow for anything else. A menu offering to restart containers that no longer exist would be worse than useless. **No schema-version change and no migration**; `pgDataVolume` and `composeProject` are deliberately retained, because they are what a later run needs to find the preserved database.
+
+**Confirmation.** Complete removal enumerates the volume by name and every directory with its size and file count, then requires **`DELETE`** typed in full — case-sensitive, compared with `-ceq`. Tested against `''`, `y`, `yes`, `Y`, `delete`, `Delete`, `DELETE ME` and `DELET`: all eight cancel, and after each one the volume, the installation root and every file are unchanged. This is deliberately a different gesture from the project's ordinary `[y/N]`, because an operator who has already pressed `y` four times will press it a fifth. There is no `-Force`. The non-interactive equivalent is `-ConfirmDataDeletion`, named so it cannot be added to a command line absent-mindedly, and it does not bypass the ownership checks.
+
+**The final backup actually outlives the installation.** It is Phase 8's `New-DeltaDatabaseBackup` — no second `pg_dump` — taken with `-SkipRetention`, then copied **outside** the installation root and re-verified in its new location. Proven end to end: after the root was deleted the exported file still existed, began with the `PGDMP` magic, and was restored into a scratch database where the synthetic row and all 42 tables came back. A "safety backup" inside the directory about to be deleted is theatre, and the code refuses to leave one there.
+
+**Validation** — 236 Phase 12 assertions, 351 regression, all passing. Isolated installations only; the operator's `C:\DELTA` was never a target of either mode.
+
+| Suite | Result |
+|---|---|
+| Part A — guard, reconnaissance, preserve-data uninstall, idempotency, reinstall | 81/81 |
+| Part B — static invariants, cancellation, refusals, degraded states, complete removal | 125/125 |
+| Part C — the non-interactive contract exactly as documented | 30/30 |
+| Regression — Phase 8 (96), Phase 9 (99), Phase 10/10.5/11 (156) | 351/351 |
+
+- **Data survival is proven by content, not by directory existence.** A row `p12_survival`, a file in `uploads\`, and a verified dump were planted before the uninstall. After preserve-data uninstall **and** `setup.ps1` reinstall, the row read back identical, the upload was byte-identical, the schema still had 42 public tables, and the **administrator credential hash was unchanged** — proving the reinstall reused the database rather than bootstrapping a new one. Repeated over a second uninstall/reinstall cycle, and again over the non-interactive path.
+- **Application health after reinstall**, not HTTP 200: `/`, `/en/admin/login` and `/en/user/login` each returned 200 **and** an empty `configErrors` payload.
+- **Idempotency.** A second run reports the runtime already uninstalled, asks nothing, writes nothing — the state file was byte-identical afterwards — and exits 0. A run against a completely removed installation reports that nothing is installed and exits 0. Neither produces a stack trace.
+- **Partial reconciliation.** After a degraded run left the containers up and the tasks and rules gone, a rerun finished the job: it did **not** claim the runtime was already gone, it reported already-absent resources as reconciled rather than failed, and it removed what remained.
+- **Docker unavailable.** Exercised through the real code path, not a simulated CLI. Both scheduled tasks and the firewall rule were still removed; the containers and volume were reported **"could not verify"** and left untouched; the state file was **kept** so they stay identifiable; the result was **PARTIAL**, and the record named what was unresolved.
+- **Refusals.** A populated non-DELTA directory is not registered, `uninstall.ps1` exits 0 saying so, and nothing in it is deleted. `Remove-DeltaInstallationTree` refuses an unregistered target independently of the entry point — the guard sits where the recursive delete is — and refuses a drive root outright even when handed an object claiming to be registered.
+- **Static invariants.** No `prune` token in any Docker argument vector anywhere. The `down` token appears exactly once, in `Delta.Uninstall.ps1`. No volume-removal flag shares an argument array with `down`, and every `-v` in the product is a `docker run` **mount**. Exactly one `docker volume rm` call site. The uninstaller contains no prerequisite-removal command of any kind — no `msiexec`, no `Disable-WindowsOptionalFeature`, no `wsl --unregister`.
+- **Blast radius.** `apc-2026`, `deltaprobe-delta-1`, `deltaprobe-postgres-1` and the operator's three containers are identity-unchanged after every mode, including complete removal. The operator's `.env`, state file, `delta_pgdata` volume, scheduled tasks and the host image list are unchanged. Every unrelated network survived.
+- **Secrets.** No password, secret, key name or connection URI appears in any uninstall transcript or in anything the uninstaller printed. Preserved `.env` keeps its Administrators + SYSTEM ACL — verified byte-for-byte and ACL-for-ACL, because the file is never touched at all.
+- **PowerShell 5.1.** 12/12 scripts parse under the 5.1 parser and carry the UTF-8 BOM.
+
+**Four harness defects, none of them product defects.** Two were the same case-insensitivity trap this project keeps meeting: `'-v' -ne '-V'` is **false** in PowerShell, so the first run of the guard test silently skipped the one flag that matters — the identical fault to Phase 10.5's `$PostgresPassword` collision and Phase 11's `$vol`/`$VOL`. A path test used a substring instead of path containment, so an export directory named `delta-p12-final-backup` counted as being *inside* `delta-p12`. And two suites asserted the presence of a log-rotation task on an installation that had never opened Management Mode — which is where that task is registered (Phase 7 behaviour, unchanged by this phase).
+
+**Three stale assertions from earlier phases, updated rather than deleted.** Phases 8, 9 and 11 each asserted that no `down` or `docker volume rm` token existed anywhere in the product. Phase 12 makes both legitimate, once each and guarded, so the assertions were **narrowed to what they were always protecting** — that no backup, update or management path can reach either — and the replacement in Part B is stronger than what it replaced: it is an AST check that no volume flag can share an argument array with `down`, which survives a future `docker run -v` being added. One of the three was additionally a weak regex that filtered comments with `^\s*#` and therefore could not see inside `<# #>` blocks; it had been counting two doc-comment sentences *about never using `down -v`* as uses of it. It is now tokenizer-based.
+
+**Two fixtures were rebuilt, not worked around.** Phase 11's cleanup had removed `C:\Workspace\delta-p11`, so its certificate and administrator suites had no installation to run against and produced no result. Rebuilding the fixture was the honest fix; rewriting the tests to fit whatever happened to exist was not. Both then passed unmodified (47/47, 25/25).
+
+**Limitations**
+
+1. **Multi-installation removal is untested at scale.** Every ownership decision is scoped by Compose project, and two installations were live throughout every test, but a host with several *registered DELTA* installations being uninstalled one at a time was not exercised.
+2. **`docker volume rm` refusing because something else still mounts the volume** is handled and reported rather than forced, but was not provoked — Compose had already removed the only containers using it.
+3. **A corrupt state file** is refused with its parse error, which is correct, but that leaves the Docker resources identifiable only by hand. There is deliberately no repair path; inventing one would mean guessing at what an unreadable record meant.
+4. **The rotation task is registered by Management Mode, not by installation.** Unchanged by this phase and out of its scope, but it means a never-managed installation has no rotation task to remove — which is correct, and is why the suites now assert it explicitly.
+5. **Windows Firewall under central policy.** A rule that cannot be removed is reported by name rather than retried; a domain-managed host was not available to test that path.
+
+**Dependencies for next phase.** None. This is an additive capability on top of the Phase 11 release gate.
 
 ---
 

@@ -1712,6 +1712,35 @@ function Sync-DeltaLogRotationTask {
     return $result
 }
 
+function Unregister-DeltaLogRotationTask {
+    <#
+      Removes this installation's rotation task, and only that one - the exact
+      counterpart of Unregister-DeltaStartupTask, matched by the exact name
+      built from this installation's own Compose project, and bracket-escaped
+      for the same reason the readers are: -TaskName is a wildcard filter and
+      these names contain brackets.
+
+      Added for Phase 12. Registration has always had a matching removal for
+      the startup task; the rotation task had none, because until an
+      uninstaller existed nothing ever needed to retire one.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectName)
+
+    $name = Get-DeltaLogRotationTaskName -ProjectName $ProjectName
+    $state = Get-DeltaLogRotationTaskState -ProjectName $ProjectName
+    if (-not $state.Exists) {
+        return [PSCustomObject]@{ Name = $name; Removed = $false; Reason = 'No such task.' }
+    }
+
+    try {
+        Unregister-ScheduledTask -TaskName ([System.Management.Automation.WildcardPattern]::Escape($name)) -Confirm:$false -ErrorAction Stop
+        return [PSCustomObject]@{ Name = $name; Removed = $true; Reason = $null }
+    }
+    catch {
+        return [PSCustomObject]@{ Name = $name; Removed = $false; Reason = $_.Exception.Message }
+    }
+}
+
 function Initialize-DeltaLogRotation {
     <#
       Makes sure this installation has its rotation task, and records what was
