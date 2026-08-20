@@ -889,7 +889,7 @@ docker compose start delta
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-20 · **Acceptance gate: met.** All thirteen acceptance items were demonstrated physically against the operator's live installation at `C:\DELTA` (project `delta`, volume `delta_pgdata`, HTTP 80). 62/62 Phase 8 assertions pass.
+**Status: COMPLETE** · 2026-08-20 · commit `0b8d6b8` · **Acceptance gate: met.** All thirteen acceptance items were demonstrated physically against the operator's live installation at `C:\DELTA` (project `delta`, volume `delta_pgdata`, HTTP 80). 62/62 Phase 8 assertions pass.
 
 Delivered: the database-backup section of `lib\Delta.Manage.ps1` (`Format-DeltaByteSize`, `Get-DeltaBackupDirectory`, `Get-DeltaBackupFile`, `Test-DeltaBackupArchive`, `Invoke-DeltaBackupRetention`, `New-DeltaDatabaseBackup`, `Remove-DeltaFailedBackup`, `Invoke-DeltaBackupOperation`, the option-2 menu wiring and a backups row in the status block); the byte-exact process seams `Invoke-DeltaProcessBinaryStream` and `Invoke-DeltaDockerBinaryStream` in `lib\Delta.Docker.ps1`; `Get-DeltaComposeArguments` and `Invoke-DeltaComposeBinary` in `lib\Delta.Stack.ps1`; the backup and manual-restore sections of `README.md`.
 
