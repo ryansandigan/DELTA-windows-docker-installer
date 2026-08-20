@@ -1361,7 +1361,7 @@ docker compose ps --format json          # published ports on nginx only
 
 #### Implementation status
 
-**Status: COMPLETE** · 2026-08-21 · commit `<recorded below>` · **Result: PASS WITH FOLLOW-UP ITEMS.** 402/402 assertions pass. Two limitations remain, both genuinely requiring an operator or an environment that does not exist yet, and both left explicit rather than simulated away.
+**Status: COMPLETE** · 2026-08-21 · commit `1cd2451` · **Result: PASS WITH FOLLOW-UP ITEMS.** 402/402 assertions pass. Two limitations remain, both genuinely requiring an operator or an environment that does not exist yet, and both left explicit rather than simulated away.
 
 **What this phase did.** It exercised the product as one thing rather than as twelve phases: a fresh install driven through the real `setup.ps1`, its rerun and `-Reconfigure` behaviour, every management-mode entry in one session, a failure matrix, idempotency of the operations an administrator repeats, and a blast-radius audit — then re-ran every earlier phase's suite against the result.
 
