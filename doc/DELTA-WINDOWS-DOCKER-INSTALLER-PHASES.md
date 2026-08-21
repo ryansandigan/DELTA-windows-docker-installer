@@ -1818,6 +1818,42 @@ The unit suite gained a **real GUI test**: it launches an STA PowerShell, calls 
 
 **One harness fault, the third of its kind here.** `Select-DeltaSslFile`'s doc comment explains *why* it does not call `Stop-Setup`, and a raw-text "never calls Stop-Setup" grep matched the explanation. Strip the comment first — the same fix as the previous two.
 
+#### Follow-up — promoting a certificate-covered domain
+
+**2026-08-21, same day.** The primary-domain refusal was correct and stayed correct, but it was a dead end: an operator installing on `localhost` and then being handed a certificate for `delta.ncscm.gov.jo` was told what was wrong and sent to a different menu to fix it. The refusal now comes with an offer.
+
+When the gate refuses, the names already extracted from the certificate are filtered through `Test-DeltaDomainName` — Domain Management's rule, not a second one — and offered as primary domains. One candidate is a yes/no question; several are a numbered list, because a certificate carrying four SANs does not say which of them the installation should call itself. Wildcards, IPv6 literals and anything malformed are dropped rather than proposed: `*.example.org` is a real thing to find on a certificate and not a hostname DELTA can be reached at.
+
+**Every domain mutation goes through Domain Management's own functions.** `Invoke-DeltaDomainAdd` if the name is not configured yet, then `Invoke-DeltaDomainSetPrimary`, and `Invoke-DeltaDomainRemove` on the way back out. Certificate Management writes no domain record, builds no `server_name`, and touches `DELTA_HOSTNAME` nowhere — asserted statically.
+
+The certificate and key are **not** collected again. The remediation falls through to the acceptance path with the same resolved paths, so the file dialogs open exactly once however the question is answered.
+
+#### The ordering, and why the rollback is where it is
+
+The promotion runs **before** the TLS transaction, because everything that transaction generates is built from the primary domain. Each half is already transactional on its own — `Invoke-DeltaDomainSetPrimary` regenerates and validates NGINX and puts itself back if that fails — so the intermediate state is a consistent one: on an HTTP installation the site is briefly serving the new primary over HTTP, which is a state the installer supports.
+
+What that ordering costs is a rollback the TLS transaction cannot perform. `Set-DeltaTlsState` restores from a snapshot taken *after* the promotion, so a failure there returns `.env`, Compose, NGINX and the certificate to the promoted state and stops. The promotion is therefore reversed by its callers, with `Undo-DeltaCertificateDomainRemediation`, on three paths: the confirmation being declined, the transaction failing, and the re-checked gate somehow still refusing. A failed *Enable HTTPS* does not leave the installation renamed.
+
+#### One narrow extension to Domain Management
+
+`Invoke-DeltaDomainSetPrimary` gained an optional `-CoverageCertificatePath`, threaded to `Get-DeltaDomainCertificateState`. The HTTPS invariant is unchanged — an HTTPS `PUBLIC_URL` must not point at a hostname the certificate serving it cannot validate — but during promote-then-install the certificate that will be serving it is the staged one. Without this, *Replace Certificate* could never promote: the outgoing certificate does not cover the incoming certificate's domain, by construction. Nothing else passes the parameter, so the ordinary path still judges against what is installed.
+
+#### Validation after the promotion offer — 971/971
+
+| Suite | |
+|---|---|
+| Certificate promotion (**new**) | 88/88 |
+| Certificate unit | 132/132 |
+| Certificate regression | 150/150 |
+| Certificate lifecycle (§30) | 119/119 |
+| Certificate failure matrix (§23) | 109/109 |
+| Domain Management (4 suites) | 122 + 128 + 42 + 81 |
+
+The new suite runs against a disposable installation (`C:\Workspace\delta-cert-promote`, project `deltapromote`, ports 8093/8455) and covers: the offer computed from the certificate rather than guessed; an unconfigured name offered and marked as needing adding; the configured one offered first; wildcard, IPv6, path, port and malformed names never offered; the current primary never offered as a change; **declining changes nothing** and still produces the original refusal; **no answer and no prompt still refuses**, which is what every other suite relies on; accepting an already-configured domain promotes it, keeps `localhost` as additional, moves `PUBLIC_URL`, leads `server_name` with it, and serves **the certificate that was selected**; the container's own `printenv PUBLIC_URL` agrees; an unconfigured domain is added, promoted and continues; a multi-SAN certificate honours the **chosen** name rather than the first; a name outside the certificate is refused; a certificate that already covers the primary produces **no remediation at all**; *Replace Certificate* promotes too; and a deliberate template fault after the promotion rolls the primary back to `localhost`, removes the added domain, restores the domain set exactly, and leaves the site answering.
+
+**One pre-existing defect found and deliberately not fixed.** `Set-DeltaTlsState` stages the certificate into `certs\` before `nginx -t` runs, and its rollback restores from `Backup-DeltaCertificateMaterial` — which has nothing to restore when the installation had no certificate to begin with. So a failed *Enable HTTPS* from a no-certificate state leaves the staged `delta.crt`/`delta.key` behind. They are inert: `TLS_ENABLED` is false, the generated NGINX has no `ssl_certificate`, Compose publishes no HTTPS port, and files sitting in `certs\` on an HTTP installation is exactly the state *Disable HTTPS* deliberately produces. It is unrelated to this change — it predates it and occurs with or without a promotion — and fixing it means touching the TLS transaction this task was told not to redesign. The promotion suite asserts what actually happens rather than hiding it either way. Worth raising before the next certificate task.
+
+
 
 ---
 

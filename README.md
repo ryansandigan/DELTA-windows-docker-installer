@@ -836,6 +836,61 @@ every browser reaching DELTA at its own canonical address gets a security
 warning. A certificate that does not cover the primary domain is not installed,
 and you are told what it *is* valid for.
 
+#### When the certificate names a different domain
+
+A certificate that validates perfectly but names a different host than your
+current primary domain is usually not a mistake — it is the right certificate
+arriving before the domain has been made primary. Installing DELTA on
+`localhost` and then being handed a certificate for `delta.ncscm.gov.jo` is the
+ordinary way this happens.
+
+The refusal above still stands. What you are offered next is the chance to
+change the thing that makes it a refusal, using the names the certificate
+already carries:
+
+```
+The certificate does not cover the current primary domain:
+
+    localhost
+
+The certificate is valid for:
+
+    delta.ncscm.gov.jo
+
+Would you like to use delta.ncscm.gov.jo as the primary domain?
+
+  1. Yes - Make it the primary domain and continue
+  2. No  - Keep the current primary domain
+
+Selection:
+```
+
+Answer **Yes** and the installer, through Domain Management's own operations:
+
+1. adds the domain to the configured set if it is not there already;
+2. makes it the primary domain, keeping the previous primary (`localhost` here)
+   as an additional domain, so links using it keep working;
+3. **reuses the certificate and key you already chose** — the file dialogs do
+   not open a second time;
+4. carries on with the HTTPS transaction exactly as it would have, so
+   `PUBLIC_URL`, the NGINX `server_name` and the published ports all end up
+   consistent with the new primary domain.
+
+Answer **No** and nothing changes: the certificate is refused exactly as it was
+before, and the primary domain is untouched.
+
+If the certificate carries **several** usable names, they are listed and you
+choose which one becomes primary — the installer does not pick the first SAN on
+your behalf. Only names that pass DELTA's ordinary domain rules are offered, so
+a wildcard entry like `*.example.org` is never proposed as a primary domain, and
+neither is anything malformed.
+
+> **If anything fails afterwards, the promotion is undone.** The domain change
+> is made before the HTTPS transaction it exists to enable, so if that
+> transaction fails the installer puts the primary domain back and removes a
+> domain it added only for this operation. A failed *Enable HTTPS* does not
+> leave the installation renamed.
+
 Uncovered **additional** domains are different: they are aliases, so an
 uncovered one warns and HTTPS still goes ahead for the correctly-covered
 primary. See [Managing domains](#managing-domains).
@@ -946,14 +1001,24 @@ Ownership is split and neither side reaches into the other:
 | **Domain Management** (8) | which hostnames exist, which one is primary — the *host* half of `PUBLIC_URL` |
 
 Adding or removing a domain never issues, replaces or deletes a certificate.
-Installing a certificate never adds, removes or re-designates a domain.
+Installing a certificate changes a domain **only** when you answer Yes to the
+offer described in
+[When the certificate names a different domain](#when-the-certificate-names-a-different-domain)
+— and when it does, it performs that change through Domain Management's own
+operations rather than writing the domain configuration itself. There is one
+implementation of adding and promoting a domain, and both menus use it.
 
 They meet at one invariant: **an HTTPS `PUBLIC_URL` must never knowingly point at
-a hostname the active certificate does not cover.** So on a TLS-enabled
+a hostname the certificate serving it does not cover.** So on a TLS-enabled
 installation, *Set Primary Domain* **refuses** to promote a domain the
 certificate demonstrably does not cover, and tells you to install a covering
 certificate first. The domain stays configured as an additional domain
 meanwhile, so NGINX still answers to it.
+
+The promotion offer satisfies the same invariant from the other direction —
+it only ever proposes domains the certificate being installed *does* cover, and
+the coverage is judged against that incoming certificate rather than the
+outgoing one.
 
 #### Firewall
 

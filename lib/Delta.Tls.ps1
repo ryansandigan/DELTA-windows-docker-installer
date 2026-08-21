@@ -1020,16 +1020,35 @@ function Get-DeltaCertificateForActivation {
       must be true before anything on the installation is touched.
 
       Returns a validated PEM pair plus the coverage verdict, or a named
-      reason. Nothing here writes into the live configuration: the staging
-      directory is this installer's own temporary path, and the operator's
-      source files are only ever read.
+      reason.
+
+      One thing here CAN write into the live configuration, and only with the
+      operator's explicit answer: when the certificate is valid but names a
+      different host than the current primary domain, the certificate's own
+      names are offered as primary domains and the chosen one is applied
+      through Domain Management. When that happens the refreshed domain model
+      is returned in DomainModel and a record of the change in Remediation, and
+      the caller must use both - the model because everything downstream is
+      built from the primary domain, and the record because a later failure has
+      to undo it.
+
+      Everything else is read-only: the staging directory is this installer's
+      own temporary path, and the operator's source files are only ever read.
+
+      -PrimaryDomainChoice pre-answers the remediation question instead of
+      asking: a domain name accepts that domain, 'decline' keeps the current
+      primary. It exists so the flow can be exercised without a console, and it
+      is the same injection the -Source parameter already provides for the
+      certificate itself.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
         [Parameter(Mandatory)][object]$Configuration,
         [Parameter(Mandatory)][object]$DomainModel,
         [Parameter(Mandatory)][string]$StagingDirectory,
         [object]$Source,
+        [string]$PrimaryDomainChoice,
         [bool]$AllowPrompt = $true,
         [bool]$OfferStaged = $false
     )
@@ -1043,6 +1062,8 @@ function Get-DeltaCertificateForActivation {
         TlsMode         = 'supplied'
         Validation      = $null
         Gate            = $null
+        DomainModel     = $DomainModel
+        Remediation     = $null
     }
 
     $pending = $Source
@@ -1116,32 +1137,98 @@ function Get-DeltaCertificateForActivation {
         if ($resolved.Validation.Warning) { Write-DeltaWarning $resolved.Validation.Warning }
 
         # --- the primary-domain gate ---------------------------------------
-        $gate = Test-DeltaCertificateActivation -CertificatePath $resolved.CertificatePath -DomainModel $DomainModel
+        $gate = Test-DeltaCertificateActivation -CertificatePath $resolved.CertificatePath -DomainModel $result.DomainModel
         $result.Gate = $gate
 
         if (-not $gate.Allowed) {
             Write-DeltaFailure ''
             Write-DeltaFailure 'The certificate was refused.'
             Write-Detail $gate.Reason
-            Write-Detail ''
-            Write-Detail "Either supply a certificate that covers $($DomainModel.Primary), or use Domain"
-            Write-Detail 'Management (menu option 8) to make a domain this certificate does cover the'
-            Write-Detail 'primary one.'
-            if (-not $AllowPrompt) { $result.Reason = $gate.Reason; return $result }
-            Write-Host ''
-            if (-not (Read-DeltaYesNoConfirmation -Body { Write-Host 'Try a different certificate?' })) {
-                $result.Cancelled = $true
-                $result.Reason = $gate.Reason
-                return $result
+
+            # --- offer the certificate's own names as the primary domain ----
+            # The refusal above stands. What follows is an offer to change the
+            # thing that makes it a refusal, using the names this certificate
+            # already carries - not a way around the check. If the operator
+            # declines, or there is nothing usable to offer, the refusal is
+            # exactly what it was before.
+            $candidates = @(Get-DeltaCertificateCandidateDomain -CertificateName $gate.Coverage.Names -DomainModel $result.DomainModel)
+            $chosenDomain = $null
+
+            if ($candidates.Count -gt 0) {
+                if ($PSBoundParameters.ContainsKey('PrimaryDomainChoice') -and $PrimaryDomainChoice) {
+                    if ($PrimaryDomainChoice -ne 'decline') {
+                        $normalized = ConvertTo-DeltaDomainName -Value $PrimaryDomainChoice
+                        if (@($candidates | ForEach-Object { $_.Domain }) -contains $normalized) { $chosenDomain = $normalized }
+                        else {
+                            $result.Reason = "$PrimaryDomainChoice is not one of the domains this certificate covers."
+                            return $result
+                        }
+                    }
+                }
+                elseif ($AllowPrompt) {
+                    $chosenDomain = Read-DeltaCertificatePrimaryDomainChoice -Candidate $candidates `
+                        -DomainModel $result.DomainModel -CertificateName $gate.Coverage.Names
+                }
             }
-            continue
+
+            if ($chosenDomain) {
+                $remediation = Invoke-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+                    -Configuration $Configuration -DomainModel $result.DomainModel `
+                    -Domain $chosenDomain -CertificatePath $resolved.CertificatePath
+                $result.Remediation = $remediation
+
+                if (-not $remediation.Succeeded) {
+                    Write-DeltaFailure ''
+                    Write-DeltaFailure $remediation.Reason
+                    Write-Detail 'The certificate was not installed.'
+                    $result.Reason = $remediation.Reason
+                    return $result
+                }
+
+                # Everything downstream is built from the primary domain, so the
+                # model is re-read rather than patched, and the gate is asked
+                # again against it - the promotion is not assumed to have made
+                # the certificate acceptable, it is checked.
+                $result.DomainModel = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
+                $gate = Test-DeltaCertificateActivation -CertificatePath $resolved.CertificatePath -DomainModel $result.DomainModel
+                $result.Gate = $gate
+
+                if (-not $gate.Allowed) {
+                    Write-DeltaFailure ''
+                    Write-DeltaFailure "The certificate still does not cover the primary domain after the change: $($gate.Reason)"
+                    $null = Undo-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Remediation $remediation
+                    $result.Remediation = $null
+                    $result.DomainModel = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
+                    $result.Reason = $gate.Reason
+                    return $result
+                }
+
+                Write-Success $remediation.Reason
+                # Falls through to the acceptance path below with the SAME
+                # certificate and key: the operator is never asked for the
+                # files a second time.
+            }
+            else {
+                Write-Detail ''
+                Write-Detail "Either supply a certificate that covers $($result.DomainModel.Primary), or use Domain"
+                Write-Detail 'Management (menu option 8) to make a domain this certificate does cover the'
+                Write-Detail 'primary one.'
+                if (-not $AllowPrompt) { $result.Reason = $gate.Reason; return $result }
+                Write-Host ''
+                if (-not (Read-DeltaYesNoConfirmation -Body { Write-Host 'Try a different certificate?' })) {
+                    $result.Cancelled = $true
+                    $result.Reason = $gate.Reason
+                    return $result
+                }
+                continue
+            }
         }
 
         if (-not $gate.PrimaryDetermined) {
             Write-DeltaWarning $gate.Reason
         }
         else {
-            Write-Detail "[ ok ]     covers the primary domain $($DomainModel.Primary)"
+            Write-Detail "[ ok ]     covers the primary domain $($result.DomainModel.Primary)"
             foreach ($uncovered in $gate.UncoveredAdditional) {
                 Write-DeltaWarning "The additional domain $uncovered is NOT covered by this certificate. NGINX will still serve it, and browsers reaching DELTA by it will warn."
             }
@@ -1152,6 +1239,263 @@ function Get-DeltaCertificateForActivation {
         $result.Succeeded       = $true
         return $result
     }
+}
+
+# ---------------------------------------------------------------------------
+# Primary-domain remediation
+#
+# A certificate that validates perfectly but names a different host than the
+# current primary domain is not a broken certificate - it is very often a
+# correct certificate arriving before the domain has been made primary. The
+# gate above still refuses it, because PUBLIC_URL must not knowingly point at a
+# hostname the serving certificate cannot validate. What changes here is what
+# happens next: instead of sending the operator away to Domain Management and
+# back again, the names already extracted from the certificate are offered as
+# primary domains.
+#
+# Every domain mutation below goes through Domain Management's own functions.
+# There is no second implementation of adding or promoting a domain, and the
+# undo path uses the same three functions in reverse.
+# ---------------------------------------------------------------------------
+
+function Get-DeltaCertificateCandidateDomain {
+    <#
+      The certificate's own DNS names, filtered to those that could actually
+      become this installation's primary domain, in the order they should be
+      offered.
+
+      Filtered by Test-DeltaDomainName - Domain Management's rule, not a second
+      one - so a wildcard, an IPv6 literal or anything malformed is dropped
+      rather than promoted. A wildcard SAN is a real and common thing to find
+      on a certificate; it is not a hostname DELTA can be reached at, and
+      offering *.example.org as a primary domain would produce a PUBLIC_URL
+      nobody can type.
+
+      Already-configured domains come first. Promoting a domain the operator
+      has already declared is a smaller change than inventing one, so it is the
+      one offered first when both are available.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CertificateName,
+        [Parameter(Mandatory)][object]$DomainModel
+    )
+
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($name in $CertificateName) {
+        $check = Test-DeltaDomainName -Value $name
+        if (-not $check.IsValid) { continue }
+        if ($check.Normalized -eq $DomainModel.Primary) { continue }
+        if (-not $seen.Add($check.Normalized)) { continue }
+
+        $null = $candidates.Add([PSCustomObject]@{
+            Domain       = $check.Normalized
+            IsConfigured = ($DomainModel.All -contains $check.Normalized)
+        })
+    }
+
+    return @(@($candidates | Where-Object { $_.IsConfigured }) + @($candidates | Where-Object { -not $_.IsConfigured }))
+}
+
+function Read-DeltaCertificatePrimaryDomainChoice {
+    <#
+      Offers the certificate's usable names as primary domains, and returns the
+      chosen one or $null for "keep the current primary".
+
+      One candidate is offered as a yes/no question, because that is what it is.
+      Several are offered as a numbered list, because picking the first one on
+      the operator's behalf would be exactly the blind choice this is meant to
+      avoid - a certificate carrying four SANs does not say which of them the
+      installation should call itself.
+
+      There is no bare-Enter default, and Enter keeps the current primary: the
+      safe answer is the one that changes nothing.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Candidate,
+        [Parameter(Mandatory)][object]$DomainModel,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CertificateName
+    )
+
+    Write-Host ''
+    Write-Host 'The certificate does not cover the current primary domain:'
+    Write-Host ''
+    Write-Detail $DomainModel.Primary
+    Write-Host ''
+    Write-Host 'The certificate is valid for:'
+    Write-Host ''
+    foreach ($name in $CertificateName) { Write-Detail $name }
+    Write-Host ''
+
+    if ($Candidate.Count -eq 1) {
+        $only = $Candidate[0].Domain
+        Write-Host "Would you like to use $only as the primary domain?"
+        Write-Host ''
+        Write-Host "  1. Yes - Make it the primary domain and continue"
+        Write-Host "  2. No  - Keep the current primary domain"
+        Write-Host ''
+        while ($true) {
+            $choice = ([string](Read-Host -Prompt 'Selection')).Trim()
+            if ($choice -eq '1') { return $only }
+            if ($choice -eq '2' -or $choice -eq '0' -or $choice -eq '') { return $null }
+            Write-DeltaWarning "'$choice' is not a valid option."
+        }
+    }
+
+    Write-Host 'Which of them should become the primary domain?'
+    Write-Host ''
+    for ($i = 0; $i -lt $Candidate.Count; $i++) {
+        $suffix = if ($Candidate[$i].IsConfigured) { '   (already configured)' } else { '   (will be added)' }
+        Write-Host ("  {0}. {1}{2}" -f ($i + 1), $Candidate[$i].Domain, $suffix)
+    }
+    Write-Host ("  {0}. None - Keep the current primary domain ({1})" -f ($Candidate.Count + 1), $DomainModel.Primary)
+    Write-Host ''
+
+    while ($true) {
+        $choice = ([string](Read-Host -Prompt 'Selection')).Trim()
+        if ($choice -eq '' -or $choice -eq '0') { return $null }
+        $index = 0
+        if ([int]::TryParse($choice, [ref]$index)) {
+            if ($index -ge 1 -and $index -le $Candidate.Count) { return $Candidate[$index - 1].Domain }
+            if ($index -eq ($Candidate.Count + 1)) { return $null }
+        }
+        Write-DeltaWarning "'$choice' is not a valid option."
+    }
+}
+
+function Invoke-DeltaCertificateDomainRemediation {
+    <#
+      Makes a certificate-covered domain the primary one, through Domain
+      Management's own functions and nothing else.
+
+      Two steps, in this order, both of which are already transactional in
+      their own right: add the domain if it is not configured yet, then promote
+      it. Each regenerates and validates NGINX and puts itself back if that
+      fails, so there is no half-applied domain state to invent handling for -
+      what this function adds is a record of what it did, so the caller can
+      reverse it if the certificate transaction that follows fails.
+
+      -CoverageCertificatePath is passed to the promotion so the HTTPS
+      invariant is judged against the certificate that is about to serve the
+      URL. On an installation that is still HTTP the invariant does not apply
+      at all; on one already serving HTTPS the outgoing certificate would
+      otherwise refuse a promotion the incoming one makes correct.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][object]$Configuration,
+        [Parameter(Mandatory)][object]$DomainModel,
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][string]$CertificatePath
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded       = $false
+        Reason          = $null
+        Stage           = 'start'
+        Domain          = $Domain
+        PreviousPrimary = $DomainModel.Primary
+        DomainWasAdded  = $false
+        PromotionApplied = $false
+    }
+
+    # --- add, if it is not configured yet ---------------------------------
+    if ($DomainModel.All -notcontains $Domain) {
+        $result.Stage = 'add'
+        Write-Step "Adding $Domain to the configured domains"
+        $added = Invoke-DeltaDomainAdd -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+            -Configuration $Configuration -Model $DomainModel -Domain $Domain -AllowPrompt $false
+        if (-not $added.Succeeded) {
+            $result.Reason = "$Domain could not be added to the configured domains: $($added.Reason)"
+            return $result
+        }
+        $result.DomainWasAdded = $true
+    }
+
+    # --- promote ----------------------------------------------------------
+    $result.Stage = 'promote'
+    Write-Step "Making $Domain the primary domain"
+    $current = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
+    $promoted = Invoke-DeltaDomainSetPrimary -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+        -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot) -Model $current `
+        -Domain $Domain -CoverageCertificatePath $CertificatePath -AllowPrompt $false
+
+    if (-not $promoted.Succeeded) {
+        $result.Reason = "$Domain could not be made the primary domain: $($promoted.Reason)"
+        # The add, if there was one, is left in place deliberately: it is a
+        # configured domain the operator asked for and NGINX is already serving
+        # it. The caller's undo removes it if the whole operation is abandoned.
+        return $result
+    }
+    $result.PromotionApplied = -not ($promoted.PSObject.Properties.Name -contains 'NoOp' -and $promoted.NoOp)
+
+    $result.Stage = 'complete'
+    $result.Succeeded = $true
+    $result.Reason = "$Domain is now the primary domain."
+    return $result
+}
+
+function Undo-DeltaCertificateDomainRemediation {
+    <#
+      Puts the primary domain back the way it was, and removes a domain that
+      was added only for this operation.
+
+      Reached when the certificate transaction that the promotion was made for
+      subsequently fails. Without it a failed Enable HTTPS would leave the
+      installation renamed - the domain change would have survived the very
+      operation it was made to enable, which is the partial state the
+      transaction rules exist to prevent.
+
+      Same three Domain Management functions as the forward path, in reverse,
+      and each is transactional in its own right. It reports what it managed
+      rather than claiming success: a rollback that lies is worse than none.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][object]$Remediation
+    )
+
+    $result = [PSCustomObject]@{ PrimaryRestored = $false; DomainRemoved = $false; Reason = $null }
+    if (-not $Remediation -or -not $Remediation.Succeeded) { return $result }
+
+    Write-Step "Putting the primary domain back to $($Remediation.PreviousPrimary)"
+
+    if ($Remediation.PromotionApplied) {
+        $configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
+        $model = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $configuration
+        # No -CoverageCertificatePath: this is going back to the domain that was
+        # primary before, which the installed certificate already covered if it
+        # covered anything - the ordinary invariant is the right one here.
+        $back = Invoke-DeltaDomainSetPrimary -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+            -Configuration $configuration -Model $model -Domain $Remediation.PreviousPrimary -AllowPrompt $false
+        $result.PrimaryRestored = [bool]$back.Succeeded
+        if (-not $back.Succeeded) {
+            $result.Reason = "The primary domain could not be put back to $($Remediation.PreviousPrimary): $($back.Reason)"
+            return $result
+        }
+    }
+    else {
+        $result.PrimaryRestored = $true
+    }
+
+    if ($Remediation.DomainWasAdded) {
+        $configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
+        $model = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $configuration
+        $removed = Invoke-DeltaDomainRemove -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+            -Configuration $configuration -Model $model -Domain $Remediation.Domain -AllowPrompt $false
+        $result.DomainRemoved = [bool]$removed.Succeeded
+        if (-not $removed.Succeeded) {
+            $result.Reason = "$($Remediation.Domain) was added for this operation and could not be removed again: $($removed.Reason)"
+        }
+    }
+
+    if (-not $result.Reason) {
+        Write-Detail "The primary domain is $($Remediation.PreviousPrimary) again."
+    }
+    return $result
 }
 
 function New-DeltaCertificateStaging {
@@ -1208,6 +1552,7 @@ function Invoke-DeltaTlsEnable {
         [Parameter(Mandatory)][object]$Configuration,
         [Parameter(Mandatory)][object]$DomainModel,
         [object]$Source,
+        [string]$PrimaryDomainChoice,
         [int]$HttpsPort,
         [bool]$AllowPrompt = $true
     )
@@ -1233,11 +1578,26 @@ function Invoke-DeltaTlsEnable {
     $staging = $null
     try {
         $staging = New-DeltaCertificateStaging -InstallRoot $InstallRoot
-        $certificate = Get-DeltaCertificateForActivation -InstallRoot $InstallRoot -Configuration $Configuration `
-            -DomainModel $DomainModel -StagingDirectory $staging -Source $Source -AllowPrompt $AllowPrompt -OfferStaged $true
+        $activationArguments = @{
+            InstallRoot = $InstallRoot; ScriptRoot = $ScriptRoot; Configuration = $Configuration
+            DomainModel = $DomainModel; StagingDirectory = $staging; Source = $Source
+            AllowPrompt = $AllowPrompt; OfferStaged = $true
+        }
+        if ($PSBoundParameters.ContainsKey('PrimaryDomainChoice')) { $activationArguments['PrimaryDomainChoice'] = $PrimaryDomainChoice }
+        $certificate = Get-DeltaCertificateForActivation @activationArguments
         if (-not $certificate.Succeeded) {
             return [PSCustomObject]@{ Succeeded = $false; Cancelled = $certificate.Cancelled
                 Stage = $(if ($certificate.Cancelled) { 'cancelled' } else { 'certificate' }); Reason = $certificate.Reason }
+        }
+
+        # The primary domain may have just changed, at the operator's request,
+        # to one this certificate covers. Everything below is built from the
+        # refreshed model - the configuration is re-read for the same reason,
+        # because the promotion rewrote PUBLIC_URL in .env.
+        $remediation = $certificate.Remediation
+        $DomainModel = $certificate.DomainModel
+        if ($remediation -and $remediation.Succeeded) {
+            $Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
         }
 
         $newUrl = Get-DeltaPublicUrl -Scheme 'https' -HostName $DomainModel.Primary -Port $port.Port
@@ -1261,6 +1621,10 @@ function Invoke-DeltaTlsEnable {
                 Write-Host 'DELTA is returned to it.'
             }
             if (-not $confirmed) {
+                # The promotion happened before this question was asked, so
+                # declining here has to undo it - otherwise "nothing was
+                # changed" would be untrue.
+                $null = Undo-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Remediation $remediation
                 return [PSCustomObject]@{ Succeeded = $false; Cancelled = $true; Stage = 'cancelled'
                     Reason = 'Cancelled. HTTPS was not enabled and nothing was changed.' }
             }
@@ -1270,8 +1634,18 @@ function Invoke-DeltaTlsEnable {
             -EnableTls $true -DomainModel $DomainModel -TlsMode $certificate.TlsMode `
             -StagedCertificatePath $certificate.CertificatePath -StagedKeyPath $certificate.KeyPath -HttpsPort $port.Port
 
+        # A promotion made FOR this transaction must not outlive it failing.
+        # Set-DeltaTlsState has already put .env, Compose, NGINX and the
+        # certificate back from its own snapshot; the domain change was made
+        # before that snapshot was taken, so it is this function's to reverse.
+        if (-not $outcome.Succeeded -and $remediation -and $remediation.Succeeded) {
+            Add-Member -InputObject $outcome -NotePropertyName 'DomainRolledBack' `
+                -NotePropertyValue (Undo-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Remediation $remediation) -Force
+        }
+
         Add-Member -InputObject $outcome -NotePropertyName 'Cancelled' -NotePropertyValue $false -Force
         Add-Member -InputObject $outcome -NotePropertyName 'Gate' -NotePropertyValue $certificate.Gate -Force
+        Add-Member -InputObject $outcome -NotePropertyName 'Remediation' -NotePropertyValue $remediation -Force
         Add-Member -InputObject $outcome -NotePropertyName 'SelfSigned' -NotePropertyValue ($certificate.TlsMode -eq 'self-signed') -Force
         return $outcome
     }
@@ -1341,9 +1715,11 @@ function Invoke-DeltaCertificateReplace {
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
         [Parameter(Mandatory)][object]$Configuration,
         [Parameter(Mandatory)][object]$DomainModel,
         [object]$Source,
+        [string]$PrimaryDomainChoice,
         [bool]$AllowPrompt = $true
     )
 
@@ -1357,11 +1733,24 @@ function Invoke-DeltaCertificateReplace {
         $staging = New-DeltaCertificateStaging -InstallRoot $InstallRoot
         # -OfferStaged is deliberately off: "replace the certificate with the
         # certificate already installed" is not a replacement.
-        $certificate = Get-DeltaCertificateForActivation -InstallRoot $InstallRoot -Configuration $Configuration `
-            -DomainModel $DomainModel -StagingDirectory $staging -Source $Source -AllowPrompt $AllowPrompt -OfferStaged $false
+        $activationArguments = @{
+            InstallRoot = $InstallRoot; ScriptRoot = $ScriptRoot; Configuration = $Configuration
+            DomainModel = $DomainModel; StagingDirectory = $staging; Source = $Source
+            AllowPrompt = $AllowPrompt; OfferStaged = $false
+        }
+        if ($PSBoundParameters.ContainsKey('PrimaryDomainChoice')) { $activationArguments['PrimaryDomainChoice'] = $PrimaryDomainChoice }
+        $certificate = Get-DeltaCertificateForActivation @activationArguments
         if (-not $certificate.Succeeded) {
             return [PSCustomObject]@{ Succeeded = $false; Cancelled = $certificate.Cancelled
                 Stage = $(if ($certificate.Cancelled) { 'cancelled' } else { 'certificate' }); Reason = $certificate.Reason }
+        }
+
+        # A promotion rewrites PUBLIC_URL and regenerates NGINX, so the
+        # configuration this operation acts on is re-read rather than reused.
+        $remediation = $certificate.Remediation
+        $DomainModel = $certificate.DomainModel
+        if ($remediation -and $remediation.Succeeded) {
+            $Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
         }
 
         $current = Get-DeltaInstalledCertificate -InstallRoot $InstallRoot
@@ -1383,6 +1772,7 @@ function Invoke-DeltaCertificateReplace {
                 Write-Host 'the site does not go down.'
             }
             if (-not $confirmed) {
+                $null = Undo-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Remediation $remediation
                 return [PSCustomObject]@{ Succeeded = $false; Cancelled = $true; Stage = 'cancelled'
                     Reason = 'Cancelled. The certificate in use is unchanged.' }
             }
@@ -1391,8 +1781,16 @@ function Invoke-DeltaCertificateReplace {
         $outcome = Set-DeltaCertificateMaterial -InstallRoot $InstallRoot -Configuration $Configuration `
             -CertificatePath $certificate.CertificatePath -KeyPath $certificate.KeyPath -TlsMode $certificate.TlsMode
 
+        # The promotion was made so this replacement could happen. If it did
+        # not, the rename does not get to survive it.
+        if (-not $outcome.Succeeded -and $remediation -and $remediation.Succeeded) {
+            Add-Member -InputObject $outcome -NotePropertyName 'DomainRolledBack' `
+                -NotePropertyValue (Undo-DeltaCertificateDomainRemediation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Remediation $remediation) -Force
+        }
+
         Add-Member -InputObject $outcome -NotePropertyName 'Cancelled' -NotePropertyValue $false -Force
         Add-Member -InputObject $outcome -NotePropertyName 'Gate' -NotePropertyValue $certificate.Gate -Force
+        Add-Member -InputObject $outcome -NotePropertyName 'Remediation' -NotePropertyValue $remediation -Force
         Add-Member -InputObject $outcome -NotePropertyName 'SelfSigned' -NotePropertyValue ($certificate.TlsMode -eq 'self-signed') -Force
         return $outcome
     }
@@ -1522,6 +1920,13 @@ function Show-DeltaCertificateOutcome {
     if ($Outcome.Succeeded) {
         Write-Success $Outcome.Reason
 
+        if ($Outcome.PSObject.Properties.Name -contains 'Remediation' -and $Outcome.Remediation -and $Outcome.Remediation.Succeeded) {
+            Write-Detail "Primary domain       $($Outcome.Remediation.PreviousPrimary) -> $($Outcome.Remediation.Domain)"
+            if ($Outcome.Remediation.DomainWasAdded) {
+                Write-Detail "                     $($Outcome.Remediation.Domain) was added to the configured domains"
+            }
+            Write-Detail "                     $($Outcome.Remediation.PreviousPrimary) is kept as an additional domain"
+        }
         if ($Outcome.PSObject.Properties.Name -contains 'PublicUrl' -and $Outcome.PublicUrl) {
             Write-Detail "PUBLIC_URL           $($Outcome.PublicUrl)"
         }
@@ -1574,6 +1979,14 @@ function Show-DeltaCertificateOutcome {
     }
     if ($Outcome.PSObject.Properties.Name -contains 'Restored' -and $Outcome.Restored) {
         Write-Detail 'The previous certificate is back in place.'
+    }
+    if ($Outcome.PSObject.Properties.Name -contains 'DomainRolledBack' -and $Outcome.DomainRolledBack) {
+        if ($Outcome.DomainRolledBack.PrimaryRestored -and -not $Outcome.DomainRolledBack.Reason) {
+            Write-Detail "The primary domain was put back to $($Outcome.Remediation.PreviousPrimary)."
+        }
+        else {
+            Write-DeltaWarning "The primary domain could not be fully put back: $($Outcome.DomainRolledBack.Reason)"
+        }
     }
 }
 
@@ -1630,8 +2043,8 @@ function Invoke-DeltaCertificateManagement {
                 '' { $pause = $false }
                 '0' { return $configuration }
                 '1' {
-                    $outcome = Invoke-DeltaCertificateReplace -InstallRoot $InstallRoot -Configuration $configuration `
-                        -DomainModel $domainModel -AllowPrompt $AllowPrompt
+                    $outcome = Invoke-DeltaCertificateReplace -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot `
+                        -Configuration $configuration -DomainModel $domainModel -AllowPrompt $AllowPrompt
                     Show-DeltaCertificateOutcome -Outcome $outcome
                 }
                 '2' {

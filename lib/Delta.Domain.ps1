@@ -67,14 +67,27 @@ function Get-DeltaDomainCertificateState {
       coverage for one that does not exist would be inventing a problem. When
       TLS is on but the names cannot be read, Determined is false and the caller
       says so rather than claiming the domains are uncovered.
+
+      -CertificatePath judges coverage against a certificate that is about to be
+      installed instead of the one currently in certs\. The invariant is
+      unchanged - an HTTPS PUBLIC_URL must not point at a hostname the
+      certificate serving it does not cover - but during Certificate
+      Management's promote-then-install flow the certificate that will be
+      serving it is the staged one, and asking the outgoing certificate would
+      answer about the wrong thing.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][object]$Configuration,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Domains
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Domains,
+        [string]$CertificatePath
     )
 
     if (-not $Configuration.TlsEnabled) { return $null }
+
+    if ($CertificatePath) {
+        return (Get-DeltaCertificateDomainCoverage -CertificatePath $CertificatePath -Domains $Domains)
+    }
 
     $installed = Get-DeltaInstalledCertificate -InstallRoot $InstallRoot
     if (-not $installed.Exists) {
@@ -676,6 +689,14 @@ function Invoke-DeltaDomainSetPrimary {
       The old primary becomes an additional domain rather than disappearing.
       Silently dropping it would take down every existing bookmark, and an
       operator who wants it gone can remove it in the next operation - visibly.
+
+      -CoverageCertificatePath judges the HTTPS invariant below against a
+      certificate that is about to be installed rather than the one currently
+      in certs\. Certificate Management uses it when the operator has chosen to
+      promote a domain the NEW certificate covers: the invariant is the same
+      one, but the certificate that will be serving the URL is the staged one,
+      and the outgoing certificate cannot answer for it. Nothing else passes
+      it, so the ordinary path still judges against what is installed.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -683,6 +704,7 @@ function Invoke-DeltaDomainSetPrimary {
         [Parameter(Mandatory)][object]$Configuration,
         [Parameter(Mandatory)][object]$Model,
         [string]$Domain,
+        [string]$CoverageCertificatePath,
         [bool]$AllowPrompt = $true
     )
 
@@ -731,7 +753,9 @@ function Invoke-DeltaDomainSetPrimary {
     Write-Detail "Additional           $(if ($newAdditional.Count -gt 0) { $newAdditional -join ', ' } else { 'none' })"
     Write-Detail "Scheme               $($Model.Scheme) (unchanged - HTTPS is enabled or disabled through Certificate Management, never here)"
 
-    $coverage = Get-DeltaDomainCertificateState -InstallRoot $InstallRoot -Configuration $Configuration -Domains @($target)
+    $coverageArguments = @{ InstallRoot = $InstallRoot; Configuration = $Configuration; Domains = @($target) }
+    if ($CoverageCertificatePath) { $coverageArguments['CertificatePath'] = $CoverageCertificatePath }
+    $coverage = Get-DeltaDomainCertificateState @coverageArguments
     if ($coverage) {
         Write-Host ''
         Write-DeltaDomainCoverageLine -Domain $target -Coverage $coverage
