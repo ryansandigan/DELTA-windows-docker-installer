@@ -769,6 +769,30 @@ When you are re-enabling HTTPS after disabling it, a third option appears —
 *Reuse the certificate already in `certs\`* — offering the pair that was
 preserved. It is validated again from scratch before it is used.
 
+#### Choosing the files
+
+Option 1 opens **two Windows file-selection dialogs**, one after the other — the
+same flow the native NGINX installer uses. You browse to the files; you do not
+type paths.
+
+```
+Select the SSL certificate file     Certificate files (*.crt;*.cer;*.pem)
+Select the SSL private key file     Private key files (*.key;*.pem)
+```
+
+Each dialog also offers *All files*, so a correctly-named certificate in an
+unusual location is still reachable — the extension is checked afterwards either
+way.
+
+**Cancelling either dialog cancels the whole operation** and returns you to the
+menu with the installation untouched. Nothing is validated, staged or changed
+until both files have been chosen.
+
+> On a session that cannot show a dialog at all — Server Core, or PowerShell
+> running on a non-STA thread — the installer says so and asks you to type the
+> two paths instead, so a headless host is not left unable to install a
+> certificate.
+
 **PEM is the only format accepted.** NGINX serves PEM files directly, so that is
 what you supply and that is what gets installed: nothing is converted on the way
 in, and there is no transformation step between your files and the ones being

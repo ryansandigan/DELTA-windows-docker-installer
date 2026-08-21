@@ -371,6 +371,128 @@ function Read-DeltaYesNoConfirmation {
     return $confirmed
 }
 
+# ---------------------------------------------------------------------------
+# File selection
+#
+# Adapted from the reference installer's Select-DeltaSslFile, which lives in
+# its own lib\DeltaInstaller.Common.ps1 for the same reason it lives here: it
+# carries no certificate-specific knowledge at all - the caller supplies the
+# title and the filter - so it belongs with the shared console helpers rather
+# than with the one feature that currently uses it.
+# ---------------------------------------------------------------------------
+
+function Test-DeltaFileDialogSupported {
+    <#
+      Whether an OpenFileDialog can actually be shown from this session.
+
+      Two things have to hold. System.Windows.Forms must load - it is absent on
+      a Server Core installation. And the calling thread must be STA, which is
+      WinForms' own hard requirement: powershell.exe defaults to STA, but a
+      script invoked with -MTA or hosted inside a runspace that is not gets a
+      thread on which ShowDialog throws.
+
+      This exists so a caller can decide BEFORE it starts a flow, rather than
+      discovering it half-way through and having to abandon one. Answers only
+      the question; opens nothing.
+    #>
+
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+            return $false
+        }
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Select-DeltaSslFile {
+    <#
+      Opens a standard Windows file selection dialog and returns the selected
+      file's full path, or $null if the operator closed or cancelled it without
+      choosing one. Adapted from the reference installer's function of the same
+      name, with its parameters, its filter convention and its CheckFileExists
+      /Multiselect settings unchanged.
+
+      Two deliberate differences from the reference.
+
+      It refuses a non-STA thread itself rather than documenting STA as an
+      assumption. Measured: on an MTA thread ShowDialog does not throw, it
+      HANGS - no window, no error, no return. A helper whose failure mode is an
+      unkillable prompt is not one a menu loop can call safely, so the check is
+      here and not only in Test-DeltaFileDialogSupported, and a caller that
+      never probed still cannot hang on it.
+
+      And where the reference calls Stop-Setup because
+      System.Windows.Forms would not load - right for a linear installer run -
+      this returns $null and says why. The caller here is a menu loop inside
+      Management Mode, and tearing the whole utility down because a dialog
+      could not be opened would be worse than the problem it is reporting.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Filter
+    )
+
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+        Write-DeltaWarning 'A file selection window cannot be opened from this session: PowerShell is not running on an STA thread.'
+        return $null
+    }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    }
+    catch {
+        Write-DeltaWarning "A file selection window could not be opened - System.Windows.Forms could not be loaded: $($_.Exception.Message)"
+        return $null
+    }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title           = $Title
+    $dialog.Filter          = $Filter
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect     = $false
+
+    # The chosen path is read BEFORE the dialog is disposed, and returned from
+    # the local: reading FileName off a disposed dialog is not something to
+    # rely on.
+    $selected = $null
+    try {
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $selected = $dialog.FileName
+        }
+    }
+    catch {
+        Write-DeltaWarning "A file selection window could not be opened: $($_.Exception.Message)"
+        return $null
+    }
+    finally {
+        $dialog.Dispose()
+    }
+
+    return $selected
+}
+
+function Get-DeltaFileDialogFilter {
+    <#
+      A dialog filter string built from an extension list, so the extensions a
+      dialog offers and the extensions the validator accepts are the same list
+      and cannot drift apart. "All files" is kept as the second entry, exactly
+      as the reference installer's filters do, because a correctly-named file
+      in an unusual location is still a file the operator has to be able to
+      reach.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string[]]$Extensions
+    )
+
+    $patterns = (($Extensions | ForEach-Object { "*$_" }) -join ';')
+    return "$Description ($patterns)|$patterns|All files (*.*)|*.*"
+}
+
 function ConvertTo-DeltaPlainText {
     <#
       SecureString to plain text, at the point it is genuinely needed. Uses

@@ -1675,7 +1675,7 @@ Domain Management is **option 8**, inside the Docker-gated block (every mutation
 
 | Deliberately **not** taken | |
 |---|---|
-| `Select-DeltaSslFile` (WinForms picker) | this installer runs elevated and is routinely driven over a remote session; a modal dialog that never appears is a hang, not a convenience. Paths are typed, as every other path in Management Mode is |
+| ~~`Select-DeltaSslFile` (WinForms picker)~~ | **Reversed on 2026-08-21 at the operator's instruction - see the follow-up below.** The rework first argued that a modal dialog which never appears is a hang; the operator's answer is that locating a certificate on disk is what a picker is for, and the installer now uses the reference's dialog |
 | BouncyCastle PEM→PFX conversion | A§23 removed the vendored DLL. The conversion needed here is the **opposite** direction (PFX→PEM, because NGINX consumes PEM), and openssl in the already-required database image does it |
 | Windows certificate store | A§23 removed it from this product entirely |
 | Its validation depth | extension check plus an `X509Certificate2` parse. This installer already proves the **key matches the certificate**, checks expiry, and now checks primary-domain coverage — strictly stronger, so the Docker primitive stayed authoritative |
@@ -1782,6 +1782,42 @@ What stayed, and why:
 | Domain Management (4 suites) | 122 + 81 + 42 + 128 |
 
 The failure matrix swapped its "wrong PKCS#12 password" case for "a `.pfx` supplied where a certificate is expected", which is the failure an operator can now actually have. The suites manufacture their PEM fixtures with their own openssl helper, clearly marked test-local, rather than through a product primitive that no longer exists.
+#### Follow-up — the certificate picker, reversed
+
+**2026-08-21, same day.** The rework chose typed paths over the reference installer's `Select-DeltaSslFile`, arguing that a modal dialog which never appears on a remote operator's screen is a hang rather than a convenience. **The operator reversed that**, and they are right about the common case: locating a certificate wherever the CA's bundle happened to land is exactly what a file picker is for, and an administrator who has just been handed one should not be transcribing its path.
+
+*Use an existing certificate and private key* now opens two Windows file-selection dialogs, certificate first and key second, with the reference's own titles and filters:
+
+| Dialog | Filter |
+|---|---|
+| Select the SSL certificate file | `Certificate files (*.crt;*.cer;*.pem)` plus All files |
+| Select the SSL private key file | `Private key files (*.key;*.pem)` plus All files |
+
+`Select-DeltaSslFile` is adapted from `lib\DeltaInstaller.Common.ps1` and lives in `lib\Delta.Common.ps1` for the same reason the reference promoted it to its own shared file: it carries no certificate-specific knowledge, the caller supplies the title and the filter. The filters are built by `Get-DeltaFileDialogFilter` from `$Script:DeltaPemCertificateExtensions` and `$Script:DeltaPemKeyExtensions` — the same lists the validator checks against, so what the dialog offers and what the installer accepts cannot drift apart.
+
+Two deliberate differences from the reference, both because the caller is a menu loop rather than a linear install:
+
+1. **Cancelling either dialog cancels the operation** and returns to the menu with nothing changed, instead of the reference's `Stop-Setup`. That is this installer's convention everywhere else, and it is what the task asked to preserve.
+2. **A session that cannot show a dialog falls back to typing.** `Test-DeltaFileDialogSupported` decides that up front. Server Core has no WinForms; without the fallback such a host could not install a certificate at all. It is a fallback and is labelled as one — not a second picker mechanism.
+
+**The original objection turned out to be half right, and measurably so.** On an **MTA** thread `ShowDialog` does not throw — it **hangs**: no window, no error, no return. The first version of this change reproduced exactly the failure mode the rework had worried about. So the STA check lives inside `Select-DeltaSslFile` itself, not only in the availability probe, and a caller that never probed still cannot hang on it. That is now asserted from both directions.
+
+Nothing else moved: PEM-only input, certificate/key pair matching, expiry gating, primary-domain coverage refusal, the transaction and its rollback, and the self-signed flow are all untouched, and their suites re-run unchanged.
+
+#### Validation after the picker change — 883/883
+
+| Suite | |
+|---|---|
+| Certificate unit | 132/132 |
+| Certificate lifecycle (§30) | 119/119 |
+| Certificate failure matrix (§23) | 109/109 |
+| Certificate regression | 150/150 |
+| Domain Management (4 suites) | 122 + 81 + 42 + 128 |
+
+The unit suite gained a **real GUI test**: it launches an STA PowerShell, calls `Select-DeltaSslFile` with a unique title, finds that window by title through `EnumWindows` — `MainWindowTitle` does not see it, because the dialog is not the console's main window — and asserts both that it appeared and that the call is still blocked on it. The MTA half asserts the opposite: that the call returns promptly with nothing selected rather than hanging. Both tear the probe process down afterwards.
+
+**One harness fault, the third of its kind here.** `Select-DeltaSslFile`'s doc comment explains *why* it does not call `Stop-Setup`, and a raw-text "never calls Stop-Setup" grep matched the explanation. Strip the comment first — the same fix as the previous two.
+
 
 ---
 

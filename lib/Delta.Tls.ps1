@@ -875,6 +875,75 @@ function Show-DeltaCertificateMenu {
 # Certificate collection
 # ---------------------------------------------------------------------------
 
+function Read-DeltaCertificateFilePair {
+    <#
+      Collects an existing certificate and its private key: two Windows file
+      selection dialogs, the certificate first and the key second, which is the
+      order and the shape the reference installer's
+      Install-DeltaSslCertificateFiles uses.
+
+      The filters come from the same extension lists the validator checks
+      against, so what the dialog offers and what the installer accepts cannot
+      drift apart. "All files" stays as the second entry, as the reference's
+      filters have it - a correctly-named certificate in an unusual place is
+      still one the operator has to be able to reach, and the extension is
+      checked afterwards regardless of how the file was found.
+
+      Cancelling either dialog cancels the whole selection and returns $null,
+      which the caller reports as "nothing was changed". That is this
+      installer's convention throughout, and it is why this does not adopt the
+      reference's Stop-Setup on a missing selection: there, a cancelled picker
+      ends a linear install; here it must return the operator to the menu they
+      came from with the installation untouched.
+
+      Nothing is validated here beyond the dialog's own CheckFileExists. The
+      certificate, the key, their pairing, the dates and the domain coverage
+      are all decided by Resolve-DeltaCertificateInput and the activation gate,
+      unchanged - this function's only job is to find out which two files the
+      operator means.
+    #>
+
+    $certificateFilter = Get-DeltaFileDialogFilter -Description 'Certificate files' -Extensions $Script:DeltaPemCertificateExtensions
+    $keyFilter         = Get-DeltaFileDialogFilter -Description 'Private key files' -Extensions $Script:DeltaPemKeyExtensions
+
+    if (-not (Test-DeltaFileDialogSupported)) {
+        # No dialog is possible in this session. Say so, then fall back to
+        # typing rather than leaving the operator unable to install a
+        # certificate at all.
+        Write-Host ''
+        Write-DeltaWarning 'This session cannot open a file selection window, so the paths have to be typed.'
+        Write-Detail 'That happens on Server Core, or when PowerShell is not running on an STA thread.'
+        Write-Host ''
+        Write-Host 'Leave either blank to cancel.'
+        $typedCertificate = ([string](Read-Host -Prompt "Certificate file ($($Script:DeltaPemCertificateExtensions -join '/'))")).Trim('"', ' ')
+        if (-not $typedCertificate) { return $null }
+        $typedKey = ([string](Read-Host -Prompt "Private key file ($($Script:DeltaPemKeyExtensions -join '/'))")).Trim('"', ' ')
+        if (-not $typedKey) { return $null }
+        return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $typedCertificate; KeyPath = $typedKey }
+    }
+
+    Write-Host ''
+    Write-Step 'Selecting the certificate file'
+    Write-Detail 'A file selection window has opened. Cancel it to go back without changing anything.'
+    $certificate = Select-DeltaSslFile -Title 'Select the SSL certificate file' -Filter $certificateFilter
+    if (-not $certificate) {
+        Write-Detail 'No certificate was selected.'
+        return $null
+    }
+    Write-Detail $certificate
+
+    Write-Step 'Selecting the private key file'
+    Write-Detail 'A second window has opened for the private key.'
+    $key = Select-DeltaSslFile -Title 'Select the SSL private key file' -Filter $keyFilter
+    if (-not $key) {
+        Write-Detail 'No private key was selected.'
+        return $null
+    }
+    Write-Detail $key
+
+    return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key }
+}
+
 function Read-DeltaCertificateSource {
     <#
       Asks where the certificate is coming from, and collects it.
@@ -885,11 +954,18 @@ function Read-DeltaCertificateSource {
       reading, and choosing between a production certificate and a self-signed
       one is exactly that decision. Enter cancels.
 
-      Paths are typed rather than picked from a WinForms dialog. The reference
-      installer uses Select-DeltaSslFile; this installer runs elevated, is
-      routinely driven over a remote session, and asks for every other path in
-      Management Mode by typing - a modal dialog that never appears on the
-      operator's screen is a hang, not a convenience.
+      The certificate and the key are chosen from Windows file selection
+      dialogs, one each, exactly as the reference installer's
+      Install-DeltaSslCertificateFiles does - Select-DeltaSslFile with the same
+      two filters. Locating a certificate wherever it happens to sit on disk is
+      what a file picker is for, and an operator who has just been handed a
+      bundle by their CA should not have to transcribe its path.
+
+      Typing the paths remains as a fallback, and only as a fallback: a session
+      that cannot show a dialog at all - Server Core, or an MTA thread - would
+      otherwise leave the operator with no way to install a certificate.
+      Test-DeltaFileDialogSupported decides that up front rather than half-way
+      through the flow.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -924,13 +1000,9 @@ function Read-DeltaCertificateSource {
         if ($choice -eq '0' -or $choice -eq '') { return $null }
 
         if ($choice -eq '1') {
-            Write-Host ''
-            Write-Host 'Leave either blank to cancel.'
-            $certificate = ([string](Read-Host -Prompt 'Certificate file (.crt/.cer/.pem)')).Trim('"', ' ')
-            if (-not $certificate) { return $null }
-            $key = ([string](Read-Host -Prompt 'Private key file (.key/.pem)')).Trim('"', ' ')
-            if (-not $key) { return $null }
-            return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key }
+            $selection = Read-DeltaCertificateFilePair
+            if (-not $selection) { return $null }
+            return $selection
         }
         if ($choice -eq '2') {
             return [PSCustomObject]@{ Kind = 'self-signed'; CertificatePath = $null; KeyPath = $null }
