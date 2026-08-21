@@ -134,12 +134,41 @@ function Invoke-DeltaProcessCapture {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
 
+    # .NET Framework builds the child's stdin writer from Console.InputEncoding,
+    # and on this host that is a UTF-8 encoder WITH a byte-order mark. There is
+    # no ProcessStartInfo.StandardInputEncoding on .NET Framework - it is .NET
+    # Core only - and StreamWriter emits its preamble the first time the stream
+    # is touched, including when .BaseStream is merely read. So writing raw
+    # bytes is not enough on its own: the mark is already in the pipe ahead of
+    # them.
+    #
+    # Measured: a PKCS#12 password sent this way arrived as 13 bytes rather than
+    # 10 - ef bb bf then the password - and openssl answered "Mac verify error:
+    # invalid password?" for a password that was correct.
+    #
+    # Setting the console encoding to a preamble-free UTF-8 for the length of
+    # this call is the only lever 5.1 offers. It is restored in the finally
+    # block below, and a host that refuses the change (stdin already redirected,
+    # no console) is not a failure - the consumer-side guard covers it.
+    $previousInputEncoding = $null
+    if ($PSBoundParameters.ContainsKey('StandardInput')) {
+        try {
+            $previousInputEncoding = [Console]::InputEncoding
+            if ($previousInputEncoding.GetPreamble().Length -gt 0) {
+                [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+            }
+            else { $previousInputEncoding = $null }
+        }
+        catch { $previousInputEncoding = $null }
+    }
+
     try {
         $null = $process.Start()
         $result.Started = $true
     }
     catch {
         $result.Error = $_.Exception.Message
+        if ($previousInputEncoding) { try { [Console]::InputEncoding = $previousInputEncoding } catch { } }
         return $result
     }
 
@@ -150,7 +179,17 @@ function Invoke-DeltaProcessCapture {
         if ($PSBoundParameters.ContainsKey('StandardInput')) {
             # Written after the readers are attached and closed immediately, so
             # the child sees EOF rather than waiting for more input.
-            if ($StandardInput) { $process.StandardInput.Write($StandardInput) }
+            #
+            # Straight to BaseStream as explicit UTF-8 bytes, so the payload's
+            # encoding is decided here rather than by whatever the console
+            # happens to be set to. Combined with the preamble-free console
+            # encoding set above, the child receives exactly these bytes and
+            # nothing else.
+            if ($StandardInput) {
+                $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($StandardInput)
+                $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+                $process.StandardInput.BaseStream.Flush()
+            }
             $process.StandardInput.Close()
         }
 
@@ -164,6 +203,7 @@ function Invoke-DeltaProcessCapture {
         $result.ExitCode = if ($result.TimedOut) { -1 } else { $process.ExitCode }
     }
     finally {
+        if ($previousInputEncoding) { try { [Console]::InputEncoding = $previousInputEncoding } catch { } }
         $process.Dispose()
     }
 

@@ -737,6 +737,36 @@ function Invoke-DeltaDomainSetPrimary {
         Write-DeltaDomainCoverageLine -Domain $target -Coverage $coverage
     }
 
+    # --- the HTTPS invariant ----------------------------------------------
+    # PUBLIC_URL is what DELTA calls itself. Promoting a domain the active
+    # certificate demonstrably does not cover would make the canonical URL fail
+    # hostname validation in every browser - a knowingly broken installation,
+    # produced by a menu option whose stated job is to swap a hostname.
+    #
+    # So it is refused, not warned about, and the operator is pointed at the
+    # two things that actually fix it. Coverage that could not be DETERMINED is
+    # not a refusal: "we could not read the SAN extension" and "the name is not
+    # there" are different facts, and only the second one is knowingly broken.
+    if ($coverage -and $coverage.Determined) {
+        $row = $coverage.Rows | Where-Object { $_.Domain -eq $target } | Select-Object -First 1
+        if ($row -and -not $row.IsCovered) {
+            Write-Host ''
+            Write-DeltaFailure "$target cannot become the primary domain while HTTPS is enabled."
+            Write-Detail "The active certificate does not cover it - it is valid for: $($coverage.Names -join ', ')."
+            Write-Detail "PUBLIC_URL would become $newPublicUrl, and every browser reaching DELTA at its"
+            Write-Detail 'own canonical address would show a certificate warning.'
+            Write-Detail ''
+            Write-Detail 'Install a certificate that covers it first, through Certificate Management'
+            Write-Detail "(menu option 7). $target stays configured as an additional domain meanwhile,"
+            Write-Detail 'so NGINX still answers to it.'
+            return [PSCustomObject]@{
+                Succeeded = $false; Cancelled = $false; Stage = 'certificate-coverage'
+                Reason = "$target is not covered by the active certificate, so it was not made the primary domain."
+                Coverage = $coverage
+            }
+        }
+    }
+
     if ($AllowPrompt) {
         $confirmed = Read-DeltaYesNoConfirmation -Body {
             Write-Host "Make $target the primary domain?"

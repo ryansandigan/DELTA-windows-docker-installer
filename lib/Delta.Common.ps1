@@ -371,6 +371,22 @@ function Read-DeltaYesNoConfirmation {
     return $confirmed
 }
 
+function ConvertTo-DeltaPlainText {
+    <#
+      SecureString to plain text, at the point it is genuinely needed. Uses
+      NetworkCredential rather than manual Marshal calls - the standard,
+      PowerShell 5.1-compatible idiom, adapted from the reference installer.
+
+      Lives here, in the file every entry point loads first, because callers
+      exist at every layer: the administrator reset, the .env generator, and
+      the PKCS#12 conversion in Delta.Network.ps1. Defining it in a
+      late-loading file made that last one resolve to nothing and silently
+      substitute an empty password - measured.
+    #>
+    param([Parameter(Mandatory)][SecureString]$SecureString)
+    return [System.Net.NetworkCredential]::new('', $SecureString).Password
+}
+
 function Stop-Setup {
     <#
       Raises a terminating error with an operator-readable message. setup.ps1's

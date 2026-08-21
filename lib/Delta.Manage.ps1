@@ -120,15 +120,12 @@ function Read-DeltaAdminNewPassword {
     }
 }
 
-function ConvertTo-DeltaPlainText {
-    <#
-      SecureString to plain text, at the point it is genuinely needed. Uses
-      NetworkCredential rather than manual Marshal calls - the standard,
-      PowerShell 5.1-compatible idiom, adapted from the reference installer.
-    #>
-    param([Parameter(Mandatory)][SecureString]$SecureString)
-    return [System.Net.NetworkCredential]::new('', $SecureString).Password
-}
+# ConvertTo-DeltaPlainText moved to lib\Delta.Common.ps1 when Certificate
+# Management needed it to hand a PKCS#12 password to openssl. It is a pure
+# SecureString helper with no dependencies, and leaving it here meant a file
+# loaded early (Delta.Network.ps1) depending on one loaded late - which
+# degraded to an empty password rather than failing loudly. Every caller is
+# unchanged; only where it is defined moved.
 
 # ---------------------------------------------------------------------------
 # The reset itself
@@ -3302,7 +3299,7 @@ function Invoke-DeltaManagementMode {
             }
             '7' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Certificate Management'; continue }
-                $null = Invoke-DeltaCertificateOperation -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
+                $null = Invoke-DeltaCertificateOperation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
             }
             '8' {
                 if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Domain Management'; continue }

@@ -121,19 +121,25 @@ installing. It does not ask the installation questions again, does not
 regenerate anything, and does not recreate any container just because you
 opened it.
 
-To change installation-level settings — hostname, ports, HTTPS — run the
-installer flow explicitly:
+Most settings are changed from the menu itself and need no installer run:
+
+| To change | Use |
+|---|---|
+| HTTPS on or off, the certificate, the HTTPS port | [Certificate Management](#https-and-certificates) — menu option 7 |
+| Hostnames, and which one is canonical | [Domain Management](#managing-domains) — menu option 8 |
+| Email | [Configure SMTP](#configuring-email) — menu option 5 |
+| The administrator password | [menu option 6](#resetting-the-administrator-password) |
+
+What is left for the installer flow is the **HTTP port**:
 
 ```powershell
-.\setup.ps1 -Reconfigure
+.\setup.ps1 -Reconfigure -HttpPort 8080
 ```
 
-That re-offers the hostname and the HTTPS choice. It deliberately does **not**
-re-ask either password: the database password is applied only when the database
-is first created, so changing it there would not change what PostgreSQL expects,
-and the administrator credential is left to
-[menu option 6](#resetting-the-administrator-password), which is the operation
-that actually knows how to replace it.
+It deliberately does **not** re-ask either password: the database password is
+applied only when the database is first created, so changing it there would not
+change what PostgreSQL expects, and the administrator credential is left to
+menu option 6, which is the operation that actually knows how to replace it.
 
 ### What a first install does
 
@@ -332,8 +338,8 @@ it finishes, when you cancel it, and when it fails.
   [Configuring email](#configuring-email).
 - **Reset Administrator Password** replaces the administrator credential — see
   [Resetting the administrator password](#resetting-the-administrator-password).
-- **Certificate Management** replaces the TLS certificate — see
-  [Replacing the TLS certificate](#replacing-the-tls-certificate).
+- **Certificate Management** turns HTTPS on and off and manages the certificate —
+  see [HTTPS and certificates](#https-and-certificates).
 - **Domain Management** adds and removes the hostnames DELTA answers to, and
   chooses which one is canonical — see [Managing domains](#managing-domains).
 - **DELTA Access Guide** shows the real URLs for this installation, tests the
@@ -680,30 +686,160 @@ this operation touches one database row.
 If the account cannot be found, that is reported and nothing is created or
 changed. Cancelling at either prompt leaves the credential alone.
 
-### Replacing the TLS certificate
+### HTTPS and certificates
 
-Menu option **7** replaces the certificate and private key that NGINX serves.
+Menu option **7**, **Certificate Management**, owns HTTPS for this installation:
+enabling it, replacing the certificate, inspecting it, and turning it off again.
+All of it happens inside the management utility — you are never sent away to run
+`.\setup.ps1 -Reconfigure` to get HTTPS.
 
-It first shows what is in use — subject, issuer, expiry and thumbprint — then
-asks for the replacement certificate and key. Both must be **PEM** files, and
-the key must not be passphrase-protected (NGINX cannot use one without the
-passphrase stored in plaintext next to it, which gains nothing).
+The screen adapts to what it finds.
 
-Before anything is touched, the replacement is validated:
+**On an HTTP installation:**
+
+```
+========================================================================
+Certificate Management
+C:\DELTA
+========================================================================
+
+HTTPS
+  Disabled - NGINX serves HTTP on port 80
+
+Primary domain
+  delta.example.org
+
+Configured domains
+  delta.example.org   (primary)
+  delta.internal.example.org
+
+Certificate
+  None active
+
+  1. Enable HTTPS
+  0. Return
+```
+
+**On an HTTPS installation:**
+
+```
+HTTPS
+  Enabled on port 443
+
+Primary URL
+  https://delta.example.org
+
+Certificate
+  Subject        CN=delta.example.org
+  Issuer         CN=Example CA
+  Valid from     2026-01-04
+  Expires        2027-01-04  (312 day(s) remaining)
+  Thumbprint     3A7C...
+  Private key    Available
+
+Domain coverage
+  delta.example.org            (primary)     Covered
+  delta.internal.example.org   (additional)  NOT COVERED
+
+  1. Replace Certificate
+  2. Inspect Certificate
+  3. Disable HTTPS
+  0. Return
+```
+
+#### Certificate formats
+
+| You have | Supply |
+|---|---|
+| PEM certificate + private key | the `.crt`/`.cer`/`.pem` and the `.key`/`.pem` |
+| A PKCS#12 bundle | the `.pfx`/`.p12` and its password |
+| Nothing yet | choose *Generate a self-signed certificate* |
+
+NGINX consumes PEM and nothing else, so a PKCS#12 bundle is converted into a PEM
+pair here — by OpenSSL, in the database image that is already required and
+already pulled. **The password reaches OpenSSL on standard input and nowhere
+else**: never in a command line, never in an environment variable, never written
+to disk, never echoed as you type it, and never recorded in `.env`, the state
+file or any log. Your original `.pfx` is only ever read; it is never moved,
+modified or deleted.
+
+DER, PKCS#7 and the Windows certificate store are not accepted. This installer
+terminates TLS from mounted PEM files and has no involvement with the Windows
+certificate store at all.
+
+An encrypted private key is refused rather than accommodated: NGINX cannot use
+one without an `ssl_password_file` holding the passphrase in plaintext beside
+it, which gains nothing.
+
+#### What is validated before anything is touched
 
 - both files exist and can be read;
 - the certificate parses as X.509;
-- the private key parses;
-- **the key matches the certificate** — this is the check that matters, because
-  a mismatch otherwise surfaces as a cryptic NGINX failure;
-- the certificate is currently valid, with a warning if it expires within 30 days.
+- the private key parses and is not passphrase-protected;
+- **the key matches the certificate** — the check that matters, because a
+  mismatch otherwise surfaces as a cryptic NGINX failure;
+- the certificate is currently valid — not expired, not post-dated — with a
+  warning if it expires within 30 days;
+- **it covers the primary domain.**
 
-A defect is reported **by name** — you are told which of the two files is wrong
-and how — and nothing is changed.
+That last one is a **refusal, not a warning**. `PUBLIC_URL` is the address DELTA
+calls itself by; configuring it as `https://delta.example.org` while serving a
+certificate that fails hostname validation for `delta.example.org` would mean
+every browser reaching DELTA at its own canonical address gets a security
+warning. A certificate that does not cover the primary domain is not installed,
+and you are told what it *is* valid for.
 
-If it validates, the current certificate and key are copied aside with a
-timestamp, the new pair is installed with the same restricted permissions the
-old key had, and then:
+Uncovered **additional** domains are different: they are aliases, so an
+uncovered one warns and HTTPS still goes ahead for the correctly-covered
+primary. See [Managing domains](#managing-domains).
+
+Coverage is read from the certificate's subjectAltName DNS entries (falling back
+to the common name only when there is no SAN at all), matched case-insensitively,
+with wildcards honoured the way browsers honour them — `*.example.org` covers
+`a.example.org` but not `example.org` or `a.b.example.org`. If the names cannot
+be read on this host, that is reported as **could not be determined** and never
+as "not covered".
+
+#### Enable HTTPS
+
+1. The HTTPS port is settled through the same resolver installation uses, so a
+   port something else already holds is reported and refused rather than DELTA
+   being recreated onto a port it cannot bind.
+2. The certificate is collected, converted if needed, validated and gated.
+3. The NGINX configuration for HTTPS is generated and **validated with `nginx -t`
+   inside the still-running HTTP container** — which can read the new certificate
+   and key, because `certs\` is mounted in both shapes. Nothing is recreated
+   until that passes.
+4. `.env` gains `TLS_ENABLED=true`, `TLS_MODE`, the HTTPS port, and a
+   `PUBLIC_URL` whose scheme becomes `https`.
+5. `docker-compose.yml` is regenerated to publish the HTTPS port, and validated.
+6. **NGINX is recreated** — `up -d --no-deps nginx`. This is genuinely necessary,
+   not defensive: the published ports and the healthcheck are both
+   container-creation-time properties and a reload cannot express either.
+7. **The DELTA container is recreated** — `PUBLIC_URL` is in its environment and
+   is read at start.
+8. The installer's own HTTPS firewall rule is added for that port.
+9. The endpoint is actually requested, and the certificate NGINX is presenting is
+   read back and compared with the one installed.
+
+The database, its volume, the uploads and every unrelated container are not
+touched at any point.
+
+Afterwards HTTP keeps listening and issues a `301` to the HTTPS URL, including a
+non-standard port when there is one.
+
+**What "verified" means.** The installer requests the site over loopback, which
+proves this machine terminates TLS and that DELTA answers through it. It does
+**not** prove a browser elsewhere will trust the certificate or that your
+hostname resolves — those depend on DNS and on that machine trusting the issuer.
+The report says exactly that rather than implying more.
+
+#### Replace Certificate
+
+Available while HTTPS is on, and it does **not** require disabling HTTPS first.
+The same collection, validation and primary-domain gate apply. Then the current
+certificate and key are copied aside with a timestamp, the new pair is installed
+with the same restricted permissions, and:
 
 ```
 nginx -t          runs inside the running NGINX container
@@ -714,35 +850,92 @@ nginx -s reload    only if nginx -t passed
 signals the running NGINX process, so established connections are drained rather
 than dropped and the site does not go down.
 
-Afterwards the installer requests the site over HTTPS and reads back the
-certificate NGINX is actually presenting, confirming it is the new one. The
-thumbprint and expiry are recorded in `.delta-install.json`; the private key is
-never read into the installer, never logged and never stored anywhere but
-`certs\`.
-
-The screen also lists **every configured domain** and whether the certificate in
-use covers it, so a replacement can be chosen against the full set rather than
-against the primary hostname alone:
-
-```
-Configured domains
-  delta.ncscm.gov.jo                       primary     covered by the certificate
-  delta.internal.ncscm.gov.jo              additional  NOT covered by the certificate
-```
-
 **If `nginx -t` rejects the new certificate**, NGINX is never signalled — it
 carries on serving the old certificate from memory — the previous files are put
 back, and the restored configuration is re-tested. If the reload or the endpoint
-check fails, the previous certificate is restored and reloaded. The site stays
-up throughout.
+check fails, the previous certificate is restored and reloaded. The known-good
+certificate is never destroyed first.
 
-> **If HTTPS is not enabled** for this installation, this option says so and
-> stops: there is no certificate in use to replace. Turning HTTPS on changes the
-> published ports and regenerates the NGINX configuration, which is the
-> installer flow — `.\setup.ps1 -Reconfigure`.
+#### Inspect Certificate
+
+A read-only view: subject, issuer, serial number, thumbprint, whether it is
+self-signed, validity dates and days remaining, the public-key algorithm and
+size, the signature algorithm, the SAN names, whether the private key file is
+present, and per-domain coverage of the configured domain set.
+
+Fields this host could not read are omitted rather than shown blank or guessed
+at. **No private key material, no certificate password and no `.env` value is
+ever printed** — the private key is never opened; its presence is answered from
+the filesystem.
+
+#### Disable HTTPS
+
+Returns the installation to plain HTTP. You are told what will happen before you
+confirm: `PUBLIC_URL` reverts to `http://`, the HTTPS listener and published port
+go away, HTTP serves DELTA directly instead of redirecting, and the installer's
+HTTPS firewall rule is retired.
+
+**The certificate and key are not deleted.** Preservation is the safe default —
+you may be about to turn HTTPS back on, and you may not have another copy. The
+recorded HTTPS port is kept too, so re-enabling offers the port this installation
+already chose.
+
+Disabling HTTPS on an installation that is already HTTP is a no-op that says so.
+
+#### Enable HTTPS again
+
+Re-enabling offers the preserved certificate back as *"Reuse the certificate
+already in `certs\`"*. It is **validated again from scratch** — a certificate
+that was valid in March is not necessarily valid in December, and an expired,
+mismatched or wrong-domain one is refused exactly as any other would be.
+
+#### Interaction with Domain Management
+
+Ownership is split and neither side reaches into the other:
+
+| | Owns |
+|---|---|
+| **Certificate Management** (7) | HTTPS on/off, the certificate and key, `TLS_ENABLED`, the HTTPS port, the *scheme* half of `PUBLIC_URL`, the HTTPS firewall rule |
+| **Domain Management** (8) | which hostnames exist, which one is primary — the *host* half of `PUBLIC_URL` |
+
+Adding or removing a domain never issues, replaces or deletes a certificate.
+Installing a certificate never adds, removes or re-designates a domain.
+
+They meet at one invariant: **an HTTPS `PUBLIC_URL` must never knowingly point at
+a hostname the active certificate does not cover.** So on a TLS-enabled
+installation, *Set Primary Domain* **refuses** to promote a domain the
+certificate demonstrably does not cover, and tells you to install a covering
+certificate first. The domain stays configured as an additional domain
+meanwhile, so NGINX still answers to it.
+
+#### Firewall
+
+Only the installer's own two rules, named after this installation's Compose
+project, are ever touched. Enabling HTTPS adds the HTTPS rule for the port in
+use; disabling retires it. Repeated operations replace rather than duplicate. A
+domain change alone never rewrites a firewall rule. A host whose policy forbids
+local firewall rules still gets a working installation — it just is not reachable
+from other machines yet, and the installer says so.
+
+#### If something fails
+
+Every TLS change is one transaction over a snapshot of `.env`, the Compose file,
+the NGINX configuration and the certificate material. Any failure restores all of
+it and brings the runtime back to it, then reports honestly whether DELTA is
+answering again. You should never end up with `TLS_ENABLED=true` and an HTTP-only
+NGINX, a `PUBLIC_URL` that says `https` while HTTPS is unavailable, or a
+certificate replaced under a configuration that was never validated.
 
 There is no automatic renewal and no ACME/Let's Encrypt client. Replacing a
 certificate is a deliberate operator action.
+
+#### Self-signed certificates
+
+Offered, and labelled as what they are. A generated certificate covers the whole
+configured domain set — the primary and every additional domain — plus
+`localhost` and `127.0.0.1`. Browsers will warn until it is trusted or replaced.
+It is suitable for internal testing, not for public use, and both the screen and
+the completion report say so.
 
 ### Managing domains
 
@@ -946,20 +1139,23 @@ boundary before it can become part of a `server_name` directive, and anything
 that is not a plain hostname stops the operation rather than being escaped or
 quoted.
 
-### Changing ports or TLS
+### Changing the HTTP port
 
-Ports and TLS enablement are settled during installation, and the management
-utility deliberately does not re-ask. To change them, run the installer flow
-again against the existing installation:
+The HTTP port is the one networking setting the management utility does not
+own. To change it, run the installer flow against the existing installation:
 
 ```powershell
 .\setup.ps1 -Reconfigure -HttpPort 8080
 ```
 
-That re-resolves ports and TLS and regenerates the generated files. It is as
-non-destructive as any other re-run: your data, secrets, certificates, image
-pins **and your configured domains** are preserved — a rerun regenerates
-`server_name` from the recorded domain set, so additional domains are not lost.
+It is as non-destructive as any other re-run: your data, secrets, certificates,
+image pins, **your TLS state and your configured domains** are all preserved — a
+rerun regenerates `server_name` from the recorded domain set and the Compose
+file from the recorded TLS state, so neither is lost.
+
+**HTTPS enablement and the HTTPS port are no longer this flow's job.** Use
+[Certificate Management](#https-and-certificates) (menu option 7), which does
+the whole transition and can undo it.
 
 The hostname no longer needs this flow: use **Domain Management** (menu option
 8) instead.
@@ -1229,7 +1425,9 @@ Stated plainly so it is not mistaken for a gap:
 - **Domain Management does not manage certificates.** Adding a domain reports
   whether the active certificate covers it and stops there: no certificate is
   issued, replaced or deleted because a hostname was added or removed. Enabling
-  HTTPS on an HTTP installation is still `.\setup.ps1 -Reconfigure`.
+  HTTPS is [Certificate Management](#https-and-certificates), menu option 7.
+- **Certificate Management does not manage domains.** It reads the configured
+  domain set to decide coverage and never changes it.
 - **It does not configure DNS.** A hostname does not have to resolve to be
   configured, and nothing here creates, checks or updates a DNS record —
   reaching DELTA by a name from another machine additionally depends on DNS and

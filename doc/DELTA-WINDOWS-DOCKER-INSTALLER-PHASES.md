@@ -1655,6 +1655,106 @@ Domain Management is **option 8**, inside the Docker-gated block (every mutation
 
 ---
 
+### Feature — Certificate Management rework
+
+**Not a phase.** A focused rework of the Phase 10 feature, on top of Domain Management.
+
+**Status: COMPLETE** · 2026-08-21 · **Validated: 456/456 assertions.**
+
+**Goal.** Certificate Management owns the HTTPS lifecycle — enable, inspect, replace, disable, re-enable — from inside the management utility. The Phase 10 behaviour of telling an HTTP installation to leave the utility and run `.\setup.ps1 -Reconfigure` is gone.
+
+#### Reference implementation reviewed
+
+`setup-nginx.ps1` in `DELTA-windows-installer`, plus `lib\DeltaInstaller.Common.ps1` and `setup-iis.ps1`.
+
+| Kept | |
+|---|---|
+| Replace / Keep / Cancel on an existing certificate, with **no bare-Enter default** | a consequential certificate decision is never made by a stray keypress. Reproduced as "Enter cancels" in `Read-DeltaCertificateSource` |
+| "Nothing was written, NGINX was not started or reloaded" on cancel | reproduced verbatim in spirit throughout |
+| Fixed installed location, regenerate → validate → reload | already this installer's shape |
+
+| Deliberately **not** taken | |
+|---|---|
+| `Select-DeltaSslFile` (WinForms picker) | this installer runs elevated and is routinely driven over a remote session; a modal dialog that never appears is a hang, not a convenience. Paths are typed, as every other path in Management Mode is |
+| BouncyCastle PEM→PFX conversion | A§23 removed the vendored DLL. The conversion needed here is the **opposite** direction (PFX→PEM, because NGINX consumes PEM), and openssl in the already-required database image does it |
+| Windows certificate store | A§23 removed it from this product entirely |
+| Its validation depth | extension check plus an `X509Certificate2` parse. This installer already proves the **key matches the certificate**, checks expiry, and now checks primary-domain coverage — strictly stronger, so the Docker primitive stayed authoritative |
+
+#### The finding that made this transactional
+
+`./certs:/etc/nginx/certs:ro` is mounted in **both** the HTTP and the HTTPS Compose shapes — it sits outside the `#__IF_TLS__` region. So a candidate HTTPS configuration, certificate and key included, is fully validated by `nginx -t` **inside the still-HTTP running container, before any container is recreated**.
+
+Recreation is nevertheless genuinely required, and this is why: the nginx service's `ports:` gains `${HTTPS_PORT}:443` and its `healthcheck:` switches from `wget http://` to `wget --no-check-certificate https://`. Both are container-creation-time properties that a reload cannot express. `up -d --no-deps nginx` is the narrowest operation that works — one container, no volume. `PUBLIC_URL` lives in the delta service's `environment:`, so that container is recreated too, through the same `Update-DeltaApplicationContainer` the SMTP flow uses.
+
+#### Shared primitives
+
+There is now exactly one Certificate Management implementation and one TLS transition. `Set-DeltaTlsState` is the transaction; `Set-DeltaCertificateMaterial` is the same-state certificate swap, kept separate because it genuinely needs only a reload. Both share `Resolve-DeltaCertificateInput` and `Test-DeltaCertificateActivation`. New primitives added to `Delta.Network.ps1` beside the existing certificate logic: `Get-DeltaCertificateSourceKind`, `Convert-DeltaPkcs12ToPem`, `Get-DeltaCertificateDetail`.
+
+#### Certificate input
+
+PEM (`.crt`/`.cer`/`.pem` + `.key`/`.pem`), PKCS#12 (`.pfx`/`.p12`), self-signed generation, and reuse of the preserved staged pair. DER, PKCS#7 and the Windows store are refused — they fail A§11's second test, "can it be converted safely into what NGINX consumes", on this architecture.
+
+**The PKCS#12 password reaches openssl on stdin and nowhere else.** Not an argument (visible in the process list and in this installer's own captured argument vector), not an environment variable (visible in `docker inspect` and `/proc`), not a file. It is a `SecureString` until the moment of use, converted for the narrowest scope, and cleared immediately.
+
+#### The primary-domain gate
+
+Coverage of the **primary** domain is a **refusal**, not a warning: `PUBLIC_URL` is what DELTA calls itself, and serving it with a certificate that fails hostname validation would mean every browser reaching DELTA at its canonical address gets a warning. Uncovered **additional** domains warn and do not block. Coverage that cannot be *determined* is reported as such and never treated as absent.
+
+#### Files changed
+
+| File | |
+|---|---|
+| `lib\Delta.Tls.ps1` | **new** — the screen, four operations, the TLS transition transaction |
+| `lib\Delta.Network.ps1` | PKCS#12 conversion, certificate detail, stdin support on `Invoke-DeltaOpenSsl` |
+| `lib\Delta.Docker.ps1` | stdin transport fix (below) |
+| `lib\Delta.Common.ps1` | `ConvertTo-DeltaPlainText` moved here |
+| `lib\Delta.Configure.ps1` | superseded Certificate Management removed; its four primitives kept |
+| `lib\Delta.Manage.ps1` | `ConvertTo-DeltaPlainText` moved out; option 7 passes `-ScriptRoot` |
+| `lib\Delta.Domain.ps1` | the HTTPS primary-domain invariant |
+| `setup.ps1`, `README.md` | manifest, documentation |
+
+`uninstall.ps1` and `lib\Delta.Uninstall.ps1` are **unmodified**, and the Phase 12 guarantee is re-proved below. Menu numbering is **unchanged**.
+
+#### Validation — 456/456
+
+| Suite | |
+|---|---|
+| Unit — formats, PKCS#12, detail, the gate, wildcards, screens, secrets | 98/98 |
+| Lifecycle — the §30 acceptance chain on a disposable installation | 119/119 |
+| Failure matrix — §23, every case provoked | 109/109 |
+| Regression — PS 5.1, manifests, menu, blast radius, secrets, uninstall | 130/130 |
+
+Plus the four Domain Management suites re-run: **370/370** (122 + 78 + 42 + 128).
+
+- **The §30 chain, end to end** on `C:\Workspace\delta-cert-test` (project `deltacert`, volume `deltacert_pgdata`, ports 8091/8453): fresh HTTP install → primary domain confirmed → **Enable HTTPS from a PKCS#12 bundle** → `PUBLIC_URL` becomes `https://…:8453`, `TLS_ENABLED=true`, Compose publishes the HTTPS port, HTTP returns **301** to the HTTPS URL including the non-standard port, the served thumbprint is the installed one, and **the running container's `printenv PUBLIC_URL` reports the new value** → inspect → replace → add a domain → coverage reported accurately → **disable** → HTTP 200 directly, HTTPS port dead, firewall rule retired, **certificate and key byte-identical** → **re-enable reusing the preserved pair** → healthy again. The database marker, the synthetic upload and the administrator bootstrap survive every step; backup still works.
+- **Failure matrix, all provoked.** Missing certificate, missing key, malformed certificate, malformed key, **key/certificate mismatch**, expired, not-yet-valid, **does not cover the primary domain**, **wrong PKCS#12 password**, `nginx -t` rejection (forced by a deliberate template fault so the real transaction runs), a port already held by a live listener, three bad replacements against a working HTTPS installation, NGINX unavailable, an unwritable state file, and a corrupt state file. Every one: previous state survives byte-for-byte, the site never went down, no database or upload touched, no password in any message.
+- **Rollback ordering.** The state-file write is deliberately last and non-fatal — `.env` and the runtime already agree, and refusing a completed change because a note could not be filed would be worse. Everything before it rolls back the whole snapshot. Asserted separately for both.
+- **Blast radius.** No `down`, `prune`, `volume rm`, `delta_pgdata`, `New-NetFirewallRule`/`Remove-NetFirewallRule`, Windows certificate store or unscoped Docker call anywhere in the new code. The operator's `C:\DELTA` came through with `.env` and `delta.conf` hash-identical, its containers identity-unchanged, its volume present, its firewall rules intact, and **the additional domain the operator had configured through Domain Management preserved exactly**.
+- **Secrets.** No password, private key, `.env` value or connection URI in any transcript or screen. `-passin stdin` only; `pass:`, `env:` and `file:` are statically absent.
+- **PowerShell 5.1.** 15/15 scripts parse, UTF-8 with BOM, LF, no PS7-only syntax.
+
+**Three product defects found and fixed.**
+
+1. **A latent stdin-transport defect, and the one that mattered most.** `Invoke-DeltaProcessCapture` wrote its `-StandardInput` payload through the `StreamWriter` .NET builds from `Console.InputEncoding` — a UTF-8 encoder **with a byte-order mark** on this host. Worse, `StreamWriter.BaseStream`'s getter flushes the preamble, so writing raw bytes was not enough on its own: the mark was already in the pipe. Measured: a correct 10-character PKCS#12 password arrived as 13 bytes, `ef bb bf` first, and openssl answered *"Mac verify error: invalid password?"*. `ProcessStartInfo.StandardInputEncoding` is .NET Core only and does not exist on the .NET Framework PowerShell 5.1 runs on. Fixed by clearing the console encoding's preamble for the length of the call and writing explicit UTF-8 bytes, with a consumer-side BOM strip as defence for a host where the console encoding cannot be changed. **This defect was already present on the Phase 5 `psql -f -` path**; it had simply never been exercised by a byte-sensitive payload.
+2. **A layering inversion.** `ConvertTo-DeltaPlainText` lived in `Delta.Manage.ps1`, which loads *after* `Delta.Network.ps1`. The PKCS#12 conversion resolved it to nothing and **silently substituted an empty password** rather than failing loudly. Moved to `Delta.Common.ps1`, which every entry point loads first; every caller is unchanged.
+3. **`[AllowNull()]` on a `[string]` parameter still rejects the coerced empty string.** `Remove-DeltaCertificateStaging -Path $null` threw from a `finally` block, which would have masked the real failure it was cleaning up after. Needs `[AllowEmptyString()]` as well.
+
+**One Domain Management defect, fixed narrowly.** `Invoke-DeltaDomainSetPrimary` *reported* certificate coverage and then proceeded, so on a TLS installation an operator could promote an uncovered hostname and land on a knowingly broken `PUBLIC_URL`. It now **refuses** when coverage is determined and absent, names what the certificate is valid for, and points at Certificate Management — while leaving the domain configured as an additional domain. Undetermined coverage still only warns: "we could not read the SAN extension" and "the name is not there" are different facts.
+
+**Two harness faults, both the same class the earlier suites recorded.** A blast-radius grep over raw file text matched the file's own comment stating the invariant it was checking — the Domain Management suite hit this exact trap, and the fix is the same: strip comments before grepping code. And the Domain Management lifecycle suite demanded an empty additional-domain baseline; the operator has since configured a real domain through the feature, and a regression suite does not get to require that the operator has configured nothing. It now records and restores whatever baseline it finds.
+
+**Limitations**
+
+1. **No automatic renewal.** No ACME/Let's Encrypt client and no scheduled renewal, unchanged and deliberate. Expiry inside 30 days warns on the screen and in the inspection view.
+2. **No CSR generation.** For a supplied certificate the installer validates and installs what it is given.
+3. **Trust is not proved from this host.** The endpoint verification proves TLS termination and that DELTA answers; whether a browser elsewhere trusts the issuer and resolves the hostname depends on DNS and that machine's trust store. The report says exactly that and claims no more.
+4. **Coverage reading is `X509Extension.Format()`-based**, whose labels come from Windows. Both the Windows (`DNS Name=`) and OpenSSL (`DNS:`) forms are parsed; a locale emitting neither reports *undetermined* rather than wrong. Not reproducible on this host.
+5. **The HTTP port still belongs to `setup.ps1 -Reconfigure`.** Changing it moves a published port on a container that is not otherwise being recreated, and no operator has asked for it from the menu.
+6. **A brief window exists between the `.env` write and the NGINX recreation** in which recorded state is ahead of the runtime. Compose reads ports and `PUBLIC_URL` from `.env`, so it cannot be avoided; it is inside one synchronous operation and every exit path rolls the whole snapshot back.
+7. **Windows certificate-store entries are never touched**, so the "shared certificate must survive" rule is satisfied vacuously rather than by ownership analysis.
+
+---
+
 ## 9. Assessment Flow → Phase Mapping
 
 ### Installation flowchart (A§12 / A§13)

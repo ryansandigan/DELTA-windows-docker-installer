@@ -146,6 +146,11 @@ $Script:DeltaLibraries = [ordered]@{
     # the nginx -t / reload primitives, the .env writer and the certificate
     # inspector rather than reimplementing any of them.
     'Delta.Domain.ps1'    = 'Invoke-DeltaDomainOperation'
+    # Certificate Management. Loaded after Delta.Domain.ps1 because it consumes
+    # the authoritative domain model to decide certificate coverage, and after
+    # Delta.Configure.ps1 because it composes that file's certificate
+    # primitives and its application-container recreation.
+    'Delta.Tls.ps1'       = 'Invoke-DeltaCertificateOperation'
 }
 
 foreach ($library in $Script:DeltaLibraries.Keys) {
