@@ -1820,7 +1820,7 @@ The unit suite gained a **real GUI test**: it launches an STA PowerShell, calls 
 
 #### Follow-up — promoting a certificate-covered domain
 
-**2026-08-21, same day.** The primary-domain refusal was correct and stayed correct, but it was a dead end: an operator installing on `localhost` and then being handed a certificate for `delta.ncscm.gov.jo` was told what was wrong and sent to a different menu to fix it. The refusal now comes with an offer.
+**2026-08-21, same day** · commit `e959802`. The primary-domain refusal was correct and stayed correct, but it was a dead end: an operator installing on `localhost` and then being handed a certificate for `delta.ncscm.gov.jo` was told what was wrong and sent to a different menu to fix it. The refusal now comes with an offer.
 
 When the gate refuses, the names already extracted from the certificate are filtered through `Test-DeltaDomainName` — Domain Management's rule, not a second one — and offered as primary domains. One candidate is a yes/no question; several are a numbered list, because a certificate carrying four SANs does not say which of them the installation should call itself. Wildcards, IPv6 literals and anything malformed are dropped rather than proposed: `*.example.org` is a real thing to find on a certificate and not a hostname DELTA can be reached at.
 
