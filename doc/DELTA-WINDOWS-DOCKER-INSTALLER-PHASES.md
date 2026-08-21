@@ -1550,7 +1550,7 @@ The final backup was ordered with the other destructive steps, **after** `compos
 
 **Not a phase.** Phases 1–12 are the installer's specified scope and are complete. This is a post-Phase-12 feature added on top of the settled architecture, recorded here because the phasing document is where this project keeps its implementation history.
 
-**Status: COMPLETE** · 2026-08-21 · **Validated: 364/364 assertions.**
+**Status: COMPLETE** · 2026-08-21 · commit `ed640a8` · **Validated: 364/364 assertions.**
 
 **Goal.** An administrator can manage the hostnames DELTA answers to from the management utility, without hand-editing `.env`, the NGINX configuration or `docker-compose.yml`, and without being told to leave the utility and run `.\setup.ps1 -Reconfigure`.
 
