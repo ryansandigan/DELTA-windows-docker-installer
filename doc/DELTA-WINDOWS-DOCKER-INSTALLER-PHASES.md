@@ -1784,7 +1784,7 @@ What stayed, and why:
 The failure matrix swapped its "wrong PKCS#12 password" case for "a `.pfx` supplied where a certificate is expected", which is the failure an operator can now actually have. The suites manufacture their PEM fixtures with their own openssl helper, clearly marked test-local, rather than through a product primitive that no longer exists.
 #### Follow-up — the certificate picker, reversed
 
-**2026-08-21, same day.** The rework chose typed paths over the reference installer's `Select-DeltaSslFile`, arguing that a modal dialog which never appears on a remote operator's screen is a hang rather than a convenience. **The operator reversed that**, and they are right about the common case: locating a certificate wherever the CA's bundle happened to land is exactly what a file picker is for, and an administrator who has just been handed one should not be transcribing its path.
+**2026-08-21, same day** · commit `5907f4f`. The rework chose typed paths over the reference installer's `Select-DeltaSslFile`, arguing that a modal dialog which never appears on a remote operator's screen is a hang rather than a convenience. **The operator reversed that**, and they are right about the common case: locating a certificate wherever the CA's bundle happened to land is exactly what a file picker is for, and an administrator who has just been handed one should not be transcribing its path.
 
 *Use an existing certificate and private key* now opens two Windows file-selection dialogs, certificate first and key second, with the reference's own titles and filters:
 
