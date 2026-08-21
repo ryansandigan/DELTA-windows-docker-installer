@@ -45,6 +45,17 @@ installers/
 *.msi
 
 # -----------------------------------------------------------------------------
+# Release packaging output.
+#
+# tools\build-release.ps1 deletes and recreates release\ wholesale on every
+# run. It is build output, never source - and leaving it untracked but not
+# ignored would dirty the working tree and trip release.ps1's clean-tree
+# guardrail after any local package build.
+# -----------------------------------------------------------------------------
+
+release/
+
+# -----------------------------------------------------------------------------
 # Local test artefacts and scratch output
 # -----------------------------------------------------------------------------
 

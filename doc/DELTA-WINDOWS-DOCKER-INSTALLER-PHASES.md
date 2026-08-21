@@ -80,7 +80,9 @@ C:\Workspace\DELTA-windows-installer-docker\
     └── DELTA-WINDOWS-DOCKER-INSTALLER-PHASES.md
 ```
 
-`uninstall.ps1` was added by Phase 12; through Phase 11 there was deliberately none. There is no `docs\` directory and no `CHANGELOG.md`; the per-phase implementation-status sections in this document are the change record.
+`uninstall.ps1` was added by Phase 12; through Phase 11 there was deliberately none. There is no `docs\` directory, and the per-phase implementation-status sections in this document remain the change record for the phase work itself.
+
+Release infrastructure was added after Phase 12 and is not shown in the tree above: `release.ps1` and `tools\build-release.ps1` at the repository root, `lib\Delta.Version.ps1` as the installer's own version source, and a `CHANGELOG.md` holding the curated per-release notes. `CHANGELOG.md` is now the release-facing change record — `release.ps1` refuses to cut a release for a version that has no populated `## [X.Y.Z]` section — and it complements, rather than replaces, the phase records here.
 
 `Delta.Manage.ps1` will grow across Phases 7–10. Split it when it does — the natural seams are backup, update, and configuration management.
 

@@ -1552,3 +1552,52 @@ Stated plainly so it is not mistaken for a gap:
 - **It does not install or manage a Linux distribution.** Docker Desktop's own
   WSL distribution is Docker's; the installer only talks to `docker`,
   `docker compose` and `docker desktop`.
+
+---
+
+## Cutting a release
+
+For maintainers of this repository, not for installing DELTA.
+
+The installer's own version lives in `lib\Delta.Version.ps1`, and release notes
+live in `CHANGELOG.md`. Write the `## [X.Y.Z]` section for the version you are
+about to cut and commit it first — `release.ps1` refuses to release a version
+that has no notes.
+
+```powershell
+.\release.ps1                  # bump the patch version (1.0.0 -> 1.0.1)
+.\release.ps1 -Version 2.1.0   # release exactly 2.1.0
+.\release.ps1 -DryRun          # show what would happen, change nothing
+```
+
+`release.ps1` bumps `lib\Delta.Version.ps1`, commits it as
+`build: bump installer version to X.Y.Z`, pushes, then creates and pushes an
+annotated `vX.Y.Z` tag. It checks everything before it changes anything: you
+must be in a Git repository, on `main`, with a clean working tree, a version
+file that parses as `X.Y.Z`, a `vX.Y.Z` tag that does not already exist, and a
+non-empty `## [X.Y.Z]` section in `CHANGELOG.md`. Any failure stops with the
+version file and Git state untouched.
+
+`-DryRun` runs every one of those checks, prints the current and next version
+and the five Git commands it would run, and writes nothing — no file change, no
+commit, no tag.
+
+### Building the package
+
+`tools\build-release.ps1` produces the distributable ZIP:
+
+```powershell
+.\tools\build-release.ps1 -Version 1.0.0
+```
+
+It copies an explicit whitelist of production files into
+`release\DELTA-windows-installer-docker-<Version>\`, zips it, and writes a
+matching `.sha256`. `release\` is deleted and recreated on every run, so a
+rebuild never mixes in leftovers. It downloads nothing and publishes nothing —
+Docker Desktop and the container images are still obtained at install time.
+
+> **The pushed tag does not publish anything yet.** There is no
+> `.github\workflows\release.yml` in this repository, so nothing is listening
+> for `v*` tags. `release.ps1` produces the version bump and the tag, and
+> `tools\build-release.ps1` produces the package — but you must run the packager
+> yourself, and attaching the result to a GitHub Release is still manual.
