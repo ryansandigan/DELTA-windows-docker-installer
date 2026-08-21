@@ -1659,7 +1659,7 @@ Domain Management is **option 8**, inside the Docker-gated block (every mutation
 
 **Not a phase.** A focused rework of the Phase 10 feature, on top of Domain Management.
 
-**Status: COMPLETE** · 2026-08-21 · **Validated: 456/456 assertions.**
+**Status: COMPLETE** · 2026-08-21 · commit `c12922a` · **Validated: 456/456 assertions.**
 
 **Goal.** Certificate Management owns the HTTPS lifecycle — enable, inspect, replace, disable, re-enable — from inside the management utility. The Phase 10 behaviour of telling an HTTP installation to leave the utility and run `.\setup.ps1 -Reconfigure` is gone.
 
