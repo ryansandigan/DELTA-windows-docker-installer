@@ -1688,13 +1688,15 @@ Recreation is nevertheless genuinely required, and this is why: the nginx servic
 
 #### Shared primitives
 
-There is now exactly one Certificate Management implementation and one TLS transition. `Set-DeltaTlsState` is the transaction; `Set-DeltaCertificateMaterial` is the same-state certificate swap, kept separate because it genuinely needs only a reload. Both share `Resolve-DeltaCertificateInput` and `Test-DeltaCertificateActivation`. New primitives added to `Delta.Network.ps1` beside the existing certificate logic: `Get-DeltaCertificateSourceKind`, `Convert-DeltaPkcs12ToPem`, `Get-DeltaCertificateDetail`.
+There is now exactly one Certificate Management implementation and one TLS transition. `Set-DeltaTlsState` is the transaction; `Set-DeltaCertificateMaterial` is the same-state certificate swap, kept separate because it genuinely needs only a reload. Both share `Resolve-DeltaCertificateInput` and `Test-DeltaCertificateActivation`. New primitives added to `Delta.Network.ps1` beside the existing certificate logic: `Get-DeltaCertificateSourceKind` and `Get-DeltaCertificateDetail`.
 
 #### Certificate input
 
-PEM (`.crt`/`.cer`/`.pem` + `.key`/`.pem`), PKCS#12 (`.pfx`/`.p12`), self-signed generation, and reuse of the preserved staged pair. DER, PKCS#7 and the Windows store are refused — they fail A§11's second test, "can it be converted safely into what NGINX consumes", on this architecture.
+**PEM only**, plus self-signed generation and reuse of the preserved staged pair. NGINX serves PEM files directly, so nothing is converted on the way in and there is no transformation step between the operator's files and the ones being served.
 
-**The PKCS#12 password reaches openssl on stdin and nowhere else.** Not an argument (visible in the process list and in this installer's own captured argument vector), not an environment variable (visible in `docker inspect` and `/proc`), not a file. It is a `SecureString` until the moment of use, converted for the narrowest scope, and cleared immediately.
+PKCS#12, DER, PKCS#7 and the Windows certificate store are all refused. The last of those is removed from this product by A§23 outright; the rest are simply not what NGINX reads. An operator holding a `.pfx` converts it once, with the tool of their choice, and supplies the resulting pair - and a `.pfx` handed in where a certificate is expected is refused by extension, before anything is parsed.
+
+**No accepted format carries a password, so there is no certificate password anywhere in this flow** - none is asked for, held in memory, or written. An encrypted private key is still refused, because NGINX cannot use one without an `ssl_password_file` holding the passphrase in plaintext beside it.
 
 #### The primary-domain gate
 
@@ -1705,7 +1707,7 @@ Coverage of the **primary** domain is a **refusal**, not a warning: `PUBLIC_URL`
 | File | |
 |---|---|
 | `lib\Delta.Tls.ps1` | **new** — the screen, four operations, the TLS transition transaction |
-| `lib\Delta.Network.ps1` | PKCS#12 conversion, certificate detail, stdin support on `Invoke-DeltaOpenSsl` |
+| `lib\Delta.Network.ps1` | certificate detail and SAN reading |
 | `lib\Delta.Docker.ps1` | stdin transport fix (below) |
 | `lib\Delta.Common.ps1` | `ConvertTo-DeltaPlainText` moved here |
 | `lib\Delta.Configure.ps1` | superseded Certificate Management removed; its four primitives kept |
@@ -1719,18 +1721,18 @@ Coverage of the **primary** domain is a **refusal**, not a warning: `PUBLIC_URL`
 
 | Suite | |
 |---|---|
-| Unit — formats, PKCS#12, detail, the gate, wildcards, screens, secrets | 98/98 |
+| Unit — formats, sources, detail, the gate, wildcards, screens, secrets | 107/107 |
 | Lifecycle — the §30 acceptance chain on a disposable installation | 119/119 |
 | Failure matrix — §23, every case provoked | 109/109 |
 | Regression — PS 5.1, manifests, menu, blast radius, secrets, uninstall | 130/130 |
 
 Plus the four Domain Management suites re-run: **370/370** (122 + 78 + 42 + 128).
 
-- **The §30 chain, end to end** on `C:\Workspace\delta-cert-test` (project `deltacert`, volume `deltacert_pgdata`, ports 8091/8453): fresh HTTP install → primary domain confirmed → **Enable HTTPS from a PKCS#12 bundle** → `PUBLIC_URL` becomes `https://…:8453`, `TLS_ENABLED=true`, Compose publishes the HTTPS port, HTTP returns **301** to the HTTPS URL including the non-standard port, the served thumbprint is the installed one, and **the running container's `printenv PUBLIC_URL` reports the new value** → inspect → replace → add a domain → coverage reported accurately → **disable** → HTTP 200 directly, HTTPS port dead, firewall rule retired, **certificate and key byte-identical** → **re-enable reusing the preserved pair** → healthy again. The database marker, the synthetic upload and the administrator bootstrap survive every step; backup still works.
-- **Failure matrix, all provoked.** Missing certificate, missing key, malformed certificate, malformed key, **key/certificate mismatch**, expired, not-yet-valid, **does not cover the primary domain**, **wrong PKCS#12 password**, `nginx -t` rejection (forced by a deliberate template fault so the real transaction runs), a port already held by a live listener, three bad replacements against a working HTTPS installation, NGINX unavailable, an unwritable state file, and a corrupt state file. Every one: previous state survives byte-for-byte, the site never went down, no database or upload touched, no password in any message.
+- **The §30 chain, end to end** on `C:\Workspace\delta-cert-test` (project `deltacert`, volume `deltacert_pgdata`, ports 8091/8453): fresh HTTP install → primary domain confirmed → **Enable HTTPS from a PEM certificate and key** → `PUBLIC_URL` becomes `https://…:8453`, `TLS_ENABLED=true`, Compose publishes the HTTPS port, HTTP returns **301** to the HTTPS URL including the non-standard port, the served thumbprint is the installed one, and **the running container's `printenv PUBLIC_URL` reports the new value** → inspect → replace → add a domain → coverage reported accurately → **disable** → HTTP 200 directly, HTTPS port dead, firewall rule retired, **certificate and key byte-identical** → **re-enable reusing the preserved pair** → healthy again. The database marker, the synthetic upload and the administrator bootstrap survive every step; backup still works.
+- **Failure matrix, all provoked.** Missing certificate, missing key, malformed certificate, malformed key, **key/certificate mismatch**, expired, not-yet-valid, **does not cover the primary domain**, **a `.pfx` supplied where a certificate is expected**, `nginx -t` rejection (forced by a deliberate template fault so the real transaction runs), a port already held by a live listener, three bad replacements against a working HTTPS installation, NGINX unavailable, an unwritable state file, and a corrupt state file. Every one: previous state survives byte-for-byte, the site never went down, no database or upload touched, no password in any message.
 - **Rollback ordering.** The state-file write is deliberately last and non-fatal — `.env` and the runtime already agree, and refusing a completed change because a note could not be filed would be worse. Everything before it rolls back the whole snapshot. Asserted separately for both.
 - **Blast radius.** No `down`, `prune`, `volume rm`, `delta_pgdata`, `New-NetFirewallRule`/`Remove-NetFirewallRule`, Windows certificate store or unscoped Docker call anywhere in the new code. The operator's `C:\DELTA` came through with `.env` and `delta.conf` hash-identical, its containers identity-unchanged, its volume present, its firewall rules intact, and **the additional domain the operator had configured through Domain Management preserved exactly**.
-- **Secrets.** No password, private key, `.env` value or connection URI in any transcript or screen. `-passin stdin` only; `pass:`, `env:` and `file:` are statically absent.
+- **Secrets.** No password, private key, `.env` value or connection URI in any transcript or screen. There is no certificate password channel at all: `-passin` in any form is statically absent from the product.
 - **PowerShell 5.1.** 15/15 scripts parse, UTF-8 with BOM, LF, no PS7-only syntax.
 
 **Three product defects found and fixed.**
@@ -1752,6 +1754,34 @@ Plus the four Domain Management suites re-run: **370/370** (122 + 78 + 42 + 128)
 5. **The HTTP port still belongs to `setup.ps1 -Reconfigure`.** Changing it moves a published port on a container that is not otherwise being recreated, and no operator has asked for it from the menu.
 6. **A brief window exists between the `.env` write and the NGINX recreation** in which recorded state is ahead of the runtime. Compose reads ports and `PUBLIC_URL` from `.env`, so it cannot be avoided; it is inside one synchronous operation and every exit path rolls the whole snapshot back.
 7. **Windows certificate-store entries are never touched**, so the "shared certificate must survive" rule is satisfied vacuously rather than by ownership analysis.
+
+#### Follow-up — certificate sources simplified
+
+**2026-08-21, same day.** PKCS#12 was removed from the product on the operator's instruction: there is no deployment requirement for it, and NGINX serves PEM regardless. The certificate-source menu is now the two options above plus the conditional reuse of a preserved pair.
+
+What went: `Convert-DeltaPkcs12ToPem`, `$Script:DeltaPkcs12Extensions`, the `pkcs12` kind on `Resolve-DeltaCertificateInput`, its `-Pkcs12Password` parameter, the menu's PKCS#12 option and password prompt, the "that looks like a .pfx, shall I read it as one?" fallback, and the `-StandardInput` channel on `Invoke-DeltaOpenSsl`. **No accepted format carries a password now, so the strongest available claim is not that the password is handled carefully but that there is no password channel at all** - `-passin` in any form is statically absent from the product, and the suite asserts that rather than asserting on how a secret is carried.
+
+What stayed, and why:
+
+- **The stdin transport fix in `Invoke-DeltaProcessCapture`.** It was found through the PKCS#12 password, but the defect is the transport's, not the feature's, and `Invoke-DeltaDockerCommand -StandardInput` still carries SQL to `psql -f -` on two paths in `Delta.Manage.ps1`. Those survived the BOM only because a mark ahead of a statement is whitespace to the parser; a consumer reading its first bytes literally would not. Its comment no longer cites a password that can no longer exist.
+- **`ConvertTo-DeltaPlainText` in `Delta.Common.ps1`.** The move was right independently of what prompted it: the administrator reset, the `.env` generator and the completion summary all call it, and a credential helper that can resolve to nothing is a defect waiting for its second caller.
+- **Everything the removal was told not to disturb**: PEM validation, key-pair matching, expiry gating, the primary-domain coverage refusal, additional-domain warnings, the transaction and its rollback, and the self-signed flow.
+
+**One further product defect, found by the re-run.** `New-DeltaCertificateStaging` created its directory and *then* hardened it, returning the path only afterwards - so a hardening failure orphaned a directory inside `certs\` with nobody holding its name to remove it in the caller's `finally`. One was found empty in the operator's `C:\DELTA\certs` and removed. Hardening is now non-fatal and the path is always returned; the regression suite asserts `certs\` is left with no staging directory.
+
+**One harness defect, older than this task.** `Assert-That 'L7c state and NGINX still agree' (A -eq B | ... -join ',')` bound a *string* to a `[bool]` parameter: the call threw, that check and the two after it never ran, and the Domain Management lifecycle suite still reported a clean pass at 78. Fixed by computing the join into a variable first. The suite now runs **81**. A precedence bug inside an assertion is invisible by construction - the only symptom was a non-zero exit code behind a green summary.
+
+#### Validation after the simplification — 826/826
+
+| Suite | |
+|---|---|
+| Certificate unit | 107/107 |
+| Certificate lifecycle (§30) | 119/119 |
+| Certificate failure matrix (§23) | 109/109 |
+| Certificate regression | 139/139 |
+| Domain Management (4 suites) | 122 + 81 + 42 + 128 |
+
+The failure matrix swapped its "wrong PKCS#12 password" case for "a `.pfx` supplied where a certificate is expected", which is the failure an operator can now actually have. The suites manufacture their PEM fixtures with their own openssl helper, clearly marked test-local, rather than through a product primitive that no longer exists.
 
 ---
 

@@ -378,10 +378,11 @@ function ConvertTo-DeltaPlainText {
       PowerShell 5.1-compatible idiom, adapted from the reference installer.
 
       Lives here, in the file every entry point loads first, because callers
-      exist at every layer: the administrator reset, the .env generator, and
-      the PKCS#12 conversion in Delta.Network.ps1. Defining it in a
-      late-loading file made that last one resolve to nothing and silently
-      substitute an empty password - measured.
+      exist at every layer - the administrator reset, the .env generator, the
+      completion summary. Defining it in a late-loading file once made an
+      earlier-loading caller resolve it to nothing and silently substitute an
+      empty string, which is the kind of failure a credential helper must not
+      be able to have.
     #>
     param([Parameter(Mandatory)][SecureString]$SecureString)
     return [System.Net.NetworkCredential]::new('', $SecureString).Password

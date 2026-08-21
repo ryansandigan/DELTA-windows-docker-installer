@@ -431,38 +431,23 @@ function Invoke-DeltaOpenSsl {
       and the private key never appears in an argument, an environment
       variable or a log line - only file paths inside the container do.
 
-      -StandardInput carries a secret - a PKCS#12 password - to openssl's
-      `-passin stdin`. It is deliberately the only channel offered for one:
-
-        an argument      is visible in the Windows process list, in any
-                         command-line auditing, and in this installer's own
-                         captured argument vector
-        an environment   is visible in `docker inspect` for the life of the
-        variable         container and in /proc inside it
-        a file           is a password written to disk, however briefly
-
-      stdin is none of those. It needs `-i` on `docker run`, which is why the
-      flag is added only on this path.
+      No secret is ever passed to openssl here. The certificate sources this
+      installer accepts are a PEM certificate and an unencrypted PEM key, and
+      neither needs a password to read - so there is no password channel to get
+      wrong.
     #>
     param(
         [Parameter(Mandatory)][string]$Image,
         [Parameter(Mandatory)][string]$Command,
         [Parameter(Mandatory)][string]$MountPath,
         [switch]$Writable,
-        [AllowNull()][string]$StandardInput,
         [int]$TimeoutSeconds = 180
     )
 
     $mount = if ($Writable) { "${MountPath}:/work" } else { "${MountPath}:/work:ro" }
-
-    $arguments = @('run', '--rm', '--network', 'none')
-    if ($PSBoundParameters.ContainsKey('StandardInput')) { $arguments += '-i' }
-    $arguments += @('-v', $mount, '--entrypoint', 'sh', $Image, '-c', $Command)
-
-    if ($PSBoundParameters.ContainsKey('StandardInput')) {
-        return (Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds $TimeoutSeconds -StandardInput $StandardInput)
-    }
-    return (Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds $TimeoutSeconds)
+    return (Invoke-DeltaDockerCommand -Arguments @(
+        'run', '--rm', '--network', 'none', '-v', $mount, '--entrypoint', 'sh', $Image, '-c', $Command
+    ) -TimeoutSeconds $TimeoutSeconds)
 }
 
 function Test-DeltaPrivateKeyEncrypted {
@@ -784,28 +769,28 @@ function Get-DeltaCertificateDomainCoverage {
 # ---------------------------------------------------------------------------
 # Certificate input (A§11.2)
 #
-# NGINX consumes PEM and nothing else, so PEM is what everything here converges
-# on. The reference installer's NGINX path accepts exactly the same set
-# (.crt/.cer/.pem plus a .key); its PFX handling belongs to setup-iis.ps1,
-# because IIS requires PKCS#12 - the opposite conversion to the one needed here.
+# NGINX consumes PEM and nothing else, so PEM is the only format an operator
+# supplies: a .crt/.cer/.pem certificate and a .key/.pem private key. That is
+# exactly the set the reference installer's NGINX path accepts too.
 #
-# PKCS#12 is accepted anyway, because a PFX is what a Windows administrator is
-# most often handed by their CA, and because the conversion is a single openssl
-# invocation in the image that is already required and already pulled. That is
-# the whole test A§11 sets for a format: can it be validated, and can it be
-# converted safely into what NGINX actually consumes. DER, PKCS#7 and the
-# Windows certificate store all fail the second half of that on this
-# architecture (A§23) and are not offered.
+# Nothing is converted. A format that has to be transformed before NGINX can
+# read it is a step that can fail, a secret that has to be carried, and a
+# second thing to keep correct - and none of that is bought by this
+# installation, which serves the files it is given. PKCS#12, DER, PKCS#7 and
+# the Windows certificate store are all out: the last of those is removed from
+# this product by A§23 outright, and the rest are simply not what NGINX reads.
+#
+# An operator holding a .pfx converts it once, with the tool of their choice,
+# and supplies the resulting pair.
 # ---------------------------------------------------------------------------
 
 $Script:DeltaPemCertificateExtensions = @('.crt', '.cer', '.pem')
 $Script:DeltaPemKeyExtensions         = @('.key', '.pem')
-$Script:DeltaPkcs12Extensions         = @('.pfx', '.p12')
 
 function Get-DeltaCertificateSourceKind {
     <#
-      Classifies an operator-supplied certificate file by extension: 'pkcs12',
-      'pem', or 'unsupported'.
+      Classifies an operator-supplied certificate file by extension: 'pem' or
+      'unsupported'.
 
       Extension, not content sniffing, and deliberately so - it is what the
       reference installer checks, it is what the operator can see and correct,
@@ -817,120 +802,8 @@ function Get-DeltaCertificateSourceKind {
     if ([string]::IsNullOrWhiteSpace($Path)) { return 'unsupported' }
     $extension = ([System.IO.Path]::GetExtension($Path)).ToLowerInvariant()
 
-    if ($Script:DeltaPkcs12Extensions -contains $extension) { return 'pkcs12' }
     if ($Script:DeltaPemCertificateExtensions -contains $extension) { return 'pem' }
     return 'unsupported'
-}
-
-function Convert-DeltaPkcs12ToPem {
-    <#
-      Splits a PKCS#12 bundle into the PEM certificate and unencrypted PEM
-      private key NGINX needs, in a staging directory the caller owns.
-
-      The password reaches openssl on stdin and nowhere else (see
-      Invoke-DeltaOpenSsl), is converted from its SecureString for the
-      narrowest possible scope, and is cleared immediately afterwards - the
-      same discipline New-DeltaEnvironmentFile and the admin reset already
-      follow for credential material. It is never echoed, never logged, never
-      written to .env and never recorded in installer state.
-
-      A wrong password is reported as a wrong password rather than as a corrupt
-      file, because those have completely different fixes and openssl's own
-      wording ("mac verify failure") tells an operator neither.
-
-      The key comes out unencrypted (-nodes) because NGINX cannot use an
-      encrypted key without an ssl_password_file holding the passphrase in
-      plaintext beside it, which buys nothing - the same reasoning
-      Test-DeltaCertificateMaterial already applies to a supplied key. The
-      result is written into a staging directory and hardened by the caller
-      when it is installed.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$StagingDirectory,
-        [Parameter(Mandatory)][string]$OpenSslImage,
-        [AllowNull()][SecureString]$Password
-    )
-
-    $result = [PSCustomObject]@{ Succeeded = $false; Reason = $null; CertificatePath = $null; KeyPath = $null }
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        $result.Reason = "The certificate file '$Path' does not exist."
-        return $result
-    }
-
-    if (-not (Test-Path -LiteralPath $StagingDirectory -PathType Container)) {
-        $null = New-Item -ItemType Directory -Path $StagingDirectory -Force
-    }
-
-    # The operator's own file is copied in, never moved and never modified:
-    # it is their source material and this installer does not own it.
-    Copy-Item -LiteralPath $Path -Destination (Join-Path $StagingDirectory 'source.pfx') -Force
-
-    # `-passin stdin` consumes one line. An empty password is a real and common
-    # case, and a bare newline expresses it.
-    $plain = ''
-    if ($Password) { $plain = ConvertTo-DeltaPlainText -SecureString $Password }
-
-    try {
-        $capture = Invoke-DeltaOpenSsl -Image $OpenSslImage -MountPath $StagingDirectory -Writable -StandardInput ($plain + "`n") -Command @'
-set -e
-read -r PW || PW=""
-# Defence in depth for the byte-order mark .NET Framework prepends to a
-# redirected stdin. The transport removes it at source by clearing the console
-# encoding's preamble; this covers a host where that could not be changed -
-# stdin already redirected, or no console at all - where the alternative is a
-# correct password being reported as wrong.
-PW=${PW#$(printf '\357\273\277')}
-if ! printf '%s' "$PW" | openssl pkcs12 -in /work/source.pfx -passin stdin -nokeys -clcerts -out /work/converted.crt 2>/work/pkcs12.err; then
-  if grep -qi 'mac verify failure\|invalid password\|wrong password' /work/pkcs12.err; then echo PKCS12_BAD_PASSWORD; else echo PKCS12_PARSE_FAILED; fi
-  exit 0
-fi
-if ! printf '%s' "$PW" | openssl pkcs12 -in /work/source.pfx -passin stdin -nocerts -nodes -out /work/converted.key 2>/work/pkcs12.err; then
-  echo PKCS12_NO_KEY
-  exit 0
-fi
-echo PKCS12_CONVERTED
-'@
-    }
-    finally {
-        # Cleared here, not left to garbage collection, and the SecureString
-        # itself is the caller's to dispose.
-        $plain = $null
-        Remove-Item -LiteralPath (Join-Path $StagingDirectory 'source.pfx') -Force -ErrorAction SilentlyContinue
-    }
-
-    $output = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
-    $errorFile = Join-Path $StagingDirectory 'pkcs12.err'
-    if (Test-Path -LiteralPath $errorFile) { Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue }
-
-    if ($output -match 'PKCS12_BAD_PASSWORD') {
-        $result.Reason = 'The password did not open that PKCS#12 file. Check the password and try again.'
-        return $result
-    }
-    if ($output -match 'PKCS12_NO_KEY') {
-        $result.Reason = "'$Path' opened, but contains no private key. A certificate NGINX can serve must come with its key."
-        return $result
-    }
-    if ($output -notmatch 'PKCS12_CONVERTED') {
-        $result.Reason = "'$Path' could not be read as a PKCS#12 file. It may be a different format than its extension suggests."
-        return $result
-    }
-
-    $certificatePath = Join-Path $StagingDirectory 'converted.crt'
-    $keyPath         = Join-Path $StagingDirectory 'converted.key'
-    if (-not (Test-Path -LiteralPath $certificatePath) -or -not (Test-Path -LiteralPath $keyPath)) {
-        $result.Reason = "'$Path' was read but the certificate and key could not both be extracted from it."
-        return $result
-    }
-
-    # The extracted key is secret material the moment it exists.
-    Protect-DeltaSecretFile -Path $keyPath
-
-    $result.CertificatePath = $certificatePath
-    $result.KeyPath         = $keyPath
-    $result.Succeeded       = $true
-    return $result
 }
 
 function Get-DeltaCertificateDetail {

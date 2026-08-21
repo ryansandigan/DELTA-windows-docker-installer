@@ -142,14 +142,18 @@ function Invoke-DeltaProcessCapture {
     # bytes is not enough on its own: the mark is already in the pipe ahead of
     # them.
     #
-    # Measured: a PKCS#12 password sent this way arrived as 13 bytes rather than
-    # 10 - ef bb bf then the password - and openssl answered "Mac verify error:
-    # invalid password?" for a password that was correct.
+    # Measured with a short ASCII payload written through this function: it
+    # arrived three bytes longer than it was sent, ef bb bf first, and the
+    # program on the far side read the mark as part of the value. The psql
+    # callers above survive it only because a BOM ahead of a statement is
+    # whitespace to the parser; any consumer that reads its first bytes
+    # literally would not.
     #
     # Setting the console encoding to a preamble-free UTF-8 for the length of
     # this call is the only lever 5.1 offers. It is restored in the finally
     # block below, and a host that refuses the change (stdin already redirected,
-    # no console) is not a failure - the consumer-side guard covers it.
+    # no console) is not a failure - the explicit byte write below still fixes
+    # the payload's own encoding.
     $previousInputEncoding = $null
     if ($PSBoundParameters.ContainsKey('StandardInput')) {
         try {

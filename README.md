@@ -747,29 +747,52 @@ Domain coverage
   0. Return
 ```
 
-#### Certificate formats
+#### Certificate sources
 
-| You have | Supply |
-|---|---|
-| PEM certificate + private key | the `.crt`/`.cer`/`.pem` and the `.key`/`.pem` |
-| A PKCS#12 bundle | the `.pfx`/`.p12` and its password |
-| Nothing yet | choose *Generate a self-signed certificate* |
+Two, and the menu offers exactly those:
 
-NGINX consumes PEM and nothing else, so a PKCS#12 bundle is converted into a PEM
-pair here — by OpenSSL, in the database image that is already required and
-already pulled. **The password reaches OpenSSL on standard input and nowhere
-else**: never in a command line, never in an environment variable, never written
-to disk, never echoed as you type it, and never recorded in `.env`, the state
-file or any log. Your original `.pfx` is only ever read; it is never moved,
-modified or deleted.
+```
+Where is the certificate coming from?
 
-DER, PKCS#7 and the Windows certificate store are not accepted. This installer
-terminates TLS from mounted PEM files and has no involvement with the Windows
-certificate store at all.
+  1. Use an existing certificate and private key
+     Select a certificate (.crt/.cer/.pem) and private key (.key).
+     Recommended for production certificates issued by your
+     organization or certificate provider.
+
+  2. Generate a self-signed certificate
+     For testing or internal use. Browsers will warn unless trusted.
+
+  0. Cancel
+```
+
+When you are re-enabling HTTPS after disabling it, a third option appears —
+*Reuse the certificate already in `certs\`* — offering the pair that was
+preserved. It is validated again from scratch before it is used.
+
+**PEM is the only format accepted.** NGINX serves PEM files directly, so that is
+what you supply and that is what gets installed: nothing is converted on the way
+in, and there is no transformation step between your files and the ones being
+served.
+
+PKCS#12 (`.pfx`/`.p12`), DER, PKCS#7 and the Windows certificate store are not
+accepted. This installer terminates TLS from mounted PEM files and has no
+involvement with the Windows certificate store at all. If your certificate
+provider gave you a `.pfx`, convert it once with the tool of your choice and
+supply the resulting certificate and key — for example:
+
+```
+openssl pkcs12 -in delta.pfx -nokeys  -clcerts -out delta.crt
+openssl pkcs12 -in delta.pfx -nocerts -nodes   -out delta.key
+```
+
+Supplying a `.pfx` where a certificate is expected is refused by extension, with
+a message saying so, before anything is parsed or changed.
 
 An encrypted private key is refused rather than accommodated: NGINX cannot use
 one without an `ssl_password_file` holding the passphrase in plaintext beside
-it, which gains nothing.
+it, which gains nothing. Because no accepted format carries a password, **there
+is no certificate password anywhere in this flow** — none is asked for, held,
+or written.
 
 #### What is validated before anything is touched
 

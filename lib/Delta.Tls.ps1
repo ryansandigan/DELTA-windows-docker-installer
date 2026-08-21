@@ -6,7 +6,6 @@
 # and Delta.Domain.ps1 first. This file composes their primitives:
 #
 #   certificate parse / pair match / expiry     Delta.Network.ps1
-#   PKCS#12 -> PEM conversion                   Delta.Network.ps1
 #   SAN reading and coverage                    Delta.Network.ps1
 #   self-signed generation                      Delta.Network.ps1
 #   staging with the private-key ACL            Delta.Network.ps1
@@ -80,12 +79,15 @@ function Resolve-DeltaCertificateInput {
       in a staging directory, ready to install - or a named reason it cannot
       be used.
 
-      Three sources, and they converge immediately so that everything after
-      this point is one code path:
+      Two sources, and they converge immediately so that everything after this
+      point is one code path:
 
         pem       a certificate file plus a separate key file
-        pkcs12    one .pfx/.p12, converted through openssl in the container
         staged    the certificate already in certs\, re-validated from scratch
+
+      Nothing is converted on the way in. NGINX reads PEM, so PEM is what is
+      supplied and PEM is what is installed - there is no transformation step
+      between the operator's files and the ones being served.
 
       "staged" exists for re-enabling HTTPS after it was disabled: disabling
       preserves the material, and offering it back is the difference between a
@@ -103,10 +105,9 @@ function Resolve-DeltaCertificateInput {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][object]$Configuration,
-        [Parameter(Mandatory)][ValidateSet('pem', 'pkcs12', 'staged')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('pem', 'staged')][string]$Kind,
         [string]$CertificatePath,
         [string]$KeyPath,
-        [AllowNull()][SecureString]$Pkcs12Password,
         [Parameter(Mandatory)][string]$StagingDirectory
     )
 
@@ -131,23 +132,13 @@ function Resolve-DeltaCertificateInput {
             $result.CertificatePath = $installed.CertificatePath
             $result.KeyPath         = $installed.KeyPath
         }
-        'pkcs12' {
-            $converted = Convert-DeltaPkcs12ToPem -Path $CertificatePath -StagingDirectory $StagingDirectory `
-                -OpenSslImage $openSslImage -Password $Pkcs12Password
-            if (-not $converted.Succeeded) {
-                $result.Reason = $converted.Reason
-                return $result
-            }
-            $result.CertificatePath = $converted.CertificatePath
-            $result.KeyPath         = $converted.KeyPath
-        }
         'pem' {
             if (-not $CertificatePath -or -not $KeyPath) {
                 $result.Reason = 'A certificate file and a private key file are both required.'
                 return $result
             }
             if ((Get-DeltaCertificateSourceKind -Path $CertificatePath) -ne 'pem') {
-                $result.Reason = "'$CertificatePath' is not a supported certificate file. Supported: $($Script:DeltaPemCertificateExtensions -join ', ') for PEM, or $($Script:DeltaPkcs12Extensions -join ', ') for a PKCS#12 bundle."
+                $result.Reason = "'$CertificatePath' is not a supported certificate file. Supported: $($Script:DeltaPemCertificateExtensions -join ', '). NGINX serves PEM; convert another format to PEM first and supply the certificate and key."
                 return $result
             }
             $keyExtension = ([System.IO.Path]::GetExtension($KeyPath)).ToLowerInvariant()
@@ -911,19 +902,16 @@ function Read-DeltaCertificateSource {
     Write-Host ''
     Write-Host 'Where is the certificate coming from?'
     Write-Host ''
-    Write-Host '  1. A certificate and private key in PEM format'
-    Write-Detail '.crt/.cer/.pem plus a .key - what NGINX serves directly.'
+    Write-Host '  1. Use an existing certificate and private key'
+    Write-Detail 'Select a certificate (.crt/.cer/.pem) and private key (.key).'
+    Write-Detail 'Recommended for production certificates issued by your'
+    Write-Detail 'organization or certificate provider.'
     Write-Host ''
-    Write-Host '  2. A PKCS#12 bundle (.pfx/.p12)'
-    Write-Detail 'Converted here into the PEM pair NGINX needs. The password is used'
-    Write-Detail 'once and is never stored, logged or displayed.'
-    Write-Host ''
-    Write-Host '  3. Generate a self-signed certificate'
-    Write-Detail 'Covers every configured domain. Browsers will warn until it is trusted'
-    Write-Detail 'or replaced. Suitable for internal testing, not for public use.'
+    Write-Host '  2. Generate a self-signed certificate'
+    Write-Detail 'For testing or internal use. Browsers will warn unless trusted.'
     if ($canOfferStaged) {
         Write-Host ''
-        Write-Host '  4. Reuse the certificate already in certs\'
+        Write-Host '  3. Reuse the certificate already in certs\'
         Write-Detail "$($staged.Subject)"
         Write-Detail 'It is validated again from scratch before it is used.'
     }
@@ -942,26 +930,13 @@ function Read-DeltaCertificateSource {
             if (-not $certificate) { return $null }
             $key = ([string](Read-Host -Prompt 'Private key file (.key/.pem)')).Trim('"', ' ')
             if (-not $key) { return $null }
-            return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key; Password = $null }
+            return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key }
         }
         if ($choice -eq '2') {
-            Write-Host ''
-            Write-Host 'Leave blank to cancel.'
-            $bundle = ([string](Read-Host -Prompt 'PKCS#12 file (.pfx/.p12)')).Trim('"', ' ')
-            if (-not $bundle) { return $null }
-            # A SecureString: never echoed to the console, never captured in a
-            # transcript, and converted to plain text only inside the
-            # conversion call, for the length of one openssl invocation that
-            # receives it on stdin.
-            Write-Detail 'The password is not shown as you type. Press Enter if the file has none.'
-            $password = Read-Host -Prompt 'Password' -AsSecureString
-            return [PSCustomObject]@{ Kind = 'pkcs12'; CertificatePath = $bundle; KeyPath = $null; Password = $password }
+            return [PSCustomObject]@{ Kind = 'self-signed'; CertificatePath = $null; KeyPath = $null }
         }
-        if ($choice -eq '3') {
-            return [PSCustomObject]@{ Kind = 'self-signed'; CertificatePath = $null; KeyPath = $null; Password = $null }
-        }
-        if ($choice -eq '4' -and $canOfferStaged) {
-            return [PSCustomObject]@{ Kind = 'staged'; CertificatePath = $null; KeyPath = $null; Password = $null }
+        if ($choice -eq '3' -and $canOfferStaged) {
+            return [PSCustomObject]@{ Kind = 'staged'; CertificatePath = $null; KeyPath = $null }
         }
         Write-DeltaWarning "'$choice' is not a valid option."
     }
@@ -1042,25 +1017,9 @@ function Get-DeltaCertificateForActivation {
             $kind = $chosen.Kind
             $result.TlsMode = if ($kind -eq 'staged' -and $Configuration.TlsMode -and $Configuration.TlsMode -ne 'none') { $Configuration.TlsMode } else { 'supplied' }
 
-            if ($kind -eq 'pem' -and (Get-DeltaCertificateSourceKind -Path $chosen.CertificatePath) -eq 'pkcs12') {
-                # The operator chose PEM and typed a .pfx. Say what it is and
-                # offer the right reader - but never silently, because they may
-                # simply have typed the wrong path.
-                Write-DeltaWarning "'$($chosen.CertificatePath)' looks like a PKCS#12 bundle rather than a PEM certificate."
-                if (-not $AllowPrompt) {
-                    $result.Reason = "'$($chosen.CertificatePath)' is a PKCS#12 bundle. Supply it as one."
-                    return $result
-                }
-                if (Read-DeltaYesNoConfirmation -Body { Write-Host 'Read it as a PKCS#12 bundle instead?' }) {
-                    Write-Detail 'The password is not shown as you type. Press Enter if the file has none.'
-                    $pending = [PSCustomObject]@{ Kind = 'pkcs12'; CertificatePath = $chosen.CertificatePath; KeyPath = $null; Password = (Read-Host -Prompt 'Password' -AsSecureString) }
-                }
-                continue
-            }
-
             $resolved = Resolve-DeltaCertificateInput -InstallRoot $InstallRoot -Configuration $Configuration `
                 -Kind $kind -CertificatePath $chosen.CertificatePath -KeyPath $chosen.KeyPath `
-                -Pkcs12Password $chosen.Password -StagingDirectory $StagingDirectory
+                -StagingDirectory $StagingDirectory
         }
 
         if (-not $resolved.Succeeded) {
@@ -1135,7 +1094,16 @@ function New-DeltaCertificateStaging {
 
     $path = Join-Path -Path $InstallRoot -ChildPath ("certs\.staging-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $null = New-Item -ItemType Directory -Path $path -Force
-    Protect-DeltaSecretFile -Path $path
+
+    # Hardened after creation, and a hardening failure must not throw: the
+    # caller records the returned path and removes it in a finally block, so
+    # throwing between the mkdir and the return orphans the directory inside
+    # certs\ with nobody left holding its name. It inherits certs\'s own
+    # protection either way; the explicit ACL is a tightening, not the only
+    # thing standing between this and the world.
+    try { Protect-DeltaSecretFile -Path $path }
+    catch { Write-DeltaWarning "The certificate staging directory could not be ACL-restricted: $($_.Exception.Message)" }
+
     return $path
 }
 

@@ -120,12 +120,11 @@ function Read-DeltaAdminNewPassword {
     }
 }
 
-# ConvertTo-DeltaPlainText moved to lib\Delta.Common.ps1 when Certificate
-# Management needed it to hand a PKCS#12 password to openssl. It is a pure
-# SecureString helper with no dependencies, and leaving it here meant a file
-# loaded early (Delta.Network.ps1) depending on one loaded late - which
-# degraded to an empty password rather than failing loudly. Every caller is
-# unchanged; only where it is defined moved.
+# ConvertTo-DeltaPlainText moved to lib\Delta.Common.ps1. It is a pure
+# SecureString helper with no dependencies, and defining it here - in a file
+# loaded late - meant an earlier-loading caller could resolve it to nothing and
+# silently substitute an empty string. Every caller is unchanged; only where it
+# is defined moved.
 
 # ---------------------------------------------------------------------------
 # The reset itself
