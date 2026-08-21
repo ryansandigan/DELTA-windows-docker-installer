@@ -483,14 +483,25 @@ function New-DeltaNginxConfiguration {
       them back if `nginx -t` rejects what was just written - the rule is that
       an invalid configuration never stays in the live path.
 
-      server_name is the configured hostname, and both server blocks are also
+      server_name carries the whole configured domain set - the primary first,
+      then the additional domains - and both server blocks are also
       default_server, so the installation still answers when it is reached by
       IP or by a name nobody configured.
+
+      -AdditionalDomain is how Domain Management supplies a candidate set. When
+      it is not supplied the persisted set is read instead, which is what makes
+      a plain rerun and setup.ps1 -Reconfigure preserve the additional domains
+      rather than silently reverting NGINX to the primary alone.
+
+      Returns the previous contents alongside the path, so a caller can put
+      them back if `nginx -t` rejects what was just written - the rule is that
+      an invalid configuration never stays in the live path.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$ScriptRoot,
-        [Parameter(Mandatory)][object]$Network
+        [Parameter(Mandatory)][object]$Network,
+        [AllowEmptyCollection()][string[]]$AdditionalDomain
     )
 
     $templatePath = Get-DeltaTemplatePath -ScriptRoot $ScriptRoot -RelativePath 'nginx\delta.conf.template'
@@ -501,7 +512,23 @@ function New-DeltaNginxConfiguration {
         $previous = [System.IO.File]::ReadAllText($target, (New-Object System.Text.UTF8Encoding($false)))
     }
 
-    $serverName = if ($Network.HostName) { $Network.HostName } else { '_' }
+    # Bound-but-empty means "no additional domains"; unbound means "use what is
+    # persisted". Those are different instructions and $null cannot tell them
+    # apart, so the parameter's presence is what decides.
+    $additional = @()
+    if ($PSBoundParameters.ContainsKey('AdditionalDomain')) {
+        $additional = @($AdditionalDomain)
+    }
+    else {
+        $additional = @((Get-DeltaDomainModel -InstallRoot $InstallRoot).Additional)
+    }
+
+    $serverName = '_'
+    if ($Network.HostName) {
+        # Get-DeltaDomainNameList is the injection boundary: nothing that is not
+        # a plain hostname can become part of this directive.
+        $serverName = (Get-DeltaDomainNameList -Primary $Network.HostName -Additional $additional) -join ' '
+    }
 
     $text = [System.IO.File]::ReadAllText($templatePath, (New-Object System.Text.UTF8Encoding($false)))
     $text = Expand-DeltaTemplateRegions -Text $text -TlsEnabled ([bool]$Network.TlsEnabled)
@@ -520,7 +547,7 @@ function New-DeltaNginxConfiguration {
     Write-DeltaFileAtomic -Path $target -Content ($text -replace "`r`n", "`n")
     Write-Detail "Wrote $target"
 
-    return [PSCustomObject]@{ Path = $target; Previous = $previous }
+    return [PSCustomObject]@{ Path = $target; Previous = $previous; ServerName = $serverName }
 }
 
 # ---------------------------------------------------------------------------

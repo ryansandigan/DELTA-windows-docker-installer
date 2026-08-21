@@ -932,6 +932,333 @@ function Test-DeltaHostName {
     return $result
 }
 
+# ---------------------------------------------------------------------------
+# The domain model
+#
+# PUBLIC_URL is, and stays, ONE canonical URL. NGINX may accept several
+# hostnames. Those are two different things and this section keeps them
+# separate:
+#
+#   primary domain      the host part of PUBLIC_URL. Exactly one, always.
+#                       Persisted where it has always been persisted -
+#                       DELTA_HOSTNAME in .env - so there is no second copy to
+#                       drift from it.
+#   additional domains  further hostnames NGINX accepts. Persisted in
+#                       .delta-install.json under "domains", which is the
+#                       existing store for non-secret installation facts.
+#
+# A contradictory state is not rejected here, it is unrepresentable: the
+# primary is read from the one place that defines it, the additional list is
+# normalised and has the primary removed from it on every read, and the whole
+# set is deduplicated case-insensitively. There is no way to express two
+# primaries, a primary missing from the served set, or a case-variant
+# duplicate.
+# ---------------------------------------------------------------------------
+
+$Script:DeltaDomainStateKey = 'domains'
+
+function ConvertTo-DeltaDomainName {
+    <#
+      The normal form a domain is compared and stored in: trimmed, with any
+      trailing dot removed, and lower-cased.
+
+      DNS is case-insensitive and NGINX matches server_name case-insensitively,
+      so DELTA.example.org and delta.example.org are one domain. Storing the
+      normal form is what makes "reject duplicates" a comparison rather than a
+      guess.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Value)
+
+    if ($null -eq $Value) { return '' }
+    return $Value.Trim().TrimEnd('.').ToLowerInvariant()
+}
+
+function Test-DeltaDomainName {
+    <#
+      Whether a string is usable as a hostname NGINX should accept.
+
+      The rules are Test-DeltaHostName's - this deliberately does not implement
+      a second hostname grammar - with three additions that only matter for a
+      domain being added to a served set:
+
+        * a wildcard is named as a wildcard rather than reported as a bad
+          hostname part, because that is the mistake the operator actually
+          made. NGINX supports wildcard server_name; this installer does not
+          offer it, because nothing else in the architecture (certificate
+          coverage, the access guide, PUBLIC_URL) is built for one.
+        * an IPv6 literal is refused. Test-DeltaHostName accepts it for the
+          hostname question, but a bare IPv6 literal in server_name is not the
+          address match an operator expects.
+        * credentials, query strings and fragments are named, because "user@"
+          and "?" reaching this prompt mean a URL was pasted.
+
+      Returns IsValid, Reason and the normalised value.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Value)
+
+    $result = [PSCustomObject]@{
+        IsValid    = $false
+        Reason     = $null
+        Normalized = $null
+        IsAddress  = $false
+    }
+
+    $candidate = if ($null -eq $Value) { '' } else { $Value.Trim() }
+
+    if (-not $candidate) {
+        $result.Reason = 'A domain is required.'
+        return $result
+    }
+    if ($candidate.Contains('*')) {
+        $result.Reason = "Wildcard domains are not supported. Add each hostname DELTA should answer to, for example 'delta.example.org'."
+        return $result
+    }
+    if ($candidate.Contains('@')) {
+        $result.Reason = 'Enter the hostname only, without a user name - a domain is not a URL.'
+        return $result
+    }
+    if ($candidate.Contains('?')) {
+        $result.Reason = 'Enter the hostname only, without a query string.'
+        return $result
+    }
+    if ($candidate.Contains('#')) {
+        $result.Reason = 'Enter the hostname only, without a fragment.'
+        return $result
+    }
+
+    # Validate the NORMAL form, not the raw input. A fully qualified name
+    # written with the DNS root dot - delta.example.org. - is a legitimate way
+    # to type a hostname, and Test-DeltaHostName correctly reads that trailing
+    # dot as an empty label. Normalising first means the operator's spelling is
+    # accepted and the stored value is still the one form everything compares
+    # against.
+    $candidate = ConvertTo-DeltaDomainName -Value $candidate
+    if (-not $candidate) {
+        $result.Reason = 'A domain is required.'
+        return $result
+    }
+
+    $check = Test-DeltaHostName -Value $candidate
+    if (-not $check.IsValid) {
+        $result.Reason = $check.Reason
+        return $result
+    }
+
+    if ($check.IsAddress -and $candidate.Contains(':')) {
+        $result.Reason = "'$candidate' is an IPv6 address. NGINX matches server_name by name, so an IPv6 literal cannot be added as a domain - the installation already answers on any address it is reached by."
+        return $result
+    }
+
+    $result.IsAddress  = $check.IsAddress
+    $result.Normalized = ConvertTo-DeltaDomainName -Value $candidate
+    $result.IsValid    = $true
+    return $result
+}
+
+function Get-DeltaDomainNameList {
+    <#
+      A validated, deduplicated, deterministically ordered domain set: the
+      primary first, then the additional domains in the order they were
+      configured.
+
+      This is the configuration-injection boundary, and it is deliberately
+      placed here rather than at the prompt. Domain input is data; it becomes
+      part of an NGINX directive only by passing through this function, and
+      anything that is not a plain hostname stops the operation outright rather
+      than being escaped, quoted or dropped quietly. A caller cannot reach the
+      generator without coming through it.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Primary,
+        [AllowEmptyCollection()][string[]]$Additional = @()
+    )
+
+    $ordered = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($value in (@($Primary) + @($Additional))) {
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $normalized = ConvertTo-DeltaDomainName -Value $value
+        if ($normalized -notmatch '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') {
+            Stop-Setup "Refusing to write '$value' into the NGINX configuration: a domain is letters, digits, dots and hyphens, and nothing else."
+        }
+        if ($seen.Add($normalized)) { $null = $ordered.Add($normalized) }
+    }
+
+    # Returned as a plain array, and every caller wraps the call in @() - the
+    # convention the rest of this project already uses for list-returning
+    # functions. It matters here: PowerShell unrolls a one-element array onto
+    # the pipeline, so a caller that indexed an unwrapped result would be
+    # indexing the characters of a string instead of the list.
+    return $ordered.ToArray()
+}
+
+function Get-DeltaDomainModel {
+    <#
+      The authoritative domain model for an installation, assembled from the
+      two places that already hold it.
+
+      Backward compatibility is not a migration, it is the shape of this
+      function: an installation that predates Domain Management has no "domains"
+      record, so the additional list is empty and the primary is the hostname it
+      always had. Nothing is written to make that true, so entering Management
+      Mode on an old installation reads and reports without changing a byte.
+
+      The primary is DELTA_HOSTNAME. If that is missing or unusable, it falls
+      back to the host part of PUBLIC_URL - through the one URL parser, never a
+      -replace here - and finally to localhost, which is what every other reader
+      in this installer already defaults to.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        # Optional: management mode has already read .env and should not read it
+        # again. The shape is Get-DeltaStackConfiguration's.
+        [object]$Configuration
+    )
+
+    $envPath = Join-Path -Path $InstallRoot -ChildPath $Script:DeltaEnvFileName
+
+    $model = [PSCustomObject]@{
+        InstallRoot   = $InstallRoot
+        Primary       = $null
+        Additional    = @()
+        All           = @()
+        Scheme        = 'http'
+        Port          = 80
+        PublicUrl     = $null
+        PrimarySource = 'default'
+        HasPersisted  = $false
+        Warnings      = @()
+    }
+
+    $publicUrl  = $null
+    $hostValue  = $null
+    $tlsEnabled = $false
+    $httpPort   = 80
+    $httpsPort  = 443
+
+    if ($Configuration) {
+        $hostValue  = [string]$Configuration.HostName
+        $publicUrl  = [string]$Configuration.PublicUrl
+        $tlsEnabled = [bool]$Configuration.TlsEnabled
+        $httpPort   = [int]$Configuration.HttpPort
+        $httpsPort  = [int]$Configuration.HttpsPort
+    }
+    elseif (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $envFile = Read-DeltaEnvFile -Path $envPath
+        $read = {
+            param($key, $fallback)
+            if ($envFile.Entries.Contains($key)) {
+                $value = [string]$envFile.Entries[$key]
+                if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+            }
+            return $fallback
+        }
+        $hostValue  = & $read 'DELTA_HOSTNAME' $null
+        $publicUrl  = & $read 'PUBLIC_URL' $null
+        $tlsEnabled = ((& $read 'TLS_ENABLED' 'false') -eq 'true')
+        [void][int]::TryParse([string](& $read 'HTTP_PORT'  '80'),  [ref]$httpPort)
+        [void][int]::TryParse([string](& $read 'HTTPS_PORT' '443'), [ref]$httpsPort)
+    }
+
+    $model.PublicUrl = $publicUrl
+    $model.Scheme    = if ($tlsEnabled) { 'https' } else { 'http' }
+    $model.Port      = if ($tlsEnabled) { $httpsPort } else { $httpPort }
+
+    # --- the primary ------------------------------------------------------
+    if ($hostValue) {
+        $check = Test-DeltaDomainName -Value $hostValue
+        if ($check.IsValid) {
+            $model.Primary = $check.Normalized
+            $model.PrimarySource = 'DELTA_HOSTNAME'
+        }
+        else {
+            $model.Warnings += "DELTA_HOSTNAME is '$hostValue', which is not a usable domain ($($check.Reason))."
+        }
+    }
+    if (-not $model.Primary -and $publicUrl) {
+        $parts = Get-DeltaPublicUrlParts -Url $publicUrl
+        if ($parts.IsValid) {
+            $check = Test-DeltaDomainName -Value $parts.HostName
+            if ($check.IsValid) {
+                $model.Primary = $check.Normalized
+                $model.PrimarySource = 'PUBLIC_URL'
+            }
+        }
+    }
+    if (-not $model.Primary) {
+        $model.Primary = 'localhost'
+        $model.PrimarySource = 'default'
+    }
+
+    # --- the additional domains -------------------------------------------
+    $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+    $persisted = @()
+    if ($state.Exists -and -not $state.IsValid) {
+        $model.Warnings += "The installation state file could not be read ($($state.Error)). Only the primary domain is known."
+    }
+    elseif ($state.Exists -and $state.IsValid -and (@($state.Data.PSObject.Properties.Name) -contains $Script:DeltaDomainStateKey)) {
+        $record = $state.Data.$Script:DeltaDomainStateKey
+        if ($record -and (@($record.PSObject.Properties.Name) -contains 'additional')) {
+            $model.HasPersisted = $true
+            # @() around it on purpose: a one-element JSON array comes back from
+            # ConvertFrom-Json as a bare string, and iterating a string yields
+            # the string, not its characters - but a null yields one null.
+            $persisted = @($record.additional | Where-Object { $_ })
+        }
+        elseif ($record) {
+            $model.Warnings += "The installation state file has a 'domains' record with no 'additional' list. It was ignored and nothing was rewritten."
+        }
+    }
+
+    $additional = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $null = $seen.Add($model.Primary)
+
+    foreach ($entry in $persisted) {
+        $check = Test-DeltaDomainName -Value ([string]$entry)
+        if (-not $check.IsValid) {
+            $model.Warnings += "The recorded domain '$entry' is not a usable domain ($($check.Reason)). It is not being served."
+            continue
+        }
+        if ($seen.Add($check.Normalized)) { $null = $additional.Add($check.Normalized) }
+    }
+
+    $model.Additional = @($additional.ToArray())
+    $model.All = @(Get-DeltaDomainNameList -Primary $model.Primary -Additional $model.Additional)
+    return $model
+}
+
+function Set-DeltaPersistedDomain {
+    <#
+      Records the additional domains in .delta-install.json.
+
+      Only the additional list is written. The primary is not duplicated here:
+      it is DELTA_HOSTNAME, and a second copy of it in the state file would be a
+      second thing to keep in step - which is exactly the drift this feature
+      exists to prevent. The state file's existing 'hostname' and 'publicUrl'
+      fields remain what they have always been, the installer's record of what
+      it wrote, and Set Primary Domain updates them for the same reason it
+      updates .env.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Additional,
+        [System.Collections.IDictionary]$AdditionalProperties
+    )
+
+    $properties = [ordered]@{}
+    if ($AdditionalProperties) {
+        foreach ($key in $AdditionalProperties.Keys) { $properties[[string]$key] = $AdditionalProperties[$key] }
+    }
+    $properties[$Script:DeltaDomainStateKey] = [ordered]@{
+        additional = @($Additional)
+        updatedAt  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+
+    return (Write-DeltaInstallState -InstallRoot $InstallRoot -Properties $properties)
+}
+
 function Read-DeltaHostName {
     <#
       Asks for the name users will reach DELTA by, defaulting to localhost.

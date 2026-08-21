@@ -303,8 +303,9 @@ different claims.
   5. Configure SMTP
   6. Reset Administrator Password
   7. Certificate Management
-  8. DELTA Access Guide
-  9. View Logs
+  8. Domain Management
+  9. DELTA Access Guide
+ 10. View Logs
   S. Start DELTA                   (shown when something is not running)
   0. Exit
 ```
@@ -333,6 +334,8 @@ it finishes, when you cancel it, and when it fails.
   [Resetting the administrator password](#resetting-the-administrator-password).
 - **Certificate Management** replaces the TLS certificate — see
   [Replacing the TLS certificate](#replacing-the-tls-certificate).
+- **Domain Management** adds and removes the hostnames DELTA answers to, and
+  chooses which one is canonical — see [Managing domains](#managing-domains).
 - **DELTA Access Guide** shows the real URLs for this installation, tests the
   endpoint, and tells you plainly if it did not answer.
 
@@ -717,6 +720,16 @@ thumbprint and expiry are recorded in `.delta-install.json`; the private key is
 never read into the installer, never logged and never stored anywhere but
 `certs\`.
 
+The screen also lists **every configured domain** and whether the certificate in
+use covers it, so a replacement can be chosen against the full set rather than
+against the primary hostname alone:
+
+```
+Configured domains
+  delta.ncscm.gov.jo                       primary     covered by the certificate
+  delta.internal.ncscm.gov.jo              additional  NOT covered by the certificate
+```
+
 **If `nginx -t` rejects the new certificate**, NGINX is never signalled — it
 carries on serving the old certificate from memory — the previous files are put
 back, and the restored configuration is re-tested. If the reload or the endpoint
@@ -731,19 +744,225 @@ up throughout.
 There is no automatic renewal and no ACME/Let's Encrypt client. Replacing a
 certificate is a deliberate operator action.
 
-### Changing ports, hostname or TLS
+### Managing domains
 
-Those are settled during installation, and the management utility deliberately
-does not re-ask. To change them, run the installer flow again against the
-existing installation:
+Menu option **8** manages the hostnames this installation answers to, without
+editing `.env`, the NGINX configuration or `docker-compose.yml` by hand, and
+without leaving the management utility.
+
+#### Primary URL, primary domain, additional domains
+
+Three different things, and the distinction is the whole point:
+
+| | What it is |
+|---|---|
+| **Primary URL** | `PUBLIC_URL` — the one canonical address DELTA calls itself by. Used for links, redirects and anything DELTA generates that has to be absolute. There is exactly one, always. |
+| **Primary domain** | The host part of that URL. Exactly one, always. |
+| **Additional domains** | Further hostnames NGINX accepts. They are **not** additional public URLs — DELTA still calls itself by the primary URL. |
+
+`PUBLIC_URL` never becomes a list. NGINX may accept many hostnames; DELTA has
+one canonical address. So an installation can look like this:
+
+```
+PUBLIC_URL=https://delta.ncscm.gov.jo
+
+server_name delta.ncscm.gov.jo delta.internal.ncscm.gov.jo delta-old.ncscm.gov.jo;
+```
+
+#### The screen
+
+```
+========================================================================
+Domain Management
+C:\DELTA
+========================================================================
+
+Primary URL
+  https://delta.ncscm.gov.jo
+  The one canonical address DELTA uses for itself. There is exactly one.
+
+Primary domain
+  delta.ncscm.gov.jo
+
+Additional domains
+  delta.internal.ncscm.gov.jo
+  delta-old.ncscm.gov.jo
+
+  1. Add Domain
+  2. Remove Domain
+  3. Set Primary Domain
+  0. Return
+```
+
+With no additional domains it says so in a sentence rather than printing an
+empty list.
+
+#### Add Domain
+
+Enter **one hostname** — no scheme, no port, no path. `https://delta.example.org`,
+`delta.example.org:443`, `delta.example.org/path`, `user@delta.example.org` and
+`*.example.org` are all refused, with the reason. Comparison is
+case-insensitive, so `DELTA.Example.org` cannot be added alongside
+`delta.example.org`, and a domain already configured is rejected rather than
+duplicated.
+
+Adding a domain **does not change `PUBLIC_URL`**:
+
+```
+before   PUBLIC_URL=https://delta.ncscm.gov.jo
+         server_name delta.ncscm.gov.jo;
+
+add      delta.internal.ncscm.gov.jo
+
+after    PUBLIC_URL=https://delta.ncscm.gov.jo          (unchanged)
+         server_name delta.ncscm.gov.jo delta.internal.ncscm.gov.jo;
+```
+
+**No container is recreated.** The NGINX configuration is regenerated, validated
+with `nginx -t` inside the running container, and applied with `nginx -s reload`.
+DELTA and the database are not involved at all.
+
+#### Remove Domain
+
+Pick one of the **additional** domains from a numbered list — no retyping. The
+**primary domain is not offered and cannot be removed here**: that is what
+guarantees the installation can never end up with no primary domain. To stop
+using the current primary, make another domain primary first; the old one
+becomes an additional domain and can then be removed.
+
+**Removing a domain never touches certificate material.** A certificate that
+still covers a hostname NGINX no longer accepts is not a problem, and deleting
+key material because a name left a list would be well outside what this
+operation owns. Certificates belong to Certificate Management.
+
+#### Set Primary Domain
+
+Choose any configured domain — primary or additional — to become the canonical
+one:
+
+```
+before   PUBLIC_URL=https://delta.ncscm.gov.jo
+         delta.ncscm.gov.jo            primary
+         delta.internal.ncscm.gov.jo   additional
+
+set      delta.internal.ncscm.gov.jo
+
+after    PUBLIC_URL=https://delta.internal.ncscm.gov.jo
+         delta.internal.ncscm.gov.jo   primary
+         delta.ncscm.gov.jo            additional
+```
+
+The old primary is kept as an additional domain rather than dropped, so links
+using it keep working.
+
+**The scheme is preserved.** An HTTPS installation stays HTTPS and an HTTP one
+stays HTTP — this operation swaps a hostname and nothing else. It cannot enable
+or disable TLS, change ports, or alter firewall rules. Turning HTTPS on is still
+the certificate/installer workflow.
+
+This is the one domain operation that recreates a container: `PUBLIC_URL` is
+part of DELTA's environment and is read at start, so the application container
+is recreated (`up -d --no-deps delta`) to pick up the new canonical URL, then
+waited on for health and re-checked through NGINX. The database and its volume
+are not touched.
+
+#### HTTP, HTTPS and certificate coverage
+
+Domain Management manages hostnames. It does **not** own TLS enablement, and it
+never issues, replaces or deletes a certificate.
+
+On an HTTPS installation it does answer the question that matters when a
+hostname is added: **does the active certificate cover it?** You are told one of
+three things, and they are three different facts:
+
+```
+The active certificate covers delta.internal.ncscm.gov.jo.
+
+The active certificate does not cover delta.internal.ncscm.gov.jo.
+  It is valid for: delta.ncscm.gov.jo
+  ...Replace it through Certificate Management (menu option 7).
+
+Certificate coverage for delta.internal.ncscm.gov.jo could not be determined.
+```
+
+"Could not be determined" is never reported as "not covered". Coverage is read
+from the certificate's subjectAltName entries (falling back to the common name
+when there is no SAN), matched case-insensitively, with wildcards honoured the
+way browsers honour them — `*.example.org` covers `a.example.org` but not
+`example.org` or `a.b.example.org`.
+
+Adding an uncovered domain is allowed, and NGINX will serve it. Browsers
+reaching DELTA by that hostname will warn until the certificate is replaced.
+
+When the installer generates a **self-signed** certificate, it now covers the
+whole configured domain set rather than the primary alone.
+
+#### localhost
+
+`http://localhost` is a legitimate configuration and nothing here breaks it. A
+localhost installation opens Domain Management showing exactly that. Adding a
+real domain while localhost is primary **does not silently promote it** — the
+new domain is accepted by NGINX, `PUBLIC_URL` still says `http://localhost`, and
+promoting it is a separate, explicit **Set Primary Domain**. Whether localhost
+stays as an additional accepted hostname afterwards is likewise your explicit
+choice.
+
+#### What it does not change
+
+Ports. Firewall rules. TLS enablement. Certificates. Secrets. The database, its
+volume, or the uploads. Any container other than the application container, and
+that one only when `PUBLIC_URL` genuinely changed. Any NGINX installation or
+Docker resource that is not this installation's.
+
+#### Idempotency and safety
+
+Opening Domain Management and leaving it again **changes nothing** — no file is
+written for having looked. Adding a domain twice is rejected the second time,
+including a case variant. Setting the current primary as primary is a no-op that
+says so. Removing something that is not configured changes nothing. Repeated
+runs never duplicate a `server_name` entry.
+
+Every change follows the same order:
+
+```
+build candidate -> nginx -t -> nginx -s reload -> persist -> verify
+```
+
+An invalid configuration is never left in the live path. If `nginx -t` rejects
+the candidate, NGINX is never signalled — it carries on serving the previous
+domains from memory — the previous file is put back and nothing is recorded. If
+the reload fails, or the change cannot be recorded, NGINX is put back and
+reloaded so that what is served and what is recorded still agree. There is no
+failure that leaves "recorded but not served" or "served but not recorded".
+
+Configured domains are stored in `.delta-install.json` under `domains`. The
+primary is **not** duplicated there — it is `DELTA_HOSTNAME` in `.env`, where it
+has always been, so there is no second copy to drift. An installation created
+before this feature existed has no `domains` record and needs no migration: it
+simply resolves to its existing hostname as primary, with no additional domains.
+
+Domain input is **data, never NGINX syntax**. Every hostname passes a single
+boundary before it can become part of a `server_name` directive, and anything
+that is not a plain hostname stops the operation rather than being escaped or
+quoted.
+
+### Changing ports or TLS
+
+Ports and TLS enablement are settled during installation, and the management
+utility deliberately does not re-ask. To change them, run the installer flow
+again against the existing installation:
 
 ```powershell
 .\setup.ps1 -Reconfigure -HttpPort 8080
 ```
 
 That re-resolves ports and TLS and regenerates the generated files. It is as
-non-destructive as any other re-run: your data, secrets, certificates and image
-pins are preserved.
+non-destructive as any other re-run: your data, secrets, certificates, image
+pins **and your configured domains** are preserved — a rerun regenerates
+`server_name` from the recorded domain set, so additional domains are not lost.
+
+The hostname no longer needs this flow: use **Domain Management** (menu option
+8) instead.
 
 ---
 
@@ -1007,6 +1226,14 @@ Stated plainly so it is not mistaken for a gap:
 - **It does not renew certificates.** There is no ACME/Let's Encrypt client and
   no scheduled renewal — replacing a certificate is an operator action
   (menu option 7).
+- **Domain Management does not manage certificates.** Adding a domain reports
+  whether the active certificate covers it and stops there: no certificate is
+  issued, replaced or deleted because a hostname was added or removed. Enabling
+  HTTPS on an HTTP installation is still `.\setup.ps1 -Reconfigure`.
+- **It does not configure DNS.** A hostname does not have to resolve to be
+  configured, and nothing here creates, checks or updates a DNS record —
+  reaching DELTA by a name from another machine additionally depends on DNS and
+  the firewall.
 - **It does not send test email.** Configuring SMTP checks that the server
   resolves and accepts a connection; it does not verify credentials or delivery.
 - **It does not roll back an update.** DELTA's schema migrations are

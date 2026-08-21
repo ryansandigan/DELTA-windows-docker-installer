@@ -663,6 +663,7 @@ function Get-DeltaManagementStatus {
         Startup       = $null
         StartupTask   = $null
         Backups       = $null
+        Domains       = $null
     }
 
     $status.Configuration = Get-DeltaStackConfiguration -InstallRoot $InstallRoot
@@ -706,7 +707,7 @@ function Get-DeltaManagementStatus {
             $status.RunningCount++
             switch ($observed.Health) {
                 'healthy'   { $row.Detail = 'healthy' }
-                'unhealthy' { $row.Detail = 'UNHEALTHY - see View Logs (menu option 9)'; $row.Warn = $true; $status.Unhealthy += $service }
+                'unhealthy' { $row.Detail = 'UNHEALTHY - see View Logs (menu option 10)'; $row.Warn = $true; $status.Unhealthy += $service }
                 'starting'  { $row.Detail = 'starting - the healthcheck has not passed yet' }
                 default     { $row.Detail = if ($observed.Status) { $observed.Status } else { 'running; no health reported' } }
             }
@@ -746,6 +747,11 @@ function Get-DeltaManagementStatus {
         if (-not $SkipEndpointProbe -and $nginxRow -and $nginxRow.State -eq 'Running') {
             $status.Endpoint = Test-DeltaHttpEndpoint -Url ($status.LoopbackUrl + '/') -TimeoutSeconds 15
         }
+
+        # Read-only, from .env and the state file. The status block reports the
+        # additional hostnames NGINX accepts; it never writes a domain record
+        # for having looked.
+        $status.Domains = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $status.Configuration
     }
 
     # Phase 6's record, displayed and never re-measured here: "configured" and
@@ -839,6 +845,12 @@ function Show-DeltaManagementStatus {
 
     if ($configuration) {
         Write-DeltaStatusRow -Label 'Access' -State '' -Detail $Status.PublicUrl
+        # Additional domains are hostnames NGINX also answers to - not further
+        # public URLs. The label says so, because a second address on this
+        # screen would otherwise read as a second place DELTA lives.
+        if ($Status.Domains -and $Status.Domains.Additional.Count -gt 0) {
+            Write-DeltaStatusRow -Label '' -State '' -Detail "also accepted: $($Status.Domains.Additional -join ', ')  (additional domains, menu option 8)"
+        }
         if ($Status.Endpoint) {
             if ($Status.Endpoint.Succeeded) {
                 Write-DeltaStatusRow -Label '' -State '' -Detail "reachable - GET $($Status.LoopbackUrl)/ returned HTTP $($Status.Endpoint.StatusCode)" -Colour 'Green'
@@ -1031,6 +1043,34 @@ function Show-DeltaAccessGuide {
     Write-Detail "Users                $baseUrl/en/user/login"
     Write-Detail ''
 
+    # The additional hostnames NGINX accepts, if any. They are listed under
+    # their own heading and described as hostnames, never as further URLs: there
+    # is one canonical URL and it is the one above.
+    $domains = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $Configuration
+    if ($domains.Additional.Count -gt 0) {
+        Write-Host 'Additional accepted hostnames'
+        foreach ($domain in $domains.Additional) {
+            Write-Detail $domain
+        }
+        Write-Detail ''
+        Write-Detail "NGINX also answers to these. DELTA still calls itself $baseUrl - they are"
+        Write-Detail 'accepted hostnames, not additional public addresses. Manage them with Domain'
+        Write-Detail 'Management (menu option 8).'
+        if ($Configuration.TlsEnabled) {
+            $coverage = Get-DeltaCertificateDomainCoverage `
+                -CertificatePath (Join-Path -Path $InstallRoot -ChildPath "certs\$Script:DeltaCertificateFileName") `
+                -Domains $domains.All
+            if (-not $coverage.Determined) {
+                Write-DeltaWarning 'Whether the certificate covers them could not be determined here.'
+            }
+            elseif (-not $coverage.CoversAll) {
+                Write-DeltaWarning "The certificate does not cover: $($coverage.Uncovered -join ', ')"
+                Write-Detail 'Browsers reaching DELTA by those hostnames will warn.'
+            }
+        }
+        Write-Detail ''
+    }
+
     Write-Host 'How it is served'
     Write-Detail "NGINX listens on this machine and proxies to the DELTA container on its private"
     Write-Detail "network. Nothing else is published: DELTA's own port 3000 and PostgreSQL's 5432"
@@ -1064,7 +1104,7 @@ function Show-DeltaAccessGuide {
         $why = if ($Endpoint.Error) { $Endpoint.Error } else { "HTTP $($Endpoint.StatusCode)" }
         Write-DeltaWarning "DELTA did NOT answer at $loopback/ ($why)."
         Write-DeltaWarning 'The addresses above are what is configured, not what is currently working.'
-        Write-Detail 'Check the status block and the container logs (menu option 9).'
+        Write-Detail 'Check the status block and the container logs (menu option 10).'
     }
 
     Write-Detail ''
@@ -3136,12 +3176,13 @@ function Show-DeltaManagementMenu {
         Write-Host '  5. Configure SMTP'
         Write-Host '  6. Reset Administrator Password'
         Write-Host '  7. Certificate Management'
+        Write-Host '  8. Domain Management'
     }
     else {
-        Write-Host '  Operations 1-7 need the Docker engine and are not offered until it is running.'
+        Write-Host '  Operations 1-8 need the Docker engine and are not offered until it is running.'
     }
-    Write-Host '  8. DELTA Access Guide'
-    Write-Host '  9. View Logs'
+    Write-Host '  9. DELTA Access Guide'
+    Write-Host ' 10. View Logs'
     if ($offerStart) {
         if ($canRun) { Write-Host '  S. Start DELTA' }
         else { Write-Host '  S. Start DELTA                   (starts Docker Desktop first)' }
@@ -3264,6 +3305,10 @@ function Invoke-DeltaManagementMode {
                 $null = Invoke-DeltaCertificateOperation -InstallRoot $InstallRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
             }
             '8' {
+                if (-not $status.DockerReady) { Show-DeltaUnavailableOperation -Operation 'Domain Management'; continue }
+                $null = Invoke-DeltaDomainOperation -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Configuration $status.Configuration -AllowPrompt $AllowPrompt
+            }
+            '9' {
                 # No -Endpoint: the guide probes when it is displayed rather
                 # than reusing the status block's result, which may have been
                 # measured before the operator went to lunch.
@@ -3271,7 +3316,7 @@ function Invoke-DeltaManagementMode {
                 Write-Detail 'Press Enter to return to the menu.'
                 $null = Read-Host
             }
-            '9' {
+            '10' {
                 Invoke-DeltaLogsMenu -InstallRoot $InstallRoot -Configuration $status.Configuration -DockerReady $status.DockerReady
             }
             'S' {

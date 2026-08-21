@@ -142,6 +142,10 @@ $Script:DeltaLibraries = [ordered]@{
     # replacement). Loaded after Delta.Manage.ps1 because it composes that
     # file's primitives rather than duplicating them.
     'Delta.Configure.ps1' = 'Invoke-DeltaSmtpConfiguration'
+    # Domain Management. Loaded last because it composes the NGINX generator,
+    # the nginx -t / reload primitives, the .env writer and the certificate
+    # inspector rather than reimplementing any of them.
+    'Delta.Domain.ps1'    = 'Invoke-DeltaDomainOperation'
 }
 
 foreach ($library in $Script:DeltaLibraries.Keys) {

@@ -1185,6 +1185,35 @@ function Invoke-DeltaCertificateManagement {
         Write-DeltaWarning "No certificate is present at $($current.CertificatePath), although TLS is enabled."
     }
 
+    # Which of the CONFIGURED domains this certificate covers, not just the
+    # PUBLIC_URL hostname. Since Domain Management, NGINX may accept several
+    # hostnames, and "the certificate hostname is the PUBLIC_URL hostname" is no
+    # longer the whole story - so the authoritative domain set is what coverage
+    # is reported against.
+    $domains = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $Configuration
+    if ($current.Exists -and $current.Thumbprint) {
+        $coverage = Get-DeltaCertificateDomainCoverage -CertificatePath $current.CertificatePath -Domains $domains.All
+        Write-Detail ''
+        Write-Host 'Configured domains'
+        if (-not $coverage.Determined) {
+            foreach ($domain in $domains.All) {
+                $label = if ($domain -eq $domains.Primary) { "$domain   (primary)" } else { $domain }
+                Write-Detail $label
+            }
+            Write-DeltaWarning "Coverage could not be determined: $($coverage.Reason)"
+        }
+        else {
+            foreach ($row in $coverage.Rows) {
+                $role = if ($row.Domain -eq $domains.Primary) { 'primary   ' } else { 'additional' }
+                $verdict = if ($row.IsCovered) { 'covered by the certificate' } else { 'NOT covered by the certificate' }
+                Write-Detail ("{0,-40} {1}  {2}" -f $row.Domain, $role, $verdict)
+            }
+            if (-not $coverage.CoversAll) {
+                Write-DeltaWarning "A replacement certificate should cover: $($domains.All -join ', ')"
+            }
+        }
+    }
+
     # --- collect and validate --------------------------------------------
     $result.Stage = 'validate'
     $openSslImage = $Configuration.DbImage

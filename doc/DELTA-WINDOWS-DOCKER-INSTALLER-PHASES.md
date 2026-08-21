@@ -1546,6 +1546,115 @@ The final backup was ordered with the other destructive steps, **after** `compos
 
 ---
 
+### Feature — Domain Management
+
+**Not a phase.** Phases 1–12 are the installer's specified scope and are complete. This is a post-Phase-12 feature added on top of the settled architecture, recorded here because the phasing document is where this project keeps its implementation history.
+
+**Status: COMPLETE** · 2026-08-21 · **Validated: 364/364 assertions.**
+
+**Goal.** An administrator can manage the hostnames DELTA answers to from the management utility, without hand-editing `.env`, the NGINX configuration or `docker-compose.yml`, and without being told to leave the utility and run `.\setup.ps1 -Reconfigure`.
+
+#### The distinction the feature rests on
+
+`PUBLIC_URL` is **one** canonical URL. NGINX may accept **many** hostnames. Those are different things, and conflating them is what a naive "make PUBLIC_URL a list" implementation would do.
+
+| | Where it lives | How many |
+|---|---|---|
+| Primary URL | `PUBLIC_URL` in `.env` | exactly one |
+| Primary domain | `DELTA_HOSTNAME` in `.env` — the host part of the above | exactly one |
+| Additional domains | `.delta-install.json` → `domains.additional` | zero or more |
+
+#### Why the primary is not stored in the new record
+
+The obvious model — `domains: { primary, additional }` — has two copies of the primary hostname (the record and `DELTA_HOSTNAME`) and therefore a way for them to disagree. The model implemented instead **derives** the primary from where it has always lived and stores only the additional list. The consequences are structural rather than promised:
+
+- a primary missing from the served set is unrepresentable — the set is built as primary-first
+- two primaries are unrepresentable — there is one field
+- case-variant duplicates are unrepresentable — the whole set is normalised and de-duplicated on every read
+- **backward compatibility needs no migration** — an installation with no `domains` record resolves to its existing hostname with no additional domains, and entering Management Mode writes nothing
+
+#### What was extracted rather than duplicated
+
+Per the discipline rule, no second implementation of anything:
+
+| Concern | Reused |
+|---|---|
+| hostname grammar | `Test-DeltaHostName` (Phase 4), wrapped by `Test-DeltaDomainName` for the three domain-specific refusals |
+| PUBLIC_URL construction | `Get-DeltaPublicUrl` (A§11.3), unchanged |
+| PUBLIC_URL parsing | **new** `Get-DeltaPublicUrlParts`, placed beside the constructor — taking a URL apart is the same knowledge read backwards |
+| NGINX generation | `New-DeltaNginxConfiguration`, extended with `-AdditionalDomain` |
+| NGINX validation / reload | `Test-DeltaNginxConfiguration`, `Invoke-DeltaNginxReload` (Phase 4) |
+| `.env` mutation | `Set-DeltaEnvValues` (Phase 1) — atomic, comment- and order-preserving, ACL-reapplying |
+| state file | `Write-DeltaInstallState` (Phase 1) merge semantics |
+| certificate inspection | `Get-DeltaInstalledCertificate` (Phase 10) plus **new** SAN/coverage readers |
+| recreating the application container | `Update-DeltaApplicationContainer` (Phase 10) — the same primitive the SMTP flow uses for the same reason |
+
+#### The transaction
+
+```
+build candidate -> nginx -t -> nginx -s reload -> persist -> (recreate delta) -> verify
+```
+
+Ordered so persistent state and the running NGINX cannot be left disagreeing. `nginx -t` reads a candidate that was written with the previous contents held in memory; a rejection restores the file and NGINX is never signalled, so the site never goes down. Persistence happens only once the runtime is already serving the candidate, and a persistence failure puts the runtime back. The application container is recreated **only** when `PUBLIC_URL` genuinely changed — adding or removing an accepted hostname touches no container at all.
+
+`Get-DeltaDomainNameList` is the single configuration-injection boundary: a hostname becomes part of a `server_name` directive only by passing through it, and anything not matching `^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$` stops the operation rather than being escaped or dropped.
+
+#### Menu
+
+Domain Management is **option 8**, inside the Docker-gated block (every mutation needs `nginx -t` and a reload). Access Guide moved 8→9, View Logs 9→10; two in-product references to "menu option 9" were corrected.
+
+#### Files changed
+
+| File | |
+|---|---|
+| `lib\Delta.Domain.ps1` | **new** — screen, three operations, the transaction |
+| `lib\Delta.Config.ps1` | domain model, normalisation, validation, the server-name boundary, persistence |
+| `lib\Delta.Network.ps1` | `Get-DeltaPublicUrlParts`, certificate name/coverage readers, SAN-aware self-signed generation |
+| `lib\Delta.Stack.ps1` | `New-DeltaNginxConfiguration` carries the whole domain set |
+| `lib\Delta.Manage.ps1` | menu entry and dispatch, status row, access-guide section |
+| `lib\Delta.Configure.ps1` | Certificate Management reports coverage per configured domain |
+| `setup.ps1` | library manifest |
+| `README.md` | operator documentation |
+
+`uninstall.ps1` and `lib\Delta.Uninstall.ps1` are **unmodified**: a complete uninstall already archives and removes the entire installation root, and `domains` is a field inside a file that is already archived and already removed.
+
+#### Validation — 364/364
+
+| Suite | |
+|---|---|
+| Unit — model, validation, normalisation, generation, coverage, `.env` mutation | 122/122 |
+| Lifecycle — live `C:\DELTA`, HTTP | 78/78 |
+| HTTPS — isolated Compose project on 8081/8444 with a real TLS-terminating NGINX | 42/42 |
+| Regression — PS 5.1 parse/encoding, entry-point manifests, menu, redaction, blast radius | 122/122 |
+
+- **The specified lifecycle, measured end to end** on the live installation: `http://localhost` → add `delta.example.test` (PUBLIC_URL unchanged, `server_name localhost delta.example.test`) → set primary (PUBLIC_URL becomes `http://delta.example.test`, localhost demoted to additional, **and the running container's `printenv PUBLIC_URL` reports the new value**) → remove localhost (`server_name delta.example.test`). Asserted against `.env`, `.delta-install.json`, the generated file **and `nginx -T` inside the running container** — what is on disk and what NGINX actually loaded are checked separately.
+- **Idempotency.** Entering and leaving Domain Management leaves `.env`, the state file and the NGINX configuration byte-identical, and writes no `domains` record. A duplicate add is rejected; so is a case variant; so is the primary. Setting the current primary as primary is a no-op that says so. Removing an unconfigured domain changes nothing. The primary cannot be removed. Repeated generation is byte-identical.
+- **Rerun and `-Reconfigure` preserve the model.** Regenerating exactly as the stack stage does — with no `-AdditionalDomain` — reads the persisted set back and reproduces the same `server_name`.
+- **Failure paths, all provoked rather than reasoned about.** `nginx -t` rejection (forced by a deliberate template fault so the *real* transaction runs): stopped at `nginx-test`, never reloaded, configuration byte-restored, nothing persisted, site never down, live config valid again afterwards. NGINX unavailable: refused before anything was written. **State file unwritable** — the one ordering where drift is possible, because persistence follows the reload: NGINX was put back and the recorded set and the served set still agree.
+- **Injection.** 26 hostile inputs rejected at validation, including `a.test; return 500`, `a.test{`, `~^regex$`, `*.example.org`, embedded newlines and quotes. A hostile value written **directly into the state file by hand** never reaches `server_name` — the generator refuses it.
+- **Certificate coverage**, against real certificates: covers primary only; additional not covered (named, and the operator told to use Certificate Management); a SAN certificate covering all three configured domains; a domain the SAN does not cover. Wildcard matching follows the browser rule — `*.example.test` covers `a.example.test` but not `example.test` or `a.b.example.test`. An unreadable or absent certificate reports **undetermined**, never "not covered".
+- **HTTPS.** Scheme preserved through Set Primary Domain (`https` stays `https`), `TLS_ENABLED`, `TLS_MODE` and both ports untouched, both TLS server blocks carry the identical domain set, the redirect keeps the configured HTTPS port. **No certificate was issued, replaced or deleted** by any domain operation — verified by hash before and after, including across a removal.
+- **Blast radius.** No `prune`, no `down -v`, no volume operation, no firewall call, no direct Docker invocation, and no secret key read anywhere in `Delta.Domain.ps1`. Exactly two `.env` keys are written, and never with `-NoProtect`. A full non-interactive run's transcript contains no secret. The live installation was byte-restored: `.env` SHA-256 matches the baseline, `server_name localhost`, no `domains` record, site returns 200.
+- **PowerShell 5.1.** 13/13 scripts parse under the 5.1 parser, all UTF-8 with BOM and LF endings, none containing PS7-only syntax.
+
+**Two product defects found by the suites and fixed.**
+
+1. **One-element domain lists were unrolled onto the pipeline.** `Get-DeltaDomainNameList` returned a bare array; PowerShell unrolls a one-element array, so a single-domain installation produced a *string* where callers indexed a *list* — `$model.All[0]` was the letter `l` of `localhost`, and the transaction failed to bind its own network shape. Fixed by following the project's existing convention (plain array returned, every call site wraps in `@()`) rather than a comma-return, which double-wraps when a caller does wrap.
+2. **A fully qualified name with the DNS root dot was rejected.** `delta.example.org.` is a legitimate way to type a hostname; validating the raw input read the trailing dot as an empty label. Validation now runs against the normal form.
+
+**Three harness defects, recorded because two are repeats.** A test helper returning a list hit the *same* unrolling trap as the product bug — the fault is symmetric and the suite caught its own version of it. `$fail = ...` at script scope **is** `$Script:Fail`, PowerShell names being case-insensitive, so an outcome object silently destroyed the assertion counter — the same collision class Phase 10.5 and Phase 11 both record. And the first `nginx -t` failure test assumed a 202-character hostname would be rejected; measured, NGINX accepts it, so the test was rebuilt around a deliberate template fault, which exercises the real transaction rather than a hand-written file.
+
+**Limitations / follow-up for Certificate Management**
+
+1. **Enabling HTTPS on an HTTP installation still requires `.\setup.ps1 -Reconfigure`.** Certificate Management says so and stops. This was already known before this feature and is explicitly out of its scope; it is the natural next task, and the domain model is now in place for it.
+2. **No multi-domain certificate issuance.** A *self-signed* certificate now covers the whole configured domain set, because `New-DeltaSelfSignedCertificate` already built a SAN list and extending it was natural. For supplied certificates the installer reports coverage and stops — there is no CSR generation and no ACME client, exactly as before.
+3. **Coverage is read through `X509Extension.Format()`**, whose labels are produced by Windows. The parser accepts both the Windows (`DNS Name=`) and OpenSSL (`DNS:`) forms; on a system locale that emits neither, coverage reports **undetermined** rather than wrong. Not reproducible on this host.
+4. **Wildcard domains are refused as input.** NGINX supports them; nothing else in this architecture is built for one, so the refusal names them rather than reporting a bad hostname part.
+5. **IPv6 literals are refused as additional domains.** `server_name` matches by name, and the installation already answers on any address it is reached by through `default_server`.
+6. **DNS is never checked.** Unchanged from Phase 4 and deliberate: refusing a hostname because a lookup failed would invent a prerequisite.
+
+---
+
 ## 9. Assessment Flow → Phase Mapping
 
 ### Installation flowchart (A§12 / A§13)

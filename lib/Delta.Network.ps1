@@ -66,6 +66,64 @@ function Get-DeltaPublicUrl {
     return "${Scheme}://${HostName}:${Port}"
 }
 
+function Get-DeltaPublicUrlParts {
+    <#
+      The inverse of Get-DeltaPublicUrl: takes a PUBLIC_URL and returns the
+      scheme, host and port it was built from, with the scheme's default port
+      filled in when the URL omits it.
+
+      It lives here, beside the constructor, for the reason the constructor
+      exists: there is one place that knows how a DELTA public URL is put
+      together, and taking one apart is the same knowledge read backwards. A
+      caller that needed only the hostname and wrote its own -replace would be
+      the second implementation.
+
+      Returns IsValid plus Reason. An unparseable or non-HTTP value is reported,
+      never guessed at.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Url)
+
+    $result = [PSCustomObject]@{
+        IsValid  = $false
+        Reason   = $null
+        Scheme   = $null
+        HostName = $null
+        Port     = 0
+        Url      = $Url
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        $result.Reason = 'No URL was supplied.'
+        return $result
+    }
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url.Trim(), [System.UriKind]::Absolute, [ref]$uri)) {
+        $result.Reason = "'$Url' is not an absolute URL."
+        return $result
+    }
+    if ($uri.Scheme -ne 'http' -and $uri.Scheme -ne 'https') {
+        $result.Reason = "'$Url' does not use http or https."
+        return $result
+    }
+
+    # Uri.Host strips the brackets from an IPv6 literal, which is the form the
+    # rest of this installer works in.
+    $result.Scheme   = $uri.Scheme
+    $result.HostName = $uri.Host
+    $result.Port     = if ($uri.IsDefaultPort) {
+        if ($uri.Scheme -eq 'https') { $Script:DeltaDefaultHttpsPort } else { $Script:DeltaDefaultHttpPort }
+    } else { $uri.Port }
+
+    if (-not $result.HostName) {
+        $result.Reason = "'$Url' has no host part."
+        return $result
+    }
+
+    $result.IsValid = $true
+    return $result
+}
+
 # ---------------------------------------------------------------------------
 # Port occupancy and ownership (A§10.2)
 # ---------------------------------------------------------------------------
@@ -537,6 +595,172 @@ if cmp -s /work/from-cert.pub /work/from-key.pub; then echo "PAIR_MATCH"; else e
     return $result
 }
 
+function Get-DeltaCertificateName {
+    <#
+      Every hostname a certificate claims: the subjectAltName DNS entries, plus
+      the subject's CN when there is no SAN at all.
+
+      SAN is read from the extension rather than from OpenSSL, so this needs no
+      container and no Docker engine - Domain Management has to be able to
+      answer "does the certificate cover this?" while it is drawing a screen,
+      not only while it is running a transaction.
+
+      X509Extension.Format() is the only in-box reader, and its labels are
+      produced by Windows rather than by the certificate, so the pattern accepts
+      both the Windows form ("DNS Name=host") and the OpenSSL form ("DNS:host").
+      If a SAN extension is present but nothing could be read out of it, that is
+      reported as undetermined - never as "no names", which a caller would
+      correctly turn into "not covered" and be wrong.
+    #>
+    param([Parameter(Mandatory)][string]$CertificatePath)
+
+    $result = [PSCustomObject]@{
+        Determined = $false
+        Reason     = $null
+        Names      = @()
+        Subject    = $null
+        HasSan     = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $CertificatePath -PathType Leaf)) {
+        $result.Reason = "There is no certificate at '$CertificatePath'."
+        return $result
+    }
+
+    $certificate = $null
+    try {
+        $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CertificatePath)
+    }
+    catch {
+        $result.Reason = "The certificate could not be parsed: $($_.Exception.Message)"
+        return $result
+    }
+
+    $result.Subject = $certificate.Subject
+    $names = New-Object 'System.Collections.Generic.List[string]'
+
+    $san = $certificate.Extensions | Where-Object { $_.Oid -and $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
+    if ($san) {
+        $result.HasSan = $true
+        $text = $null
+        try { $text = $san.Format($true) } catch { $text = $null }
+        if ($text) {
+            foreach ($match in [regex]::Matches($text, '(?i)\bDNS[^=:\r\n]*[=:]\s*([^\s,;]+)')) {
+                $value = $match.Groups[1].Value.Trim()
+                if ($value) { $null = $names.Add($value) }
+            }
+        }
+        if ($names.Count -eq 0) {
+            $result.Reason = 'The certificate has a subjectAltName extension, but this host could not read the names out of it.'
+            return $result
+        }
+    }
+    else {
+        # No SAN. Browsers have not honoured a bare CN for years, but a
+        # certificate can still legitimately be built that way and the operator
+        # is better served by being shown what it claims than by being told
+        # nothing.
+        if ($certificate.Subject -match '(?i)(?:^|,)\s*CN\s*=\s*([^,]+)') {
+            $null = $names.Add($Matches[1].Trim())
+        }
+        if ($names.Count -eq 0) {
+            $result.Reason = 'The certificate has neither a subjectAltName extension nor a readable common name.'
+            return $result
+        }
+    }
+
+    $unique = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $names) {
+        if ($seen.Add($name)) { $null = $unique.Add($name) }
+    }
+
+    $result.Names = $unique.ToArray()
+    $result.Determined = $true
+    return $result
+}
+
+function Test-DeltaCertificateCoversName {
+    <#
+      Whether one certificate name covers one hostname, by RFC 6125's rule as
+      browsers actually apply it: an exact case-insensitive match, or a
+      left-most wildcard that matches exactly one label.
+
+      *.example.org covers a.example.org and does NOT cover example.org or
+      a.b.example.org. Getting that wrong in the permissive direction would
+      have Domain Management telling an operator HTTPS is fine for a hostname
+      every browser is about to reject.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$CertificateName,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Domain
+    )
+
+    if (-not $CertificateName -or -not $Domain) { return $false }
+
+    $name = $CertificateName.Trim().TrimEnd('.')
+    $candidate = $Domain.Trim().TrimEnd('.')
+
+    if ([string]::Equals($name, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if (-not $name.StartsWith('*.')) { return $false }
+
+    $suffix = $name.Substring(1)          # ".example.org"
+    if ($candidate.Length -le $suffix.Length) { return $false }
+    if (-not $candidate.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+    # Exactly one label may stand where the wildcard is.
+    $label = $candidate.Substring(0, $candidate.Length - $suffix.Length)
+    return (-not $label.Contains('.'))
+}
+
+function Get-DeltaCertificateDomainCoverage {
+    <#
+      Which of the configured domains the certificate in use actually covers.
+
+      This is the seam A§11 needs once NGINX serves more than one hostname:
+      "the certificate hostname is the PUBLIC_URL hostname" stops being true the
+      moment a second domain is accepted, and the honest answer is per-domain.
+
+      Returns Determined plus one row per domain. When the names cannot be read,
+      Determined is false and no row claims anything - "we could not tell" and
+      "not covered" are different facts and are reported as different facts.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CertificatePath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Domains
+    )
+
+    $names = Get-DeltaCertificateName -CertificatePath $CertificatePath
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($domain in $Domains) {
+        $matched = $null
+        if ($names.Determined) {
+            foreach ($name in $names.Names) {
+                if (Test-DeltaCertificateCoversName -CertificateName $name -Domain $domain) { $matched = $name; break }
+            }
+        }
+        $null = $rows.Add([PSCustomObject]@{
+            Domain    = $domain
+            IsCovered = [bool]$matched
+            MatchedBy = $matched
+        })
+    }
+
+    $uncovered = @($rows | Where-Object { -not $_.IsCovered })
+
+    return [PSCustomObject]@{
+        Determined      = $names.Determined
+        Reason          = $names.Reason
+        Names           = $names.Names
+        Subject         = $names.Subject
+        Rows            = $rows.ToArray()
+        Uncovered       = @($uncovered | ForEach-Object { $_.Domain })
+        CoversAll       = ($names.Determined -and $uncovered.Count -eq 0)
+        CertificatePath = $CertificatePath
+    }
+}
+
 function New-DeltaSelfSignedCertificate {
     <#
       Generates a self-signed certificate and key straight into the staging
@@ -549,20 +773,52 @@ function New-DeltaSelfSignedCertificate {
 
       Browsers will warn on the result. That is stated plainly wherever this
       mode is offered rather than dressed up.
+
+      -AdditionalName adds further subjectAltName DNS entries. It exists so a
+      generated certificate covers the whole configured domain set rather than
+      only the primary: NGINX may accept several hostnames, and issuing a
+      certificate that covers one of them and then reporting the rest as
+      uncovered would be this function creating the defect Domain Management
+      then reports. Names are validated by the caller; the defensive check
+      below is the boundary that keeps a shell metacharacter out of the command
+      regardless.
     #>
     param(
         [Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$OutputDirectory,
         [Parameter(Mandatory)][string]$OpenSslImage,
+        [string[]]$AdditionalName = @(),
         [int]$Days = 825
     )
 
+    # Every name that reaches the OpenSSL command line is checked here, at the
+    # point of use. A hostname is letters, digits, dots and hyphens; anything
+    # else is refused rather than quoted, because there is no quoting that makes
+    # an unexpected value safe to hand to a shell.
+    $subjectNames = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in (@($HostName) + @($AdditionalName) + @('localhost'))) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $candidate = $name.Trim()
+        if ($candidate -notmatch '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$') {
+            Stop-Setup "Refusing to generate a certificate for '$candidate': it is not a plain hostname."
+        }
+        if ($seen.Add($candidate)) { $null = $subjectNames.Add($candidate) }
+    }
+
     Write-Step 'Generating a self-signed certificate'
-    Write-Detail "Common name: $HostName (also valid for localhost and 127.0.0.1)"
+    if ($subjectNames.Count -gt 2) {
+        Write-Detail "Common name: $HostName (also valid for $((@($subjectNames) | Select-Object -Skip 1) -join ', ') and 127.0.0.1)"
+    }
+    else {
+        Write-Detail "Common name: $HostName (also valid for localhost and 127.0.0.1)"
+    }
 
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $OutputDirectory -Force
     }
+
+    $subjectAltName = (($subjectNames | ForEach-Object { "DNS:$_" }) + @('IP:127.0.0.1')) -join ','
 
     $command = @"
 set -e
@@ -570,7 +826,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days $Days -nodes \
   -keyout /work/$Script:DeltaCertificateKeyName \
   -out /work/$Script:DeltaCertificateFileName \
   -subj "/CN=$HostName" \
-  -addext "subjectAltName=DNS:$HostName,DNS:localhost,IP:127.0.0.1" 2>/work/openssl.err
+  -addext "subjectAltName=$subjectAltName" 2>/work/openssl.err
 echo GENERATED
 "@
 
@@ -1032,7 +1288,13 @@ function Invoke-DeltaNetworkStage {
             }
         }
         if (-not $sourceCertificate) {
-            $generated = New-DeltaSelfSignedCertificate -HostName $resolvedHost -OutputDirectory $certsDirectory -OpenSslImage $OpenSslImage
+            # A generated certificate covers the whole configured domain set,
+            # not just the primary. On a fresh installation that set is the
+            # primary alone; on a rerun of an installation with additional
+            # domains, issuing for the primary only would manufacture the
+            # coverage gap Domain Management then has to report.
+            $additionalNames = @((Get-DeltaDomainModel -InstallRoot $InstallRoot).Additional)
+            $generated = New-DeltaSelfSignedCertificate -HostName $resolvedHost -OutputDirectory $certsDirectory -OpenSslImage $OpenSslImage -AdditionalName $additionalNames
             if (-not $generated.Succeeded) {
                 $result.Reason = $generated.Reason
                 return $result
