@@ -1757,7 +1757,7 @@ Plus the four Domain Management suites re-run: **370/370** (122 + 78 + 42 + 128)
 
 #### Follow-up — certificate sources simplified
 
-**2026-08-21, same day.** PKCS#12 was removed from the product on the operator's instruction: there is no deployment requirement for it, and NGINX serves PEM regardless. The certificate-source menu is now the two options above plus the conditional reuse of a preserved pair.
+**2026-08-21, same day** · commit `26435c7`. PKCS#12 was removed from the product on the operator's instruction: there is no deployment requirement for it, and NGINX serves PEM regardless. The certificate-source menu is now the two options above plus the conditional reuse of a preserved pair.
 
 What went: `Convert-DeltaPkcs12ToPem`, `$Script:DeltaPkcs12Extensions`, the `pkcs12` kind on `Resolve-DeltaCertificateInput`, its `-Pkcs12Password` parameter, the menu's PKCS#12 option and password prompt, the "that looks like a .pfx, shall I read it as one?" fallback, and the `-StandardInput` channel on `Invoke-DeltaOpenSsl`. **No accepted format carries a password now, so the strongest available claim is not that the password is handled carefully but that there is no password channel at all** - `-passin` in any form is statically absent from the product, and the suite asserts that rather than asserting on how a secret is carried.
 
