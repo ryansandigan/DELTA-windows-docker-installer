@@ -31,6 +31,17 @@
     2.14.100). Passing -Version completely overrides that auto-increment
     with the exact version supplied.
 
+    If the resolved version is the one lib\Delta.Version.ps1 already
+    declares - the first release, where the file was authored at 1.0.0
+    before this script ever ran, and -Version 1.0.0 asks to tag exactly
+    that - there is no bump to make. The version file is left alone and
+    the add/commit/push half of the sequence is skipped; the annotated tag
+    is cut from the current HEAD instead. No empty commit is manufactured
+    to stand in for a bump that isn't needed. Only an explicit -Version
+    can reach this, since auto-increment always changes the patch, and it
+    relaxes no guardrail: an already-existing tag refuses the release here
+    exactly as it does for a bump.
+
     Guardrails run before anything is changed: the current directory must
     be a Git repository, the current branch must be 'main', the working
     tree must have no uncommitted changes, the version file must parse,
@@ -61,6 +72,11 @@
 .EXAMPLE
     .\release.ps1 -Version 2.1.0
     Releases exactly 2.1.0, ignoring the current version's patch number.
+
+.EXAMPLE
+    .\release.ps1 -Version 1.0.0
+    Releases the version the file already declares: no bump commit is
+    made, the annotated v1.0.0 tag is cut from the current HEAD.
 
 .EXAMPLE
     .\release.ps1 -DryRun
@@ -299,19 +315,30 @@ function Update-VersionFile {
       name itself (not the old value) to stay resilient to exactly which
       version was there before. Written back with a BOM-less UTF8
       encoding, matching every other .ps1 file in this repository.
+
+      The match deliberately stops at the closing quote and rewrites only
+      the literal, keeping everything after it - including the line
+      ending - outside the replacement. An earlier '\s*$' tail anchor did
+      not: '\s' matches '\n', so under (?m) the greedy tail swallowed the
+      file's final newline and the rewrite silently stripped it. That made
+      even a same-version rewrite a real content change, which is exactly
+      what the caller below relies on NOT being true when it decides
+      whether a bump commit is required. Preserving the tail also leaves
+      CRLF files untouched, where a '[ \t]*$' anchor would fail outright
+      (.NET's '$' matches before '\n', not before '\r').
     #>
     param([Parameter(Mandatory)][string]$NewVersion)
 
     Write-Step 'Updating version file...'
 
     $content = Get-Content -LiteralPath $Script:VersionFilePath -Raw
-    $assignmentPattern = "(?m)^\`$Script:DeltaInstallerVersion\s*=\s*'[^']*'\s*$"
+    $assignmentPattern = "(?m)^(\`$Script:DeltaInstallerVersion\s*=\s*)'[^']*'"
 
     if ($content -notmatch $assignmentPattern) {
         Stop-Release "Could not locate the `$Script:DeltaInstallerVersion assignment in $($Script:VersionFilePath)."
     }
 
-    $newContent = [regex]::Replace($content, $assignmentPattern, "`$Script:DeltaInstallerVersion = '$NewVersion'")
+    $newContent = [regex]::Replace($content, $assignmentPattern, "`$1'$NewVersion'")
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Script:VersionFilePath, $newContent, $utf8NoBom)
@@ -410,34 +437,69 @@ try {
     Assert-TagAvailable -Tag $tagName
     Assert-ChangelogEntry -TargetVersion $nextVersion
 
+    # Releasing the version the file already declares is a real case - the
+    # first release, where lib\Delta.Version.ps1 was authored at 1.0.0 long
+    # before anyone ran this script, and -Version 1.0.0 asks to tag exactly
+    # that. There is nothing to bump, so bumping anyway would mean either a
+    # commit whose diff is empty or a 'nothing to commit' abort; instead the
+    # version file and the commit/push half of the sequence are skipped and
+    # the tag is cut from the current HEAD. Only reachable via an explicit
+    # -Version: the auto-increment path always adds one to the patch.
+    #
+    # This changes nothing about what is *allowed* to be released. Every
+    # guardrail above runs unconditionally, before this point and before any
+    # mutation - Assert-TagAvailable included, so an existing vX.Y.Z still
+    # refuses the release here exactly as it does for a bump.
+    $needsVersionBump = ($nextVersion -ne $currentVersion)
+
     if ($DryRun) {
         Write-Host ''
         Write-Step 'Dry run - no changes will be made.'
         Write-Detail "Current Version: $currentVersion"
         Write-Detail "Next Version:    $nextVersion"
+        if ($needsVersionBump) {
+            Write-Detail "Version Bump:    $currentVersion -> $nextVersion"
+        }
+        else {
+            Write-Detail "Version Bump:    not required - lib\Delta.Version.ps1 already declares $nextVersion"
+        }
         Write-Detail "Release Notes:   CHANGELOG.md '## [$nextVersion]' section found"
         Write-Host ''
         Write-Step 'The following Git commands would be executed:'
-        Write-Detail 'git add lib/Delta.Version.ps1'
-        Write-Detail "git commit -m ""build: bump installer version to $nextVersion"""
-        Write-Detail 'git push'
+        if ($needsVersionBump) {
+            Write-Detail 'git add lib/Delta.Version.ps1'
+            Write-Detail "git commit -m ""build: bump installer version to $nextVersion"""
+            Write-Detail 'git push'
+        }
         Write-Detail "git tag -a $tagName -m ""DELTA Windows Docker Installer $tagName"""
         Write-Detail "git push origin $tagName"
+        if (-not $needsVersionBump) {
+            Write-Host ''
+            Write-Detail 'No version bump commit is required, so the tag would be cut'
+            Write-Detail 'from the current HEAD as it already stands.'
+        }
         Write-Host ''
         Write-Success 'Dry run completed. No changes were made.'
         exit 0
     }
 
-    Update-VersionFile -NewVersion $nextVersion
+    if ($needsVersionBump) {
+        Update-VersionFile -NewVersion $nextVersion
 
-    Write-Step 'Committing version bump...'
-    Invoke-GitCommand -ArgumentList @('add', 'lib/Delta.Version.ps1') | Out-Null
-    Invoke-GitCommand -ArgumentList @('commit', '-m', "build: bump installer version to $nextVersion") | Out-Null
-    Write-Detail 'Committed lib/Delta.Version.ps1'
+        Write-Step 'Committing version bump...'
+        Invoke-GitCommand -ArgumentList @('add', 'lib/Delta.Version.ps1') | Out-Null
+        Invoke-GitCommand -ArgumentList @('commit', '-m', "build: bump installer version to $nextVersion") | Out-Null
+        Write-Detail 'Committed lib/Delta.Version.ps1'
 
-    Write-Step 'Pushing commit...'
-    Invoke-GitCommand -ArgumentList @('push') | Out-Null
-    Write-Detail 'Pushed to origin.'
+        Write-Step 'Pushing commit...'
+        Invoke-GitCommand -ArgumentList @('push') | Out-Null
+        Write-Detail 'Pushed to origin.'
+    }
+    else {
+        Write-Step 'Skipping version bump...'
+        Write-Detail "lib\Delta.Version.ps1 already declares $nextVersion - nothing to change."
+        Write-Detail 'Tagging the current HEAD; no bump commit will be created or pushed.'
+    }
 
     Write-Step 'Creating tag...'
     Invoke-GitCommand -ArgumentList @('tag', '-a', $tagName, '-m', "DELTA Windows Docker Installer $tagName") | Out-Null
