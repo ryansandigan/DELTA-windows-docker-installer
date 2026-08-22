@@ -875,74 +875,13 @@ function Show-DeltaCertificateMenu {
 # Certificate collection
 # ---------------------------------------------------------------------------
 
-function Read-DeltaCertificateFilePair {
-    <#
-      Collects an existing certificate and its private key: two Windows file
-      selection dialogs, the certificate first and the key second, which is the
-      order and the shape the reference installer's
-      Install-DeltaSslCertificateFiles uses.
-
-      The filters come from the same extension lists the validator checks
-      against, so what the dialog offers and what the installer accepts cannot
-      drift apart. "All files" stays as the second entry, as the reference's
-      filters have it - a correctly-named certificate in an unusual place is
-      still one the operator has to be able to reach, and the extension is
-      checked afterwards regardless of how the file was found.
-
-      Cancelling either dialog cancels the whole selection and returns $null,
-      which the caller reports as "nothing was changed". That is this
-      installer's convention throughout, and it is why this does not adopt the
-      reference's Stop-Setup on a missing selection: there, a cancelled picker
-      ends a linear install; here it must return the operator to the menu they
-      came from with the installation untouched.
-
-      Nothing is validated here beyond the dialog's own CheckFileExists. The
-      certificate, the key, their pairing, the dates and the domain coverage
-      are all decided by Resolve-DeltaCertificateInput and the activation gate,
-      unchanged - this function's only job is to find out which two files the
-      operator means.
-    #>
-
-    $certificateFilter = Get-DeltaFileDialogFilter -Description 'Certificate files' -Extensions $Script:DeltaPemCertificateExtensions
-    $keyFilter         = Get-DeltaFileDialogFilter -Description 'Private key files' -Extensions $Script:DeltaPemKeyExtensions
-
-    if (-not (Test-DeltaFileDialogSupported)) {
-        # No dialog is possible in this session. Say so, then fall back to
-        # typing rather than leaving the operator unable to install a
-        # certificate at all.
-        Write-Host ''
-        Write-DeltaWarning 'This session cannot open a file selection window, so the paths have to be typed.'
-        Write-Detail 'That happens on Server Core, or when PowerShell is not running on an STA thread.'
-        Write-Host ''
-        Write-Host 'Leave either blank to cancel.'
-        $typedCertificate = ([string](Read-Host -Prompt "Certificate file ($($Script:DeltaPemCertificateExtensions -join '/'))")).Trim('"', ' ')
-        if (-not $typedCertificate) { return $null }
-        $typedKey = ([string](Read-Host -Prompt "Private key file ($($Script:DeltaPemKeyExtensions -join '/'))")).Trim('"', ' ')
-        if (-not $typedKey) { return $null }
-        return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $typedCertificate; KeyPath = $typedKey }
-    }
-
-    Write-Host ''
-    Write-Step 'Selecting the certificate file'
-    Write-Detail 'A file selection window has opened. Cancel it to go back without changing anything.'
-    $certificate = Select-DeltaSslFile -Title 'Select the SSL certificate file' -Filter $certificateFilter
-    if (-not $certificate) {
-        Write-Detail 'No certificate was selected.'
-        return $null
-    }
-    Write-Detail $certificate
-
-    Write-Step 'Selecting the private key file'
-    Write-Detail 'A second window has opened for the private key.'
-    $key = Select-DeltaSslFile -Title 'Select the SSL private key file' -Filter $keyFilter
-    if (-not $key) {
-        Write-Detail 'No private key was selected.'
-        return $null
-    }
-    Write-Detail $key
-
-    return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key }
-}
+# The two file selection dialogs that collect a certificate and its key are
+# Read-DeltaCertificateFilePair, in Delta.Network.ps1 beside the extension
+# lists and the validator they answer to. They started here, when this menu was
+# the only caller; the installer's own "I have a certificate" choice now asks
+# for the same two files, and asking for them twice in two places is how the
+# two prompts come to differ. Read-DeltaCertificateSource below calls it
+# unchanged.
 
 function Read-DeltaCertificateSource {
     <#

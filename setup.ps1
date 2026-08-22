@@ -640,6 +640,20 @@ try {
                         -AdminPasswordWasGenerated $settings.AdminPasswordWasGenerated `
                         -AllowPrompt (-not $NonInteractive)
 
+                    # SMTP is offered only once DELTA is installed, published
+                    # and verified - and it is offered BEFORE the completion
+                    # summary so that the summary, and the administrator
+                    # credential shown once inside it, stay the last thing on
+                    # screen. It cannot change the installation's verdict:
+                    # $exitCode is decided by Show-DeltaStackOutcome below,
+                    # from $stack, which this does not touch.
+                    if ($stack.Outcome -eq 'ready') {
+                        $null = Invoke-DeltaPostInstallSmtpOffer `
+                            -InstallRoot $InstallRoot `
+                            -Configuration $stack.Configuration `
+                            -AllowPrompt (-not $NonInteractive)
+                    }
+
                     $exitCode = Show-DeltaStackOutcome -Stack $stack
                 }
             }

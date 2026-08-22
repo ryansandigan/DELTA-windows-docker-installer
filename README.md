@@ -12,6 +12,59 @@ it.
 
 ---
 
+## TL;DR — installation guide
+
+The whole install, in order. Everything here is expanded further down.
+
+1. **Download** the installer ZIP, `DELTA-windows-installer-docker-X.Y.Z.zip`.
+
+2. **Unblock it *before* extracting.** Right-click the ZIP → **Properties** →
+   tick **Unblock** if it is shown → **Apply**. Windows marks files that came
+   from the internet; clearing the mark on the ZIP saves clearing it on every
+   file inside it afterwards.
+
+3. **Extract** it to a local folder — say `C:\Installers\DELTA`. A local disk,
+   not a network share or a cloud-synced folder.
+
+4. **Open PowerShell as Administrator** in that folder. Elevation is required;
+   the installer checks and stops if it is missing.
+
+5. **If PowerShell blocks the script**, allow scripts for this session only:
+
+   ```powershell
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   ```
+
+   `-Scope Process` affects this one window. Close it and the machine's policy
+   is exactly as it was.
+
+6. **Run the installer:**
+
+   ```powershell
+   .\setup.ps1
+   ```
+
+7. **Answer the prompts** — hostname, database password, administrator
+   password, HTTPS, and one SMTP question at the end. Enter takes a sensible
+   default for every one of them.
+
+8. **Wait for it to finish.** The first run takes a few minutes, most of it
+   pulling images. It verifies the database, the administrator credential and
+   the published URL as it goes, and stops rather than reporting success it
+   cannot back up.
+
+9. **Record the DELTA administrator password** in the closing summary. It is
+   shown once, stored nowhere, and cannot be recovered.
+
+10. **Open the DELTA URL** the installer prints.
+
+Afterwards, running `.\setup.ps1` again opens the
+[management menu](#running-setupps1-again--the-management-utility) — update,
+backup, SMTP, certificates, domains, logs — rather than installing a second
+time.
+
+---
+
 ## Before you start
 
 - **Windows Server 2022 / 2025, or Windows 11.** 64-bit, and virtualization
@@ -66,19 +119,25 @@ password: the database is never published to the network and nothing outside
 this machine can reach it. Type your own if you want to connect with other
 tooling.
 
+Answering the HTTPS question with **your own certificate** opens two Windows
+file-selection dialogs, one for the certificate and one for the private key —
+the same pickers [Certificate Management](#choosing-the-files) uses after the
+install. You browse to the files; you do not type paths. Cancelling either
+dialog puts you back at the HTTPS question, with self-signed and plain HTTP
+still on offer and nothing changed.
+
 ### What you will *not* be asked
 
 - **Ports.** If port 80 (and 443 with HTTPS) is free, the installer takes it
   without asking. You are only asked for another port when something else
   genuinely owns it — and then you are told *what* owns it. Nothing already
   using the port is ever stopped, moved or reconfigured.
-- **SMTP / email.** DELTA works without it. The installer sets
-  `EMAIL_TRANSPORT=file`, which writes mail to the container log instead of
-  sending it, and a placeholder `EMAIL_FROM` — DELTA requires both to be set
-  even when it is not sending anything, so the installer supplies them.
-  Configure a real mail server afterwards, when you want one, from
-  [Configuring email](#configuring-email). Installing DELTA does not require a
-  mail server to exist.
+- **SMTP / email, before the install.** No mail server has to exist for DELTA to
+  install. The installer sets `EMAIL_TRANSPORT=file`, which writes mail to the
+  container log instead of sending it, and a placeholder `EMAIL_FROM` — DELTA
+  requires both to be set even when it is not sending anything. You are offered
+  SMTP once at the *end*, after DELTA is up (below), and you can decline and do
+  it later from [Configuring email](#configuring-email).
 - **How people sign in.** `AUTHENTICATION_SUPPORTED=form` is set for you, which
   is normal local sign-in with an email address and password. (DELTA also
   accepts `sso_azure_b2c`, which additionally requires three Azure settings —
@@ -91,8 +150,30 @@ folder layout, generates the configuration, pulls and pins the images, starts
 PostgreSQL, lets DELTA initialise its own schema and verifies that it did,
 replaces the published default administrator credential *before* anything is
 reachable, starts NGINX, requests the site to prove it answers, opens the
-firewall for the port it published, configures unattended startup, and prints
-the access details.
+firewall for the port it published, and configures unattended startup. The only
+thing asked after that is the optional SMTP question below, and it comes after
+DELTA is already up.
+
+### One question at the end: SMTP
+
+With DELTA installed and answering, the installer asks once:
+
+```
+Configure SMTP now? [y/N]:
+```
+
+**Y** runs the same [Configure SMTP](#configuring-email) flow as menu option 5 —
+same prompts, same connection check, same rollback if applying it fails. If it
+does fail, you are offered a retry, and declining that just leaves email
+unconfigured.
+
+**N, or Enter,** skips it. DELTA keeps working: outgoing email messages are
+written to the DELTA container log instead of being sent, which you can read
+with menu option 10, *View Logs*. Set email up whenever you like by running
+`setup.ps1` again and choosing **5. Configure SMTP**.
+
+Either way the installation is already finished and successful before this is
+asked — nothing about SMTP can undo it.
 
 Useful switches:
 
@@ -162,6 +243,39 @@ The first run takes a few minutes, most of it downloading images.
 ---
 
 ## Where things are
+
+Two separate places: the folder you extracted the installer into, and the
+installation it creates.
+
+**The extracted installer** — keep it. `setup.ps1` is also the management
+utility and the uninstaller lives beside it:
+
+```
+DELTA-windows-installer-docker-X.Y.Z\
+  setup.ps1                 install, and afterwards the management menu
+  uninstall.ps1             remove DELTA (always backs up first)
+  bin\                      scripts the scheduled tasks run
+    start-delta.ps1           brings DELTA back after a restart
+    rotate-nginx-logs.ps1     the daily access-log trim
+  lib\                      the installer's own libraries
+  templates\                .env, docker-compose.yml and NGINX templates
+  logs\installer\           transcripts of every run, secrets redacted
+```
+
+The two scheduled tasks the installer registers point into `bin\` **by absolute
+path**, so moving or renaming this folder after installing leaves them aimed at
+scripts that are no longer there. Both reconcile themselves, but from different
+places — after moving the folder, run both from its new location:
+
+```powershell
+.\setup.ps1 -Reconfigure   # re-points the startup task
+.\setup.ps1                # opens the menu, which re-points the rotation task
+```
+
+Each notices that the registered command line no longer matches and replaces
+the task; neither creates a duplicate.
+
+**The installation:**
 
 ```
 C:\DELTA\
@@ -592,6 +706,10 @@ Notes:
 Menu option **5** sets how DELTA sends mail. It shows what is configured now,
 asks for the transport, and — for SMTP — for the server settings.
 
+This is the same flow the installer offers once at the end of a fresh install
+([One question at the end](#one-question-at-the-end-smtp)); answering **N**
+there and coming here later gets you exactly the same screens.
+
 DELTA supports two transports:
 
 | Transport | What it does |
@@ -611,9 +729,9 @@ default — press Enter to keep it.
 mail library and its own built-in default uses the second one:
 
 ```
-onboarding@resend.dev
-"DELTA" <onboarding@resend.dev>
-DELTA Notifications <onboarding@resend.dev>
+sender@example.org
+"DELTA" <sender@example.org>
+DELTA Notifications <sender@example.org>
 ```
 
 The quotes and the display name are stored and delivered to DELTA exactly as
@@ -788,6 +906,11 @@ way.
 menu with the installation untouched. Nothing is validated, staged or changed
 until both files have been chosen.
 
+These are the same two dialogs the installer opens when you answer its HTTPS
+question with *I have a certificate* — one implementation, so the two flows
+cannot drift apart. The only difference is where cancelling lands you: here, the
+menu; during an install, back at the HTTPS question.
+
 > On a session that cannot show a dialog at all — Server Core, or PowerShell
 > running on a non-STA thread — the installer says so and asks you to type the
 > two paths instead, so a headless host is not left unable to install a
@@ -841,7 +964,7 @@ and you are told what it *is* valid for.
 A certificate that validates perfectly but names a different host than your
 current primary domain is usually not a mistake — it is the right certificate
 arriving before the domain has been made primary. Installing DELTA on
-`localhost` and then being handed a certificate for `delta.ncscm.gov.jo` is the
+`localhost` and then being handed a certificate for `delta.example.org` is the
 ordinary way this happens.
 
 The refusal above still stands. What you are offered next is the chance to
@@ -855,9 +978,9 @@ The certificate does not cover the current primary domain:
 
 The certificate is valid for:
 
-    delta.ncscm.gov.jo
+    delta.example.org
 
-Would you like to use delta.ncscm.gov.jo as the primary domain?
+Would you like to use delta.example.org as the primary domain?
 
   1. Yes - Make it the primary domain and continue
   2. No  - Keep the current primary domain
@@ -1069,9 +1192,9 @@ Three different things, and the distinction is the whole point:
 one canonical address. So an installation can look like this:
 
 ```
-PUBLIC_URL=https://delta.ncscm.gov.jo
+PUBLIC_URL=https://delta.example.org
 
-server_name delta.ncscm.gov.jo delta.internal.ncscm.gov.jo delta-old.ncscm.gov.jo;
+server_name delta.example.org delta.internal.example.org delta-old.example.org;
 ```
 
 #### The screen
@@ -1083,15 +1206,15 @@ C:\DELTA
 ========================================================================
 
 Primary URL
-  https://delta.ncscm.gov.jo
+  https://delta.example.org
   The one canonical address DELTA uses for itself. There is exactly one.
 
 Primary domain
-  delta.ncscm.gov.jo
+  delta.example.org
 
 Additional domains
-  delta.internal.ncscm.gov.jo
-  delta-old.ncscm.gov.jo
+  delta.internal.example.org
+  delta-old.example.org
 
   1. Add Domain
   2. Remove Domain
@@ -1114,13 +1237,13 @@ duplicated.
 Adding a domain **does not change `PUBLIC_URL`**:
 
 ```
-before   PUBLIC_URL=https://delta.ncscm.gov.jo
-         server_name delta.ncscm.gov.jo;
+before   PUBLIC_URL=https://delta.example.org
+         server_name delta.example.org;
 
-add      delta.internal.ncscm.gov.jo
+add      delta.internal.example.org
 
-after    PUBLIC_URL=https://delta.ncscm.gov.jo          (unchanged)
-         server_name delta.ncscm.gov.jo delta.internal.ncscm.gov.jo;
+after    PUBLIC_URL=https://delta.example.org           (unchanged)
+         server_name delta.example.org delta.internal.example.org;
 ```
 
 **No container is recreated.** The NGINX configuration is regenerated, validated
@@ -1146,15 +1269,15 @@ Choose any configured domain — primary or additional — to become the canonic
 one:
 
 ```
-before   PUBLIC_URL=https://delta.ncscm.gov.jo
-         delta.ncscm.gov.jo            primary
-         delta.internal.ncscm.gov.jo   additional
+before   PUBLIC_URL=https://delta.example.org
+         delta.example.org             primary
+         delta.internal.example.org    additional
 
-set      delta.internal.ncscm.gov.jo
+set      delta.internal.example.org
 
-after    PUBLIC_URL=https://delta.internal.ncscm.gov.jo
-         delta.internal.ncscm.gov.jo   primary
-         delta.ncscm.gov.jo            additional
+after    PUBLIC_URL=https://delta.internal.example.org
+         delta.internal.example.org    primary
+         delta.example.org             additional
 ```
 
 The old primary is kept as an additional domain rather than dropped, so links
@@ -1181,13 +1304,13 @@ hostname is added: **does the active certificate cover it?** You are told one of
 three things, and they are three different facts:
 
 ```
-The active certificate covers delta.internal.ncscm.gov.jo.
+The active certificate covers delta.internal.example.org.
 
-The active certificate does not cover delta.internal.ncscm.gov.jo.
-  It is valid for: delta.ncscm.gov.jo
+The active certificate does not cover delta.internal.example.org.
+  It is valid for: delta.example.org
   ...Replace it through Certificate Management (menu option 7).
 
-Certificate coverage for delta.internal.ncscm.gov.jo could not be determined.
+Certificate coverage for delta.internal.example.org could not be determined.
 ```
 
 "Could not be determined" is never reported as "not covered". Coverage is read

@@ -787,6 +787,85 @@ function Get-DeltaCertificateDomainCoverage {
 $Script:DeltaPemCertificateExtensions = @('.crt', '.cer', '.pem')
 $Script:DeltaPemKeyExtensions         = @('.key', '.pem')
 
+function Read-DeltaCertificateFilePair {
+    <#
+      Collects an existing certificate and its private key: two Windows file
+      selection dialogs, the certificate first and the key second, which is the
+      order and the shape the reference installer's
+      Install-DeltaSslCertificateFiles uses.
+
+      Both flows that ask an operator for a certificate they already hold call
+      this one function: the installer's HTTPS choice ("I have a certificate")
+      in Invoke-DeltaNetworkStage below, and Certificate Management's
+      Read-DeltaCertificateSource in Delta.Tls.ps1. It lives here, beside the
+      extension lists and Test-DeltaCertificateMaterial, rather than up in
+      Delta.Tls.ps1 where it started: the installer stage cannot call into a
+      library loaded after it without inverting the layering, and two operators
+      being asked for the same two files should not be able to be asked
+      differently.
+
+      The filters come from the same extension lists the validator checks
+      against, so what the dialog offers and what the installer accepts cannot
+      drift apart. "All files" stays as the second entry, as the reference's
+      filters have it - a correctly-named certificate in an unusual place is
+      still one the operator has to be able to reach, and the extension is
+      checked afterwards regardless of how the file was found.
+
+      Cancelling either dialog cancels the whole selection and returns $null.
+      Each caller decides what that means for it - the menu reports "nothing
+      was changed" and returns to itself, the installer returns to the HTTPS
+      question - but neither treats it as an error, which is this installer's
+      convention throughout and why this does not adopt the reference's
+      Stop-Setup on a missing selection.
+
+      Nothing is validated here beyond the dialog's own CheckFileExists. The
+      certificate, the key, their pairing, the dates and the domain coverage
+      are all decided by Test-DeltaCertificateMaterial,
+      Resolve-DeltaCertificateInput and the activation gate, unchanged - this
+      function's only job is to find out which two files the operator means.
+    #>
+
+    $certificateFilter = Get-DeltaFileDialogFilter -Description 'Certificate files' -Extensions $Script:DeltaPemCertificateExtensions
+    $keyFilter         = Get-DeltaFileDialogFilter -Description 'Private key files' -Extensions $Script:DeltaPemKeyExtensions
+
+    if (-not (Test-DeltaFileDialogSupported)) {
+        # No dialog is possible in this session. Say so, then fall back to
+        # typing rather than leaving the operator unable to install a
+        # certificate at all.
+        Write-Host ''
+        Write-DeltaWarning 'This session cannot open a file selection window, so the paths have to be typed.'
+        Write-Detail 'That happens on Server Core, or when PowerShell is not running on an STA thread.'
+        Write-Host ''
+        Write-Host 'Leave either blank to cancel.'
+        $typedCertificate = ([string](Read-Host -Prompt "Certificate file ($($Script:DeltaPemCertificateExtensions -join '/'))")).Trim('"', ' ')
+        if (-not $typedCertificate) { return $null }
+        $typedKey = ([string](Read-Host -Prompt "Private key file ($($Script:DeltaPemKeyExtensions -join '/'))")).Trim('"', ' ')
+        if (-not $typedKey) { return $null }
+        return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $typedCertificate; KeyPath = $typedKey }
+    }
+
+    Write-Host ''
+    Write-Step 'Selecting the certificate file'
+    Write-Detail 'A file selection window has opened. Cancel it to go back without changing anything.'
+    $certificate = Select-DeltaSslFile -Title 'Select the SSL certificate file' -Filter $certificateFilter
+    if (-not $certificate) {
+        Write-Detail 'No certificate was selected.'
+        return $null
+    }
+    Write-Detail $certificate
+
+    Write-Step 'Selecting the private key file'
+    Write-Detail 'A second window has opened for the private key.'
+    $key = Select-DeltaSslFile -Title 'Select the SSL private key file' -Filter $keyFilter
+    if (-not $key) {
+        Write-Detail 'No private key was selected.'
+        return $null
+    }
+    Write-Detail $key
+
+    return [PSCustomObject]@{ Kind = 'pem'; CertificatePath = $certificate; KeyPath = $key }
+}
+
 function Get-DeltaCertificateSourceKind {
     <#
       Classifies an operator-supplied certificate file by extension: 'pem' or
@@ -1283,7 +1362,8 @@ function Read-DeltaTlsModeChoice {
     Write-Host '     so users reaching this server by hostname over plain HTTP will not stay signed in.'
     Write-Host ''
     Write-Host '  2. I have a certificate - supply a certificate and private key (PEM).'
-    Write-Host '     Recommended for production.'
+    Write-Host '     Recommended for production. A file selection window opens for each;'
+    Write-Host '     cancel it to come back here.'
     Write-Host ''
     Write-Host '  3. Generate a self-signed certificate.'
     Write-Host '     Browsers will show a warning. Suitable for internal testing.'
@@ -1374,97 +1454,130 @@ function Invoke-DeltaNetworkStage {
     }
     $result.HttpPort = $http.Port
 
-    # --- TLS mode ---------------------------------------------------------
+    # --- TLS mode and certificate ------------------------------------------
     $currentMode = & $readExisting 'TLS_MODE' $null
     if (-not $currentMode) {
         $currentMode = if ((& $readExisting 'TLS_ENABLED' 'false') -eq 'true') { 'supplied' } else { 'none' }
     }
 
-    $mode = $TlsMode
-    if (-not $mode) {
-        if ($AllowPrompt) { $mode = Read-DeltaTlsModeChoice -Current $currentMode }
-        else { $mode = $currentMode }
-    }
-    $result.TlsMode = $mode
-
-    if ($mode -eq 'none') {
-        $result.TlsEnabled = $false
-        $result.HttpsPort = [int](& $readExisting 'HTTPS_PORT' "$Script:DeltaDefaultHttpsPort")
-        $result.PublicUrl = Get-DeltaPublicUrl -Scheme 'http' -HostName $resolvedHost -Port $result.HttpPort
-        Write-Detail "[ ok ]     TLS disabled; public address $($result.PublicUrl)"
-        Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only - DELTA marks its session cookies Secure, so users reaching this server by hostname will not stay signed in.'
-        $result.Succeeded = $true
-        return $result
-    }
-
-    # --- certificate ------------------------------------------------------
     $certsDirectory = Join-Path -Path $InstallRoot -ChildPath 'certs'
     $stagedCertificate = Join-Path $certsDirectory $Script:DeltaCertificateFileName
     $stagedKey         = Join-Path $certsDirectory $Script:DeltaCertificateKeyName
 
+    # The HTTPS question and the certificate that answers it are one decision
+    # taken in two steps, so both sit inside this loop. An operator who chooses
+    # "I have a certificate" and then closes the file picker has not failed the
+    # installation - they have changed their mind, and the right place to put
+    # them is back at the HTTPS question, where self-signed and plain HTTP are
+    # still on offer. Only a prompted run can reach that path; -TlsMode with
+    # -AllowPrompt $false still resolves in a single pass.
+    #
+    # -TlsMode and -CertificatePath pre-answer their own step and are consumed
+    # on the first pass only: a second pass exists precisely because the
+    # operator came back to choose again.
+    $mode = $TlsMode
     $sourceCertificate = $CertificatePath
     $sourceKey         = $CertificateKeyPath
 
-    if ($mode -eq 'self-signed') {
-        if ((Test-Path -LiteralPath $stagedCertificate) -and (Test-Path -LiteralPath $stagedKey) -and -not $CertificatePath) {
-            # A rerun keeps a certificate that is already in place and still
-            # valid rather than quietly issuing a new one under everybody.
-            $existingCheck = Test-DeltaCertificateMaterial -CertificatePath $stagedCertificate -KeyPath $stagedKey -OpenSslImage $OpenSslImage
-            if ($existingCheck.IsValid) {
-                Write-Detail '[ ok ]     an existing valid certificate is already staged; keeping it.'
-                $sourceCertificate = $stagedCertificate
-                $sourceKey = $stagedKey
-            }
-        }
-        if (-not $sourceCertificate) {
-            # A generated certificate covers the whole configured domain set,
-            # not just the primary. On a fresh installation that set is the
-            # primary alone; on a rerun of an installation with additional
-            # domains, issuing for the primary only would manufacture the
-            # coverage gap Domain Management then has to report.
-            $additionalNames = @((Get-DeltaDomainModel -InstallRoot $InstallRoot).Additional)
-            $generated = New-DeltaSelfSignedCertificate -HostName $resolvedHost -OutputDirectory $certsDirectory -OpenSslImage $OpenSslImage -AdditionalName $additionalNames
-            if (-not $generated.Succeeded) {
-                $result.Reason = $generated.Reason
-                return $result
-            }
-            $sourceCertificate = $generated.CertificatePath
-            $sourceKey = $generated.KeyPath
-        }
-    }
-
     while ($true) {
-        if (-not $sourceCertificate -or -not $sourceKey) {
-            if ((Test-Path -LiteralPath $stagedCertificate) -and (Test-Path -LiteralPath $stagedKey)) {
-                $sourceCertificate = $stagedCertificate
-                $sourceKey = $stagedKey
-            }
-            elseif ($AllowPrompt) {
-                Write-Host ''
-                $sourceCertificate = (Read-Host -Prompt 'Path to the certificate file (PEM .crt/.pem)').Trim('"', ' ')
-                $sourceKey         = (Read-Host -Prompt 'Path to the private key file (PEM .key/.pem)').Trim('"', ' ')
-            }
-            else {
-                $result.Reason = 'HTTPS was requested but no certificate and key were supplied, and there is none staged in certs\.'
-                return $result
-            }
+        if (-not $mode) {
+            if ($AllowPrompt) { $mode = Read-DeltaTlsModeChoice -Current $currentMode }
+            else { $mode = $currentMode }
         }
+        $result.TlsMode = $mode
 
-        $check = Test-DeltaCertificateMaterial -CertificatePath $sourceCertificate -KeyPath $sourceKey -OpenSslImage $OpenSslImage
-        if ($check.IsValid) {
-            $result.Certificate = $check
-            break
-        }
-
-        Write-DeltaFailure ''
-        Write-DeltaFailure 'The certificate cannot be used.'
-        Write-Detail $check.Reason
-        if (-not $AllowPrompt) {
-            $result.Reason = $check.Reason
+        if ($mode -eq 'none') {
+            $result.TlsEnabled = $false
+            $result.HttpsPort = [int](& $readExisting 'HTTPS_PORT' "$Script:DeltaDefaultHttpsPort")
+            $result.PublicUrl = Get-DeltaPublicUrl -Scheme 'http' -HostName $resolvedHost -Port $result.HttpPort
+            Write-Detail "[ ok ]     TLS disabled; public address $($result.PublicUrl)"
+            Write-DeltaWarning 'Plain HTTP is suitable for localhost testing only - DELTA marks its session cookies Secure, so users reaching this server by hostname will not stay signed in.'
+            $result.Succeeded = $true
             return $result
         }
-        $sourceCertificate = $null
-        $sourceKey = $null
+
+        if ($mode -eq 'self-signed') {
+            if ((Test-Path -LiteralPath $stagedCertificate) -and (Test-Path -LiteralPath $stagedKey) -and -not $CertificatePath) {
+                # A rerun keeps a certificate that is already in place and still
+                # valid rather than quietly issuing a new one under everybody.
+                $existingCheck = Test-DeltaCertificateMaterial -CertificatePath $stagedCertificate -KeyPath $stagedKey -OpenSslImage $OpenSslImage
+                if ($existingCheck.IsValid) {
+                    Write-Detail '[ ok ]     an existing valid certificate is already staged; keeping it.'
+                    $sourceCertificate = $stagedCertificate
+                    $sourceKey = $stagedKey
+                }
+            }
+            if (-not $sourceCertificate) {
+                # A generated certificate covers the whole configured domain set,
+                # not just the primary. On a fresh installation that set is the
+                # primary alone; on a rerun of an installation with additional
+                # domains, issuing for the primary only would manufacture the
+                # coverage gap Domain Management then has to report.
+                $additionalNames = @((Get-DeltaDomainModel -InstallRoot $InstallRoot).Additional)
+                $generated = New-DeltaSelfSignedCertificate -HostName $resolvedHost -OutputDirectory $certsDirectory -OpenSslImage $OpenSslImage -AdditionalName $additionalNames
+                if (-not $generated.Succeeded) {
+                    $result.Reason = $generated.Reason
+                    return $result
+                }
+                $sourceCertificate = $generated.CertificatePath
+                $sourceKey = $generated.KeyPath
+            }
+        }
+
+        $cancelled = $false
+
+        while ($true) {
+            if (-not $sourceCertificate -or -not $sourceKey) {
+                if ((Test-Path -LiteralPath $stagedCertificate) -and (Test-Path -LiteralPath $stagedKey)) {
+                    $sourceCertificate = $stagedCertificate
+                    $sourceKey = $stagedKey
+                }
+                elseif ($AllowPrompt) {
+                    # The same two dialogs Certificate Management opens, from
+                    # the same function - an operator holding a bundle from
+                    # their CA picks the two files rather than transcribing
+                    # two paths into a console.
+                    $selection = Read-DeltaCertificateFilePair
+                    if (-not $selection) {
+                        $cancelled = $true
+                        break
+                    }
+                    $sourceCertificate = $selection.CertificatePath
+                    $sourceKey         = $selection.KeyPath
+                }
+                else {
+                    $result.Reason = 'HTTPS was requested but no certificate and key were supplied, and there is none staged in certs\.'
+                    return $result
+                }
+            }
+
+            $check = Test-DeltaCertificateMaterial -CertificatePath $sourceCertificate -KeyPath $sourceKey -OpenSslImage $OpenSslImage
+            if ($check.IsValid) {
+                $result.Certificate = $check
+                break
+            }
+
+            Write-DeltaFailure ''
+            Write-DeltaFailure 'The certificate cannot be used.'
+            Write-Detail $check.Reason
+            if (-not $AllowPrompt) {
+                $result.Reason = $check.Reason
+                return $result
+            }
+            $sourceCertificate = $null
+            $sourceKey = $null
+        }
+
+        if (-not $cancelled) { break }
+
+        # Back to the HTTPS question, with the choice they made last time as
+        # the default so pressing Enter reopens the picker. Nothing has been
+        # written to the installation at this point - the certificate is only
+        # staged below, after it validates.
+        Write-Host ''
+        Write-Detail 'No certificate was selected, so HTTPS has not been configured yet.'
+        $currentMode = $mode
+        $mode = $null
     }
 
     $staged = Install-DeltaCertificate -InstallRoot $InstallRoot -CertificatePath $sourceCertificate -KeyPath $sourceKey

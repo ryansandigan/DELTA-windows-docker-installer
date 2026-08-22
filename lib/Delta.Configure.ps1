@@ -250,15 +250,15 @@ function Test-DeltaEmailFrom {
       "@" and a ".".
 
       An earlier version of this installer accepted a bare address only, which
-      refused '"DELTA" <onboarding@resend.dev>' - a value the application is
+      refused '"DELTA" <sender@example.org>' - a value the application is
       perfectly happy with. An installer must not be stricter than the thing it
       configures.
 
       Accepted:
-        onboarding@resend.dev
-        <onboarding@resend.dev>
-        DELTA Notifications <onboarding@resend.dev>
-        "DELTA" <onboarding@resend.dev>
+        sender@example.org
+        <sender@example.org>
+        DELTA Notifications <sender@example.org>
+        "DELTA" <sender@example.org>
 
       Still rejected: anything without an "@", a domain without a dot,
       unbalanced angle brackets, a bare address containing spaces, and
@@ -824,7 +824,14 @@ function Show-DeltaSmtpOutcome {
       "rolled back" would hide the case where the file is correct and the
       container is not.
     #>
-    param([Parameter(Mandatory)][object]$Outcome)
+    param(
+        [Parameter(Mandatory)][object]$Outcome,
+        # The menu pauses so its report is read before the menu repaints over
+        # it. The installer's post-install offer does not: nothing overwrites
+        # its output, and a second "press Enter" between a finished
+        # installation and its completion summary is a prompt for no reason.
+        [bool]$PauseForMenu = $true
+    )
 
     Write-Host ''
     if ($Outcome.Succeeded) {
@@ -862,9 +869,138 @@ function Show-DeltaSmtpOutcome {
         else { Write-Detail 'Runtime: no container was recreated.' }
     }
 
+    if ($PauseForMenu) {
+        Write-Host ''
+        Write-Detail 'Press Enter to return to the menu.'
+        $null = Read-Host
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The post-install SMTP offer
+#
+# One question at the end of a fresh installation, and nothing more. The
+# configuration itself is Invoke-DeltaSmtpConfiguration above - the same
+# collect -> validate -> snapshot -> write -> apply -> verify path menu option
+# 5 runs, with the same rollback - so there is exactly one SMTP implementation
+# and this section only decides whether it runs.
+# ---------------------------------------------------------------------------
+
+function Read-DeltaSmtpOfferAnswer {
+    <#
+      A Y/N answer on one line.
+
+      Read-DeltaYesNoConfirmation is this project's usual shape and is not used
+      here: it frames the question in banner rules for a consequential decision
+      the operator must not skim past, and this is the opposite - an optional
+      extra offered after the work is done and safely declined. The convention
+      that matters is kept: bare Enter, and anything that is not Y, means no.
+    #>
+    param([Parameter(Mandatory)][string]$Prompt)
+
+    $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
+    $yes = ($choice -in @('Y', 'y'))
+    Write-DeltaLogLine -Message "$Prompt -> $(if ($yes) { 'yes' } else { 'no' })" -Level 'DETAIL'
+    return $yes
+}
+
+function Show-DeltaSmtpDeferralNotice {
+    <#
+      What an operator who has not configured SMTP needs to know: that the
+      installation is fine, what happens to mail instead, and how to come back
+      to it. Said the same way whichever route got here - declined, cancelled,
+      failed, or non-interactive - because the situation is the same in all
+      four cases.
+
+      "Written to the container log" is DELTA's own behaviour on
+      EMAIL_TRANSPORT=file, which is what a fresh .env already sets, so this
+      describes the state the installation is actually in rather than a
+      degraded one.
+    #>
+
     Write-Host ''
-    Write-Detail 'Press Enter to return to the menu.'
-    $null = Read-Host
+    Write-Detail 'SMTP is not configured. DELTA is fully usable: it writes outgoing email messages'
+    Write-Detail 'to the DELTA container log instead of sending them (menu option 10, View Logs).'
+    Write-Detail 'To set up email later, run setup.ps1 again and choose "5. Configure SMTP".'
+}
+
+function Invoke-DeltaPostInstallSmtpOffer {
+    <#
+      Offers SMTP configuration once, at the end of a successful installation.
+
+      Optional in the strong sense. This runs after DELTA is installed,
+      published and verified, and nothing it does can change that verdict: a
+      declined offer, a cancelled flow, a failed apply, an unexpected error and
+      a non-interactive run all end the same way - the installation is still
+      successful and the operator is told how to configure email later. That is
+      also why the whole body is wrapped: setup.ps1's top-level catch turns any
+      escaping exception into a failed install, and an optional extra must not
+      be able to do that.
+
+      A failure is retryable rather than terminal. Invoke-DeltaSmtpConfiguration
+      already restores .env and the running container when an apply fails, so a
+      second attempt starts from the same place the first one did - which is
+      what makes offering the retry honest rather than hopeful.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration,
+        [bool]$AllowPrompt = $true
+    )
+
+    $result = [PSCustomObject]@{
+        Configured = $false
+        Attempts   = 0
+        Outcome    = $null
+    }
+
+    try {
+        Write-Host ''
+        Write-Step 'Email (SMTP)'
+        Write-Detail 'DELTA uses email when creating user accounts and for account services such as'
+        Write-Detail 'password resets. A mail server is not required to run DELTA; without SMTP,'
+        Write-Detail 'outgoing messages are written to the application log instead of being sent.'
+        Write-Host ''
+        Write-Detail 'You can configure SMTP now or at any time later.'
+
+        if (-not $AllowPrompt) {
+            Write-Detail 'This run is non-interactive, so SMTP was not configured.'
+            Show-DeltaSmtpDeferralNotice
+            return $result
+        }
+
+        Write-Host ''
+        if (-not (Read-DeltaSmtpOfferAnswer -Prompt 'Configure SMTP now? [y/N]')) {
+            Show-DeltaSmtpDeferralNotice
+            return $result
+        }
+
+        while ($true) {
+            $result.Attempts++
+
+            $outcome = Invoke-DeltaSmtpConfiguration -InstallRoot $InstallRoot -Configuration $Configuration -AllowPrompt $true
+            $result.Outcome = $outcome
+            Show-DeltaSmtpOutcome -Outcome $outcome -PauseForMenu $false
+
+            if ($outcome.Succeeded) {
+                $result.Configured = $true
+                return $result
+            }
+
+            Write-Host ''
+            if (-not (Read-DeltaSmtpOfferAnswer -Prompt 'Try SMTP configuration again? [y/N]')) {
+                Show-DeltaSmtpDeferralNotice
+                return $result
+            }
+        }
+    }
+    catch {
+        Write-DeltaWarning "SMTP configuration stopped with an error: $($_.Exception.Message)"
+        Write-Detail 'The installation itself is unaffected.'
+        Write-DeltaLogLine -Message $_.ScriptStackTrace -Level 'ERROR'
+        Show-DeltaSmtpDeferralNotice
+        return $result
+    }
 }
 
 # ---------------------------------------------------------------------------
