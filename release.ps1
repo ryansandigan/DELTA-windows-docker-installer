@@ -10,20 +10,22 @@
     tag. This script never builds or uploads anything; it only prepares
     and pushes the commit and tag.
 
-    Note what does NOT yet exist in this repository, so the handoff is not
-    mistaken for something it is: there is no .github\workflows\release.yml
-    here. Packaging does exist - tools\build-release.ps1 turns a version
-    number into a ZIP and a checksum - but nothing runs it automatically.
-    In the native installer repository the tag push is what triggers
-    packaging and publication; here the tag push currently triggers
-    nothing, because nothing is listening for it yet, and a package is
-    produced only by running tools\build-release.ps1 by hand. That is a
-    deliberate boundary - this script is the release *trigger*, and the
-    workflow that would join it to the packager is separate work.
-    Everything below is written so that adding that workflow later
-    requires no change here: the tag shape, the version-file contract and
-    the CHANGELOG.md heading contract are all exactly the ones such a
-    workflow would consume.
+    The tag push is the handoff. .github\workflows\release.yml fires on
+    'v*', re-checks the tag against lib\Delta.Version.ps1, extracts the
+    tag's '## [X.Y.Z]' section from CHANGELOG.md as the release body, runs
+    tools\build-release.ps1 to produce the ZIP and its .sha256, and
+    publishes the GitHub Release with both attached. So this script is the
+    only release command an operator runs: everything after the tag push
+    is automatic, and nothing here builds or uploads anything itself.
+
+    Three contracts join the two halves, and all three are enforced on
+    both sides so a tag can never reach the workflow in a state the
+    workflow will reject: the vX.Y.Z tag shape, the
+    $Script:DeltaInstallerVersion literal in lib\Delta.Version.ps1, and
+    the '## [X.Y.Z]' heading in CHANGELOG.md. The guardrails below are
+    the local half of exactly those checks - they fail on the developer's
+    machine, in seconds, rather than in a workflow run after the tag is
+    already public.
 
     With no -Version, the patch component of the current version (read
     from lib\Delta.Version.ps1) is incremented by one - major and minor
@@ -47,8 +49,8 @@
     tree must have no uncommitted changes, the version file must parse,
     the target tag must not already exist, and CHANGELOG.md must contain
     a non-empty '## [X.Y.Z]' section for the target version (the curated
-    release notes a release workflow would publish as the GitHub Release
-    body). Any failure aborts before lib\Delta.Version.ps1 or Git state
+    release notes release.yml publishes as the GitHub Release body). Any
+    failure aborts before lib\Delta.Version.ps1 or Git state
     is touched. Because the release sequence itself is a handful of
     separate git invocations (add, commit, push, tag, push), a failure
     partway through (e.g. the tag push rejected after the commit push
@@ -219,6 +221,32 @@ function Assert-GitClean {
     }
 
     Write-Detail 'Working tree is clean.'
+}
+
+function Get-GitHubRepositoryUrl {
+    <#
+      Best-effort browse URL for 'origin', used only to print Actions and
+      Release links in the closing summary. Handles the two forms a GitHub
+      remote normally takes (https://github.com/owner/repo[.git] and
+      git@github.com:owner/repo.git) and returns $null for anything else -
+      a self-hosted remote, no remote at all, or a URL shape not recognised
+      here. The caller prints links only when this returns something, so a
+      release never fails, and never prints a wrong link, over cosmetics.
+    #>
+    $url = (Invoke-GitCommand -ArgumentList @('remote', 'get-url', 'origin') -AllowFailure | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($url)) {
+        return $null
+    }
+
+    $url = $url.ToString().Trim()
+    if ($url -match '^git@github\.com:(?<path>.+?)(\.git)?$') {
+        return "https://github.com/$($Matches['path'])"
+    }
+    if ($url -match '^https://github\.com/(?<path>.+?)(\.git)?$') {
+        return "https://github.com/$($Matches['path'])"
+    }
+
+    return $null
 }
 
 function Assert-TagAvailable {
@@ -479,6 +507,14 @@ try {
             Write-Detail 'from the current HEAD as it already stands.'
         }
         Write-Host ''
+        Write-Step 'Pushing that tag would then trigger GitHub Actions to:'
+        Write-Detail "verify $tagName matches lib\Delta.Version.ps1"
+        Write-Detail "use CHANGELOG.md's '## [$nextVersion]' section as the release body"
+        Write-Detail "run tools\build-release.ps1 -Version $nextVersion"
+        Write-Detail "publish release $tagName with these assets attached:"
+        Write-Detail "  DELTA-windows-installer-docker-$nextVersion.zip"
+        Write-Detail "  DELTA-windows-installer-docker-$nextVersion.zip.sha256"
+        Write-Host ''
         Write-Success 'Dry run completed. No changes were made.'
         exit 0
     }
@@ -513,9 +549,18 @@ try {
     Write-Success 'Release completed successfully.'
     Write-Detail "Version: $nextVersion"
     Write-Detail "Tag:     $tagName"
-    Write-Detail 'The tag has been pushed. No release workflow exists in this'
-    Write-Detail 'repository yet, so nothing will build or publish it automatically.'
-    Write-Detail "To produce the package: .\tools\build-release.ps1 -Version $nextVersion"
+    Write-Host ''
+    Write-Detail 'The tag has been pushed. .github\workflows\release.yml now builds the'
+    Write-Detail 'package and publishes the GitHub Release automatically - there is'
+    Write-Detail 'nothing further to run.'
+
+    $repoUrl = Get-GitHubRepositoryUrl
+    if ($repoUrl) {
+        Write-Host ''
+        Write-Detail 'Watch the run, then confirm the release and its two assets:'
+        Write-Detail "  Actions: $repoUrl/actions"
+        Write-Detail "  Release: $repoUrl/releases/tag/$tagName"
+    }
 
     exit 0
 }

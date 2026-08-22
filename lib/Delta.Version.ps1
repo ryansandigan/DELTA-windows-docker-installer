@@ -9,8 +9,9 @@
     one literal and nothing else, so anything that needs the installer's
     version can dot-source THIS file by itself - no $Script:DeltaScriptRoot,
     no Delta.Common.ps1, no library table - and get an answer. release.ps1
-    reads it that way, and a CI gate comparing this value against a pushed
-    Git tag would read it the same way.
+    reads it that way, and so does .github\workflows\release.yml's
+    "Verify installer version matches Git tag" step, which dot-sources this
+    file on the runner to compare it against the pushed tag.
 
     That standalone property is the whole design. Deriving this value from
     .env, from the install-state file, or from any Delta.*.ps1 library would
@@ -26,10 +27,14 @@
 
     Maintained by hand, not derived from Git. release.ps1 is what bumps it,
     in the same commit that prepares a release, so it matches the "vX.Y.Z"
-    tag that commit is tagged with. Nothing enforces that agreement yet:
-    tools\build-release.ps1 takes the version as a parameter and does not
-    cross-check it against this file, and there is no release workflow in
-    this repository to do so either (see README, "Cutting a release").
+    tag that commit is tagged with. That agreement is enforced twice: once
+    locally by release.ps1, which reads this file to decide the tag, and
+    again on the runner by .github\workflows\release.yml, which refuses to
+    publish a release whose tag disagrees with the value below.
+    tools\build-release.ps1 is the one exception - it takes the version as
+    a parameter and does not cross-check it against this file, because the
+    workflow has already done so before invoking it (see README, "Cutting
+    a release").
 
     This file lives in lib\, which tools\build-release.ps1 copies whole,
     so the installer's version ships inside every release package

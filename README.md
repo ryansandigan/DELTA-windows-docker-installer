@@ -1559,16 +1559,26 @@ Stated plainly so it is not mistaken for a gap:
 
 For maintainers of this repository, not for installing DELTA.
 
-The installer's own version lives in `lib\Delta.Version.ps1`, and release notes
-live in `CHANGELOG.md`. Write the `## [X.Y.Z]` section for the version you are
-about to cut and commit it first — `release.ps1` refuses to release a version
-that has no notes.
+Releases are automated. There are two steps:
+
+1. **Write the release notes and commit them.** The installer's own version
+   lives in `lib\Delta.Version.ps1`; release notes live in `CHANGELOG.md`. Add
+   the `## [X.Y.Z]` section for the version you are about to cut, along with
+   whatever development changes belong in it, and commit — `release.ps1`
+   refuses to release a version that has no notes.
+2. **Run the one release command.**
 
 ```powershell
 .\release.ps1                  # bump the patch version (1.0.0 -> 1.0.1)
-.\release.ps1 -Version 2.1.0   # release exactly 2.1.0
+.\release.ps1 -Version 1.1.0   # release exactly 1.1.0 (intentional minor/major)
 .\release.ps1 -DryRun          # show what would happen, change nothing
 ```
+
+That is the whole release. Everything after the tag push is automatic — you do
+not build the ZIP, generate the checksum, create the GitHub Release, copy the
+release notes, or upload assets by hand.
+
+### What each half does
 
 `release.ps1` bumps `lib\Delta.Version.ps1`, commits it as
 `build: bump installer version to X.Y.Z`, pushes, then creates and pushes an
@@ -1578,13 +1588,49 @@ file that parses as `X.Y.Z`, a `vX.Y.Z` tag that does not already exist, and a
 non-empty `## [X.Y.Z]` section in `CHANGELOG.md`. Any failure stops with the
 version file and Git state untouched.
 
-`-DryRun` runs every one of those checks, prints the current and next version
-and the five Git commands it would run, and writes nothing — no file change, no
-commit, no tag.
+Pushing that tag triggers `.github\workflows\release.yml`, which runs on
+`windows-latest` and:
 
-### Building the package
+1. re-checks the tag against `lib\Delta.Version.ps1` and fails on any
+   disagreement;
+2. extracts the tag's `## [X.Y.Z]` section from `CHANGELOG.md` as the release
+   body — never commit messages, never GitHub's auto-generated notes;
+3. runs `tools\build-release.ps1 -Version X.Y.Z`;
+4. verifies both expected artifacts exist;
+5. publishes the GitHub Release for the tag with both attached:
 
-`tools\build-release.ps1` produces the distributable ZIP:
+```
+DELTA-windows-installer-docker-X.Y.Z.zip
+DELTA-windows-installer-docker-X.Y.Z.zip.sha256
+```
+
+Every one of those steps fails the run rather than publishing something
+incomplete. Because `release.ps1` enforces the same tag, version and
+`CHANGELOG.md` contracts locally before pushing, a tag it created should never
+fail these checks — they catch tags pushed by hand, outside `release.ps1`.
+
+`-DryRun` runs every local check, prints the current and next version, the Git
+commands it would run, and what the workflow would then do — and writes
+nothing: no file change, no commit, no tag, no push.
+
+### First release from an unreleased version
+
+When the requested version is the one `lib\Delta.Version.ps1` already declares —
+the bootstrap case, where the file was authored at `1.0.0` before `release.ps1`
+ever ran — there is no bump to make. `release.ps1` skips the version-file
+rewrite and the bump commit entirely and tags the current `HEAD` instead, rather
+than manufacturing an empty commit. The tag is published exactly as any other:
+
+```powershell
+.\release.ps1 -Version 1.0.0
+```
+
+This relaxes nothing. An existing `v1.0.0` tag still refuses the release.
+
+### Building the package by hand (development only)
+
+Not part of the release procedure above — the workflow runs this for you. It is
+useful for inspecting what a release package would contain:
 
 ```powershell
 .\tools\build-release.ps1 -Version 1.0.0
@@ -1595,9 +1641,15 @@ It copies an explicit whitelist of production files into
 matching `.sha256`. `release\` is deleted and recreated on every run, so a
 rebuild never mixes in leftovers. It downloads nothing and publishes nothing —
 Docker Desktop and the container images are still obtained at install time.
+It is the single source of truth for package contents: the workflow calls it
+rather than restating the file list in YAML.
 
-> **The pushed tag does not publish anything yet.** There is no
-> `.github\workflows\release.yml` in this repository, so nothing is listening
-> for `v*` tags. `release.ps1` produces the version bump and the tag, and
-> `tools\build-release.ps1` produces the package — but you must run the packager
-> yourself, and attaching the result to a GitHub Release is still manual.
+### Release infrastructure tests
+
+`tools\Test-Release.ps1` exercises `release.ps1` against disposable Git
+repositories under `%TEMP%`, each with its own local bare `origin`, so nothing
+it does can reach this repository or GitHub:
+
+```powershell
+.\tools\Test-Release.ps1
+```

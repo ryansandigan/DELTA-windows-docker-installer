@@ -1,0 +1,236 @@
+name: Release
+
+# Fires only when a version tag (v1.0.0, v2.3.1, ...) is pushed. Ordinary
+# branch pushes and pull requests never trigger a release. release.ps1 is
+# what pushes that tag - this workflow is the other half of the release,
+# and the two halves share three contracts: the 'vX.Y.Z' tag shape, the
+# $Script:DeltaInstallerVersion literal in lib\Delta.Version.ps1, and the
+# '## [X.Y.Z]' heading in CHANGELOG.md.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least-privilege default: this workflow only needs to publish a release
+# and attach assets to it.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        # Checkout resolves the pushed tag automatically (it's the
+        # triggering ref) - no extra ref/fetch-depth configuration needed.
+        # Everything below therefore reads the tagged commit's own
+        # lib\Delta.Version.ps1 and CHANGELOG.md, not main's.
+
+      - name: Derive release version from tag
+        id: version
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # github.ref_name is the bare tag (e.g. "v1.0.0") on a tag push.
+          # tools\build-release.ps1 expects the version without the "v"
+          # prefix (e.g. "1.0.0") - strip it once, here, and reuse the
+          # result in every later step.
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+
+          # The trigger is the broad 'v*' glob, so a hand-pushed tag like
+          # 'v-wip' or 'vlatest' can reach this job. release.ps1 only ever
+          # creates Major.Minor.Patch tags; anything else was made outside
+          # it, and is rejected here before a version comparison that would
+          # fail with a more confusing message.
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Host "Tag '$tag' is not a release tag."
+            Write-Host ""
+            Write-Host "Release tags must be 'vX.Y.Z' (e.g. v1.0.0)."
+            Write-Host ""
+            Write-Host "Release aborted."
+            exit 1
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Verify installer version matches Git tag
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # Dot-source the version file exactly as release.ps1 does, rather
+          # than regex-matching its text - this reuses PowerShell's own
+          # parser to evaluate the assignment, so it can't be fooled by
+          # incidental formatting differences (quote style, spacing, a
+          # trailing comment) the way a hand-rolled text pattern could.
+          # lib\Delta.Version.ps1 is deliberately standalone precisely so it
+          # can be dot-sourced on its own like this, with no other library
+          # loaded.
+          #
+          # This is the single version source. Nothing in this workflow
+          # derives the installer's version from anywhere else; the tag is
+          # only ever compared against this file, never trusted in its place.
+          . .\lib\Delta.Version.ps1
+          $installerVersion = $Script:DeltaInstallerVersion
+
+          $gitTag        = "${{ github.ref_name }}"
+          $taggedVersion = "${{ steps.version.outputs.version }}"
+
+          if ($installerVersion -ne $taggedVersion) {
+            Write-Host "Version mismatch detected."
+            Write-Host ""
+            Write-Host "Git tag:"
+            Write-Host "$gitTag"
+            Write-Host ""
+            Write-Host "Installer version (lib\Delta.Version.ps1):"
+            Write-Host "$installerVersion"
+            Write-Host ""
+            Write-Host "Release aborted."
+            exit 1
+          }
+
+          Write-Host "Installer version matches Git tag."
+          Write-Host ""
+          Write-Host "Proceeding with release build..."
+
+      - name: Extract release notes from changelog
+        id: notes
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # CHANGELOG.md is the curated source of truth for release notes.
+          # release.ps1 already refused to push this tag unless its
+          # '## [X.Y.Z]' section existed and had content
+          # (Assert-ChangelogEntry - the identical heading contract used
+          # here), so a failure below means the tag was created outside
+          # release.ps1. Failing the job is deliberate: publishing an empty,
+          # auto-generated or unrelated release body would be worse.
+          #
+          # Runs before the build on purpose - a tag with no release notes
+          # should fail fast, not after paying for packaging. The notes are
+          # written under RUNNER_TEMP, never release\, because
+          # tools\build-release.ps1 deletes and recreates release\ wholesale.
+          $version = "${{ steps.version.outputs.version }}"
+
+          if (-not (Test-Path -LiteralPath 'CHANGELOG.md' -PathType Leaf)) {
+            throw "CHANGELOG.md not found in the tagged commit - cannot build release notes for ${{ github.ref_name }}."
+          }
+
+          $changelogLines = @(Get-Content -LiteralPath 'CHANGELOG.md')
+          $headingPattern = "^##\s+\[$([regex]::Escape($version))\]"
+
+          $startIndex = -1
+          for ($i = 0; $i -lt $changelogLines.Count; $i++) {
+            if ($changelogLines[$i] -match $headingPattern) {
+              $startIndex = $i
+              break
+            }
+          }
+          if ($startIndex -lt 0) {
+            throw "CHANGELOG.md has no '## [$version]' section for tag ${{ github.ref_name }}."
+          }
+
+          # The section runs until the next '## [' release heading, or end
+          # of file for the newest-at-bottom / only entry.
+          $endIndex = $changelogLines.Count
+          for ($i = $startIndex + 1; $i -lt $changelogLines.Count; $i++) {
+            if ($changelogLines[$i] -match '^##\s+\[') {
+              $endIndex = $i
+              break
+            }
+          }
+
+          $sectionLines = @()
+          if ($startIndex + 1 -lt $endIndex) {
+            $sectionLines = @($changelogLines[($startIndex + 1)..($endIndex - 1)])
+          }
+
+          # "Meaningful content" means something beyond blank lines and bare
+          # '###' category headings - the same rule release.ps1 enforces
+          # before the tag ever gets pushed.
+          $contentLines = @($sectionLines | Where-Object { $_.Trim() -and $_ -notmatch '^###\s' })
+          if ($contentLines.Count -eq 0) {
+            throw "CHANGELOG.md's '## [$version]' section contains no release-note content."
+          }
+
+          # The release body is the section's content without its own
+          # version heading - the release page's title already names the
+          # tag. Leading/trailing blank lines are trimmed for a clean body;
+          # interior formatting is preserved exactly as curated.
+          while ($sectionLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($sectionLines[0])) {
+            $sectionLines = @($sectionLines | Select-Object -Skip 1)
+          }
+          while ($sectionLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($sectionLines[-1])) {
+            $sectionLines = @($sectionLines | Select-Object -First ($sectionLines.Count - 1))
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'RELEASE_NOTES.md'
+          Set-Content -LiteralPath $notesPath -Value ($sectionLines -join "`n") -Encoding utf8
+          "path=$notesPath" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Release notes extracted for $version ($($contentLines.Count) content line(s)):"
+          Write-Host ""
+          Write-Host ($sectionLines -join "`n")
+
+      - name: Build release package
+        shell: pwsh
+        run: .\tools\build-release.ps1 -Version "${{ steps.version.outputs.version }}"
+        # All packaging logic (whitelist copy, ZIP, SHA256) lives in that
+        # script - it is the single source of truth for what belongs in the
+        # downloadable package, and this workflow deliberately does not
+        # restate any of it in YAML. This step only supplies the version;
+        # a non-zero exit from the script fails the job automatically.
+
+      - name: Verify release artifacts exist
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # Names must match tools\build-release.ps1's $Script:PackageName
+          # ("DELTA-windows-installer-docker-<Version>"), $Script:ZipPath and
+          # $Script:ChecksumPath. Asserting them here rather than trusting the
+          # build's exit code means a packaging change that silently renames
+          # an artifact fails the release instead of publishing a release with
+          # missing assets.
+          $version  = "${{ steps.version.outputs.version }}"
+          $zip      = "release/DELTA-windows-installer-docker-$version.zip"
+          $checksum = "$zip.sha256"
+
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+            throw "Expected release artifact not found: $zip"
+          }
+          if (-not (Test-Path -LiteralPath $checksum -PathType Leaf)) {
+            throw "Expected release artifact not found: $checksum"
+          }
+
+          Write-Host "Verified release artifacts:"
+          Write-Host "  $zip"
+          Write-Host "  $checksum"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          # The release body is the tag's own curated CHANGELOG.md section,
+          # extracted (and validated non-empty) above - never auto-generated
+          # from commit messages.
+          body_path: ${{ steps.notes.outputs.path }}
+          # Second line of defence behind the verification step above: if a
+          # glob matches nothing, fail the job rather than publish a release
+          # missing its assets.
+          fail_on_unmatched_files: true
+          files: |
+            release/DELTA-windows-installer-docker-${{ steps.version.outputs.version }}.zip
+            release/DELTA-windows-installer-docker-${{ steps.version.outputs.version }}.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -5,11 +5,13 @@
 
 .DESCRIPTION
     Single source of truth for producing release packages - run both by
-    developers locally and, once a release workflow exists, by GitHub
-    Actions, which should invoke this script rather than reimplementing
-    any packaging logic of its own. (No .github\workflows\release.yml
-    exists in this repository yet; release.ps1 pushes the tag such a
-    workflow would react to. See README, "Cutting a release".)
+    developers locally and by GitHub Actions, which invokes this script
+    rather than reimplementing any packaging logic of its own.
+    .github\workflows\release.yml's "Build release package" step is a
+    single call to it, passing the version derived from the pushed tag;
+    the whitelist below is therefore the only place that decides what
+    ships, and it is never restated in YAML. See README, "Cutting a
+    release".
 
     Packaging only: copies a fixed whitelist of production files into
     release\DELTA-windows-installer-docker-<Version>\, zips that
@@ -19,7 +21,8 @@
     DELTA and PostgreSQL/PostGIS images are pulled by the Docker engine.
     This script never downloads anything, never modifies setup.ps1, and
     never publishes a GitHub Release; those are separate concerns owned
-    elsewhere.
+    elsewhere - publication belongs to release.yml, which attaches the
+    two artifacts named below to the release for the tag it was fired by.
 
     The whitelist (not an exclude-list) is deliberate: a file added to
     the repository root in the future is excluded from releases by

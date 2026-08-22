@@ -572,6 +572,70 @@ function Test-VersionFileRoundTrip {
 }
 
 # ---------------------------------------------------------------------------
+# Test 7 - GitHub links in the closing summary
+#
+# Get-GitHubRepositoryUrl only decorates the success banner, but it runs
+# inside the release path, so a throw there would fail a release that had
+# already pushed its tag. Lifted from release.ps1 by AST, like
+# Update-VersionFile above, and driven through a real repository's
+# configured remote rather than a stubbed string.
+# ---------------------------------------------------------------------------
+
+function Test-GitHubRepositoryUrl {
+    Start-TestCase 'GitHub repository URL derivation for the closing summary'
+
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script:ReleaseePath, [ref]$null, [ref]$null)
+    foreach ($name in @('Invoke-GitCommand', 'Get-GitHubRepositoryUrl')) {
+        $fn = $ast.FindAll(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name },
+            $true) | Select-Object -First 1
+        if (-not $fn) {
+            Assert-That -Description "$name was found in release.ps1" -Condition $false
+            return
+        }
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+
+    function Stop-Release { param([string]$Message) throw $Message }
+
+    $repoPath = Join-Path -Path $Script:WorkRoot -ChildPath 'github-url'
+    New-Item -ItemType Directory -Path $repoPath -Force | Out-Null
+    Invoke-Git -RepoPath $repoPath -ArgumentList @('init', '--quiet') | Out-Null
+
+    $cases = @(
+        @{ Remote = 'https://github.com/ryansandigan/DELTA-windows-docker-installer.git'; Expected = 'https://github.com/ryansandigan/DELTA-windows-docker-installer' }
+        @{ Remote = 'https://github.com/ryansandigan/DELTA-windows-docker-installer';     Expected = 'https://github.com/ryansandigan/DELTA-windows-docker-installer' }
+        @{ Remote = 'git@github.com:ryansandigan/DELTA-windows-docker-installer.git';     Expected = 'https://github.com/ryansandigan/DELTA-windows-docker-installer' }
+        @{ Remote = 'https://git.example.invalid/team/repo.git';                          Expected = '' }
+        @{ Remote = 'C:\some\local\bare.git';                                             Expected = '' }
+    )
+
+    Push-Location $repoPath
+    try {
+        foreach ($case in $cases) {
+            Invoke-Git -RepoPath $repoPath -ArgumentList @('remote', 'remove', 'origin') -AllowFailure | Out-Null
+            Invoke-Git -RepoPath $repoPath -ArgumentList @('remote', 'add', 'origin', $case.Remote) | Out-Null
+
+            $actual = Get-GitHubRepositoryUrl
+            if ($null -eq $actual) { $actual = '' }
+            Assert-Equal -Description "$($case.Remote) -> '$($case.Expected)'" -Expected $case.Expected -Actual $actual
+        }
+
+        # No remote at all must not throw - a release that reached the
+        # summary has already succeeded.
+        Invoke-Git -RepoPath $repoPath -ArgumentList @('remote', 'remove', 'origin') -AllowFailure | Out-Null
+        $noRemote = $null
+        $threw = $false
+        try { $noRemote = Get-GitHubRepositoryUrl } catch { $threw = $true }
+        Assert-That -Description 'no origin remote does not throw' -Condition (-not $threw)
+        Assert-That -Description 'no origin remote yields no links' -Condition ($null -eq $noRemote)
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -589,6 +653,7 @@ try {
     Test-DryRunEqualVersion
     Test-DryRunNormalBump
     Test-VersionFileRoundTrip
+    Test-GitHubRepositoryUrl
 
     Write-Host ''
     Write-Step 'Summary'
