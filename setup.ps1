@@ -313,12 +313,13 @@ function Show-DeltaRuntimeOutcome {
 
     switch ($Runtime.Outcome) {
         'reboot-required' {
+            # The restart itself is offered by Request-DeltaWindowsRestart in
+            # Main, not here: this function reports an outcome and returns a
+            # code, and the machine must not go down from inside a reporting
+            # function. The "restart it yourself" instructions live with the
+            # decline path, which is where they are the answer.
             Write-DeltaWarning 'Windows must restart before installation can continue.'
             Write-Detail $Runtime.Reason
-            Write-Detail ''
-            Write-Detail 'Restart this machine, sign in, then run this installer again:'
-            Write-Detail "  cd `"$Script:DeltaScriptRoot`"  then  .\setup.ps1"
-            Write-Detail 'Nothing else needs to be repeated - the installer picks up where it left off.'
             return $Script:DeltaExitRebootRequired
         }
         'declined' {
@@ -332,6 +333,76 @@ function Show-DeltaRuntimeOutcome {
             return $Script:DeltaExitPrerequisiteFailed
         }
     }
+}
+
+function Request-DeltaWindowsRestart {
+    <#
+      Offers to restart Windows when a prerequisite has asked for one, and
+      reports whether the operator agreed. It restarts nothing itself.
+
+      That separation is the point. A restart is the most disruptive thing this
+      installer can do to a machine, so the decision and the act are kept apart:
+      this function only ever returns $true or $false, and Main performs the
+      restart afterwards - once the transcript has been closed, so the log ends
+      with a proper closing line instead of being cut off mid-write by a
+      shutdown.
+
+      Three rules it cannot be talked out of:
+
+        - Nothing restarts without a typed Y. Bare Enter is no, as everywhere
+          else in this installer, so an operator who hurried past the prompt
+          keeps their machine up.
+        - -NonInteractive never restarts. An unattended run has nobody to judge
+          whether this machine can go down right now, and rebooting a server on
+          its own authority is not a decision an installer gets to make. It
+          prints the manual instructions and exits with the same code.
+        - Declining changes nothing about the outcome. The exit code is the
+          reboot-required code either way; the restart is a convenience, not a
+          different result.
+
+      Nothing is scheduled to run after the restart. The operator signs in and
+      runs setup.ps1 again, which reads the machine's actual state and continues
+      from there - which is the same path a manual restart takes, so there is
+      only one resume story to get right.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [bool]$AllowPrompt = $true
+    )
+
+    $rerun = "  cd `"$ScriptRoot`"  then  .\setup.ps1"
+
+    $declined = {
+        Write-Detail ''
+        Write-Detail 'Restart this machine, sign in, then run this installer again:'
+        Write-Detail $rerun
+        Write-Detail 'Nothing else needs to be repeated - the installer picks up where it left off.'
+    }
+
+    if (-not $AllowPrompt) {
+        Write-Detail ''
+        Write-Detail 'This run is non-interactive, so Windows will not be restarted automatically.'
+        & $declined
+        return $false
+    }
+
+    Write-Detail ''
+    Write-Detail 'This installer can restart Windows for you now.'
+    Write-Detail 'Restarting closes every open application on this machine, so save your work first.'
+    Write-Detail 'Nothing about the installation is lost either way - it resumes when you run'
+    Write-Detail 'setup.ps1 again after signing in.'
+    Write-Host ''
+
+    if (-not (Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]')) {
+        & $declined
+        return $false
+    }
+
+    Write-Detail ''
+    Write-Detail 'Windows will restart in a few seconds.'
+    Write-Detail 'After signing in, run:'
+    Write-Detail $rerun
+    return $true
 }
 
 function Show-DeltaRestartBehaviour {
@@ -559,6 +630,12 @@ function Show-DeltaStackOutcome {
 
 $exitCode = $Script:DeltaExitSuccess
 
+# Set only by an explicit Y at the restart prompt. Acted on after the finally
+# block, never inside the try: a shutdown started while the transcript is still
+# open truncates the log the operator will want to read after the machine comes
+# back.
+$Script:DeltaRestartConfirmed = $false
+
 try {
     $logPath = Start-DeltaLog -Directory $LogDirectory
 
@@ -609,6 +686,15 @@ try {
                     -AllowDownload:$AllowDockerDownload
 
                 $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
+
+                if ($runtime.Outcome -eq 'reboot-required') {
+                    # Only the answer is collected here. The restart happens
+                    # after the finally block below, so the transcript is closed
+                    # cleanly before the machine goes down.
+                    $Script:DeltaRestartConfirmed = Request-DeltaWindowsRestart `
+                        -ScriptRoot $Script:DeltaScriptRoot `
+                        -AllowPrompt (-not $NonInteractive)
+                }
 
                 if ($runtime.Outcome -eq 'ready') {
                     # Everything the administrator has to decide is asked here,
@@ -674,6 +760,25 @@ catch {
 }
 finally {
     Stop-DeltaLog -ExitCode $exitCode
+}
+
+# The transcript is closed and every stage has reported. The only thing left is
+# the restart the operator asked for at the prompt above.
+#
+# The exit code does not change: a confirmed restart is still the
+# reboot-required outcome, and if the restart cannot be started - a policy, a
+# blocking shutdown handler - the operator is told and left with a machine that
+# is up and an exit code that says exactly what it said before.
+if ($Script:DeltaRestartConfirmed) {
+    try {
+        Restart-Computer -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Host ''
+        Write-DeltaFailure "Windows could not be restarted: $($_.Exception.Message)"
+        Write-Detail 'Restart this machine yourself, sign in, and run setup.ps1 again.'
+        Write-Detail 'Nothing about the installation changed - it resumes from where it stopped.'
+    }
 }
 
 exit $exitCode

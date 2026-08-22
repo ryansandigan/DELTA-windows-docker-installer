@@ -371,6 +371,30 @@ function Read-DeltaYesNoConfirmation {
     return $confirmed
 }
 
+function Read-DeltaInlineConfirmation {
+    <#
+      A Y/N answer on one line, with the question in the prompt itself.
+
+      The lighter of this project's two confirmations. Read-DeltaYesNoConfirmation
+      above frames its question in banner rules, which is right for a
+      consequential decision an operator must not skim past; this is for the
+      offers either answer to which is perfectly safe - "configure SMTP now?",
+      "restart Windows now?" - where a banner would overstate the moment.
+
+      The convention that matters is identical in both: bare Enter, and anything
+      that is not Y, means no. A prompt an operator hurried past never takes the
+      action.
+
+      $Prompt is the question without its trailing colon - Read-Host adds that.
+    #>
+    param([Parameter(Mandatory)][string]$Prompt)
+
+    $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
+    $confirmed = ($choice -in @('Y', 'y'))
+    Write-DeltaLogLine -Message "$Prompt -> $(if ($confirmed) { 'yes' } else { 'no' })" -Level 'DETAIL'
+    return $confirmed
+}
+
 # ---------------------------------------------------------------------------
 # File selection
 #

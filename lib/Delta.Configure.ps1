@@ -886,24 +886,6 @@ function Show-DeltaSmtpOutcome {
 # and this section only decides whether it runs.
 # ---------------------------------------------------------------------------
 
-function Read-DeltaSmtpOfferAnswer {
-    <#
-      A Y/N answer on one line.
-
-      Read-DeltaYesNoConfirmation is this project's usual shape and is not used
-      here: it frames the question in banner rules for a consequential decision
-      the operator must not skim past, and this is the opposite - an optional
-      extra offered after the work is done and safely declined. The convention
-      that matters is kept: bare Enter, and anything that is not Y, means no.
-    #>
-    param([Parameter(Mandatory)][string]$Prompt)
-
-    $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
-    $yes = ($choice -in @('Y', 'y'))
-    Write-DeltaLogLine -Message "$Prompt -> $(if ($yes) { 'yes' } else { 'no' })" -Level 'DETAIL'
-    return $yes
-}
-
 function Show-DeltaSmtpDeferralNotice {
     <#
       What an operator who has not configured SMTP needs to know: that the
@@ -970,7 +952,7 @@ function Invoke-DeltaPostInstallSmtpOffer {
         }
 
         Write-Host ''
-        if (-not (Read-DeltaSmtpOfferAnswer -Prompt 'Configure SMTP now? [y/N]')) {
+        if (-not (Read-DeltaInlineConfirmation -Prompt 'Configure SMTP now? [y/N]')) {
             Show-DeltaSmtpDeferralNotice
             return $result
         }
@@ -988,7 +970,7 @@ function Invoke-DeltaPostInstallSmtpOffer {
             }
 
             Write-Host ''
-            if (-not (Read-DeltaSmtpOfferAnswer -Prompt 'Try SMTP configuration again? [y/N]')) {
+            if (-not (Read-DeltaInlineConfirmation -Prompt 'Try SMTP configuration again? [y/N]')) {
                 Show-DeltaSmtpDeferralNotice
                 return $result
             }
