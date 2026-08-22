@@ -24,6 +24,30 @@
 $Script:DeltaDockerInstallerUrl  = 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe'
 $Script:DeltaDockerInstallerName = 'Docker Desktop Installer.exe'
 
+# A size floor for a downloaded installer, not a pin. Docker Desktop's
+# installer is around 600 MB; Docker publishes no per-build checksum at a
+# stable URL for the "latest" link, so an exact hash cannot be verified without
+# breaking on every Docker release. What this catches is the failure that
+# actually happens on a fresh machine: a captive portal, a proxy error page or
+# a truncated transfer saved under the .exe name. Those are kilobytes. The real
+# authenticity check is the Authenticode signature below - this only rejects
+# what is obviously not an installer before bothering to check its signature.
+$Script:DeltaDockerInstallerMinimumBytes = 100MB
+
+# The publisher the downloaded installer must be signed by.
+#
+# Matched against the certificate's organisation (O=, falling back to CN=) and
+# anchored at the start, NOT searched for anywhere in the subject. A substring
+# search over the whole distinguished name accepts "CN=Definitely Not Docker
+# Ltd" - a validly signed binary from someone who merely put the word in their
+# company name - which is precisely the attack a signature check exists to
+# stop.
+#
+# Anchored but not pinned to the full DN: Docker has shipped under more than
+# one exact subject, and pinning the whole string would turn a routine
+# certificate renewal into a failed installation on every fresh machine.
+$Script:DeltaDockerInstallerSignerPattern = '^Docker\b'
+
 # Windows build floor. 19044 (Windows 10 21H2) is Docker Desktop's own WSL2
 # minimum; below it the product does not run at all, so it is a stop.
 $Script:DeltaMinimumWindowsBuild = 19044
@@ -1334,22 +1358,189 @@ function Get-DeltaDockerInstallLogPaths {
     return ($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) })
 }
 
+function Get-DeltaCertificateSubjectPart {
+    <#
+      One RDN out of a certificate subject - 'O' or 'CN' - so a publisher check
+      can test the organisation rather than searching the whole distinguished
+      name for a word.
+
+      Handles the quoted form a DN uses when a value itself contains a comma.
+      Returns $null when the key is absent, which the caller must treat as "not
+      established" rather than as a pass.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Subject,
+        [Parameter(Mandatory)][string]$Key
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Subject)) { return $null }
+
+    $match = [regex]::Match($Subject, "(?:^|,)\s*$Key=(?:`"(?<quoted>[^`"]*)`"|(?<plain>[^,]*))",
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return $null }
+
+    $value = if ($match.Groups['quoted'].Success) { $match.Groups['quoted'].Value } else { $match.Groups['plain'].Value }
+    $value = $value.Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    return $value
+}
+
+function Test-DeltaDockerInstallerFile {
+    <#
+      Whether a file this installer just downloaded is safe to execute.
+
+      Three checks, cheapest first, each rejecting a different real failure:
+
+        1. Size. An error page, a captive-portal redirect or a transfer that
+           died half-way is kilobytes, not hundreds of megabytes.
+        2. The MZ header. A proxy that returns HTML with a 200 produces a file
+           that is the right size band only by accident, and is not a PE image.
+        3. Authenticode. The one that actually answers "is this Docker's
+           installer": a valid signature chaining to a trusted root, with
+           Docker named in the signer's subject.
+
+      Anything short of all three is a refusal to execute. A downloaded binary
+      that cannot be shown to be the vendor's is not run on the operator's
+      machine on the grounds that it is probably fine.
+
+      This is applied to what the installer downloaded, and not to a path the
+      operator supplied or staged in installers\ themselves. Those are the
+      operator's own choice of binary, made deliberately - an air-gapped site
+      that repackages the installer is not doing anything wrong, and refusing
+      to run a file somebody explicitly pointed at would be this installer
+      overruling them about their own machine. What arrives over the network
+      unasked-for is the case that needs proving.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $result = [PSCustomObject]@{
+        IsValid           = $false
+        Reason            = $null
+        SizeBytes         = 0
+        SignatureStatus   = $null
+        Signer            = $null
+        SignerOrganisation = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "Nothing was written to '$Path'."
+        return $result
+    }
+
+    $result.SizeBytes = (Get-Item -LiteralPath $Path).Length
+    if ($result.SizeBytes -lt $Script:DeltaDockerInstallerMinimumBytes) {
+        $megabytes = [math]::Round($result.SizeBytes / 1MB, 1)
+        $result.Reason = "The download is only $megabytes MB, far below the roughly 600 MB Docker Desktop installer. That is a truncated transfer or an error page saved under the installer's name, not the installer."
+        return $result
+    }
+
+    try {
+        $header = New-Object byte[] 2
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { $null = $stream.Read($header, 0, 2) } finally { $stream.Dispose() }
+    }
+    catch {
+        $result.Reason = "The download could not be read back: $($_.Exception.Message)"
+        return $result
+    }
+
+    if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+        $result.Reason = 'The download is not a Windows executable (no MZ header). Something between this machine and Docker returned other content.'
+        return $result
+    }
+
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+    }
+    catch {
+        $result.Reason = "The download's Authenticode signature could not be read: $($_.Exception.Message)"
+        return $result
+    }
+
+    $result.SignatureStatus = [string]$signature.Status
+    if ($signature.SignerCertificate) { $result.Signer = [string]$signature.SignerCertificate.Subject }
+
+    if ($result.SignatureStatus -ne 'Valid') {
+        $result.Reason = "The download's Authenticode signature is '$($result.SignatureStatus)', not 'Valid'. It was not run."
+        return $result
+    }
+
+    # The organisation, not the whole subject: see the note on
+    # $Script:DeltaDockerInstallerSignerPattern. CN is the fallback only
+    # because a certificate without an O= is unusual, not because either will
+    # do - whichever is used still has to start with Docker.
+    $organisation = Get-DeltaCertificateSubjectPart -Subject $result.Signer -Key 'O'
+    if (-not $organisation) { $organisation = Get-DeltaCertificateSubjectPart -Subject $result.Signer -Key 'CN' }
+    $result.SignerOrganisation = $organisation
+
+    if (-not $organisation) {
+        $result.Reason = "The download is validly signed, but no publisher could be read from the certificate subject '$($result.Signer)'. It was not run."
+        return $result
+    }
+
+    if ($organisation -notmatch $Script:DeltaDockerInstallerSignerPattern) {
+        $result.Reason = "The download is validly signed, but its publisher is '$organisation' rather than Docker. It was not run. Full subject: $($result.Signer)"
+        return $result
+    }
+
+    $result.IsValid = $true
+    return $result
+}
+
+function Show-DeltaDockerInstallerFallback {
+    <#
+      How to supply the installer by hand. Printed whenever acquisition failed,
+      for any reason - a refused download, an unverifiable one, or a supplied
+      path that is not there - because in every one of those cases staging the
+      binary is what the operator does next.
+    #>
+    param([string]$SearchRoot)
+
+    Write-Detail ''
+    Write-Detail 'To supply the installer yourself instead:'
+    Write-Detail "  1. Download it from $Script:DeltaDockerInstallerUrl"
+    if ($SearchRoot) {
+        Write-Detail "  2. Put it at $(Join-Path -Path $SearchRoot -ChildPath "installers\$Script:DeltaDockerInstallerName")"
+    }
+    else {
+        Write-Detail "  2. Put it in the installers\ folder next to setup.ps1, named '$Script:DeltaDockerInstallerName'"
+    }
+    Write-Detail '  3. Run setup.ps1 again.'
+    Write-Detail 'Or pass the path directly:  .\setup.ps1 -DockerInstallerPath "D:\path\to\Docker Desktop Installer.exe"'
+}
+
 function Resolve-DeltaDockerInstaller {
     <#
-      Finds the Docker Desktop installer, in order: an explicit path, an
-      `installers\` folder beside setup.ps1 (so an air-gapped site can stage
-      the binary itself), then Docker's documented download URL.
+      Finds the Docker Desktop installer, in this order:
 
-      The download happens only on the install path, which is already behind
-      the C2 confirmation.
+        1. -DockerInstallerPath, if the operator supplied one.
+        2. installers\ beside setup.ps1, so an air-gapped site can stage the
+           binary itself.
+        3. Docker's documented download URL.
+
+      Step 3 is automatic. It used to be opt-in behind -AllowDownload, which
+      meant the ordinary fresh machine - no Docker, nothing staged, nobody
+      having read a switch list first - stopped at "No Docker Desktop installer
+      was found" with a download link it was perfectly capable of fetching
+      itself. Downloading is the documented way to obtain Docker Desktop, and
+      by the time this runs the operator has already accepted Docker's
+      licensing disclosure, which is the consent that matters.
+
+      $AllowDownload remains so a caller can still forbid the network hop and
+      get an immediate, clear refusal rather than a slow one; it defaults to
+      allowing it.
+
+      Nothing downloaded is executed before Test-DeltaDockerInstallerFile has
+      passed it, and a download that fails or cannot be verified leaves no file
+      behind to be mistaken for a good one later.
     #>
     param(
         [string]$InstallerPath,
         [string]$SearchRoot,
-        [switch]$AllowDownload
+        [bool]$AllowDownload = $true
     )
 
-    $result = [PSCustomObject]@{ Path = $null; Source = $null; Error = $null }
+    $result = [PSCustomObject]@{ Path = $null; Source = $null; Error = $null; Verification = $null }
 
     if ($InstallerPath) {
         if (Test-Path -LiteralPath $InstallerPath -PathType Leaf) {
@@ -1371,7 +1562,7 @@ function Resolve-DeltaDockerInstaller {
     }
 
     if (-not $AllowDownload) {
-        $result.Error = "No Docker Desktop installer was found. Place '$Script:DeltaDockerInstallerName' in the installers\ folder next to setup.ps1, or pass -DockerInstallerPath."
+        $result.Error = "No Docker Desktop installer was found, and downloading it was not permitted for this run. Place '$Script:DeltaDockerInstallerName' in the installers\ folder next to setup.ps1, or pass -DockerInstallerPath."
         return $result
     }
 
@@ -1381,15 +1572,33 @@ function Resolve-DeltaDockerInstaller {
     Write-Detail "To:   $destination"
     Write-Detail 'This is roughly 600 MB and can take several minutes.'
 
+    # A file left over from an earlier failed attempt must not be able to
+    # masquerade as this one's result if the transfer dies early.
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+    }
+
     $previousProgress = $ProgressPreference
+    $downloaded = $false
     try {
         # Invoke-WebRequest's progress bar makes a large download several
         # times slower in PowerShell 5.1; suppressing it is a throughput fix,
         # not cosmetics.
         $ProgressPreference = 'SilentlyContinue'
+
+        # Windows PowerShell 5.1 inherits .NET's default protocol selection,
+        # which on an unpatched Windows image can still offer TLS 1.0/1.1.
+        # desktop.docker.com refuses those, and the resulting error names a
+        # connection failure rather than the protocol - a confusing way for a
+        # fresh machine to fail. Enabling TLS 1.2 for this process removes it.
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol =
+                [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        }
+        catch { }
+
         Invoke-WebRequest -Uri $Script:DeltaDockerInstallerUrl -OutFile $destination -UseBasicParsing -ErrorAction Stop
-        $result.Path = $destination
-        $result.Source = 'downloaded'
+        $downloaded = $true
     }
     catch {
         $result.Error = "Downloading Docker Desktop failed: $($_.Exception.Message)"
@@ -1398,6 +1607,29 @@ function Resolve-DeltaDockerInstaller {
         $ProgressPreference = $previousProgress
     }
 
+    if (-not $downloaded) {
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+        }
+        return $result
+    }
+
+    Write-Step 'Verifying the downloaded installer'
+    $verification = Test-DeltaDockerInstallerFile -Path $destination
+    $result.Verification = $verification
+
+    if (-not $verification.IsValid) {
+        $result.Error = "The downloaded Docker Desktop installer could not be verified, so it was not run. $($verification.Reason)"
+        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+        Write-Detail 'The unverified download has been deleted.'
+        return $result
+    }
+
+    Write-Detail "[ ok ]     $([math]::Round($verification.SizeBytes / 1MB, 1)) MB, Authenticode $($verification.SignatureStatus)"
+    Write-Detail "[ ok ]     signed by $($verification.Signer)"
+
+    $result.Path = $destination
+    $result.Source = 'downloaded'
     return $result
 }
 
@@ -1498,7 +1730,10 @@ function Invoke-DeltaRuntimeStage {
         [Parameter(Mandatory)][string]$InstallRoot,
         [string]$ScriptRoot,
         [string]$DockerInstallerPath,
-        [switch]$AllowDownload
+        # Downloading Docker Desktop when nothing is staged is the default, not
+        # an opt-in - see Resolve-DeltaDockerInstaller. This stays so a caller
+        # can still forbid the network hop.
+        [bool]$AllowDownload = $true
     )
 
     $result = [PSCustomObject]@{
@@ -1600,11 +1835,12 @@ function Invoke-DeltaRuntimeStage {
             return $result
         }
 
-        $installer = Resolve-DeltaDockerInstaller -InstallerPath $DockerInstallerPath -SearchRoot $ScriptRoot -AllowDownload:$AllowDownload
+        $installer = Resolve-DeltaDockerInstaller -InstallerPath $DockerInstallerPath -SearchRoot $ScriptRoot -AllowDownload $AllowDownload
         if (-not $installer.Path) {
             Write-DeltaFailure ''
             Write-DeltaFailure 'Docker Desktop could not be installed.'
             Write-Detail $installer.Error
+            Show-DeltaDockerInstallerFallback -SearchRoot $ScriptRoot
             $result.Reason = $installer.Error
             return $result
         }

@@ -1776,3 +1776,14 @@ it does can reach this repository or GitHub:
 ```powershell
 .\tools\Test-Release.ps1
 ```
+
+`tools\Test-DockerInstallerAcquisition.ps1` covers how the installer obtains
+`Docker Desktop Installer.exe` — the `-DockerInstallerPath` → `installers\` →
+automatic-download order, and the verification that stands between a
+downloaded binary and running it. `Invoke-WebRequest` and
+`Get-AuthenticodeSignature` are replaced with scripted stand-ins, so it runs
+offline on a machine that already has Docker and never executes an installer:
+
+```powershell
+.\tools\Test-DockerInstallerAcquisition.ps1
+```

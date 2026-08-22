@@ -32,9 +32,17 @@
     looks in installers\ next to setup.ps1.
 
 .PARAMETER AllowDockerDownload
-    Permit downloading Docker Desktop from Docker's documented URL when it is
-    absent and no local installer was found. The download still happens only
-    after the licence disclosure is accepted.
+    Retained for compatibility and no longer required: when Docker Desktop is
+    absent and no local installer was found, the installer downloads it from
+    Docker's documented URL automatically. The download still happens only
+    after the licence disclosure is accepted, and the downloaded file is
+    verified (size, PE header, Authenticode signature) before it is run.
+    Pass -NoDockerDownload to forbid the download instead.
+
+.PARAMETER NoDockerDownload
+    Never download Docker Desktop. For hosts with no outbound access, where a
+    slow failed transfer is worse than an immediate refusal: acquisition then
+    stops at -DockerInstallerPath and installers\, and says so at once.
 
 .PARAMETER HttpPort
     Publish NGINX's HTTP port on this Windows port. Without it the installer
@@ -105,6 +113,7 @@ param(
     [string]$LogDirectory,
     [string]$DockerInstallerPath,
     [switch]$AllowDockerDownload,
+    [switch]$NoDockerDownload,
     [int]$HttpPort,
     [int]$HttpsPort,
     [string]$Hostname,
@@ -679,11 +688,22 @@ try {
                     Write-Detail 'utility. Existing secrets, data, certificates and image pins are preserved.'
                 }
 
+                # Downloading Docker Desktop is now the default, so
+                # -AllowDockerDownload asks for what already happens and is
+                # accepted only so existing command lines keep working.
+                # -NoDockerDownload is the switch that changes anything, and it
+                # wins if somebody supplies both rather than being silently
+                # overruled by the one that no longer does anything.
+                $allowDockerDownload = -not $NoDockerDownload
+                if ($AllowDockerDownload -and $NoDockerDownload) {
+                    Write-DeltaWarning '-AllowDockerDownload and -NoDockerDownload were both supplied. -NoDockerDownload wins: Docker Desktop will not be downloaded.'
+                }
+
                 $runtime = Invoke-DeltaRuntimeStage `
                     -InstallRoot $InstallRoot `
                     -ScriptRoot $Script:DeltaScriptRoot `
                     -DockerInstallerPath $DockerInstallerPath `
-                    -AllowDownload:$AllowDockerDownload
+                    -AllowDownload $allowDockerDownload
 
                 $exitCode = Show-DeltaRuntimeOutcome -Runtime $runtime -State $state -InstallRoot $InstallRoot
 
