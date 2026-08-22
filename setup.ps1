@@ -344,6 +344,140 @@ function Show-DeltaRuntimeOutcome {
     }
 }
 
+# Where the one-time logon continuation lives. RunOnce, not Run: Windows
+# deletes a RunOnce value BEFORE executing it, so the entry is spent by the
+# time setup.ps1 starts and a failed or cancelled continuation cannot fire
+# again at the next logon. HKCU, so it belongs to - and fires for - the account
+# that ran the installer, and needs no machine-wide write.
+$Script:DeltaRunOnceKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+$Script:DeltaRunOnceName = 'DELTASetupContinue'
+
+function Unregister-DeltaLogonContinuation {
+    <#
+      Removes the one-time continuation, if it is there. Safe to call when
+      nothing was ever registered.
+    #>
+
+    try {
+        if (Test-Path -LiteralPath $Script:DeltaRunOnceKey) {
+            Remove-ItemProperty -LiteralPath $Script:DeltaRunOnceKey -Name $Script:DeltaRunOnceName -ErrorAction SilentlyContinue
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Register-DeltaLogonContinuation {
+    <#
+      Arranges for setup.ps1 to run itself again at the operator's next
+      interactive logon, once, after an installer-managed restart.
+
+      Registered ONLY when the operator explicitly chose the restart at the
+      prompt below. A declined restart, a non-interactive run and a reboot the
+      operator performs themselves all leave the machine with nothing scheduled.
+
+      Three separate things stop this becoming a logon loop:
+
+        - RunOnce. Windows deletes the value before it runs the command, so it
+          is already spent when setup.ps1 starts.
+        - The command deletes the value itself, first, before doing anything
+          else - so a Windows that behaved differently, or an entry somehow
+          written twice, still only fires once.
+        - Nothing is re-registered except by another explicit Y at the prompt.
+
+      No step-specific resume state is written anywhere. The continuation runs
+      the same setup.ps1 with the same -InstallRoot, and the installer's own
+      state detection decides what happens next - which is exactly what a
+      manual rerun does, so there is one resume path rather than two.
+
+      -InstallRoot is carried across because it selects which installation is
+      detected; a continuation that silently reverted to C:\DELTA would install
+      the wrong thing. Other switches are not carried across, and the operator
+      is told to rerun by hand if they need them.
+
+      The relaunch elevates. RunOnce runs with the user's filtered token, so
+      the command opens a visible window that explains itself and then asks for
+      elevation - a UAC prompt appearing unexplained after a restart is how an
+      operator learns to click No. If elevation is refused the window says how
+      to continue by hand rather than vanishing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+
+    $result = [PSCustomObject]@{
+        Succeeded = $false
+        Reason    = $null
+        Key       = $Script:DeltaRunOnceKey
+        Name      = $Script:DeltaRunOnceName
+    }
+
+    $setupPath = Join-Path -Path $ScriptRoot -ChildPath 'setup.ps1'
+    if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+        $result.Reason = "setup.ps1 is not at '$setupPath', so there is nothing to continue with."
+        return $result
+    }
+
+    # Quoted the same way the scheduled tasks are, so a path with spaces
+    # survives the trip through the shell.
+    $relaunch = ConvertTo-DeltaCommandLine -Arguments @(
+        '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass'
+        '-File', $setupPath
+        '-InstallRoot', $InstallRoot
+    )
+
+    # Single-quoted PowerShell literals in the generated script; a quote inside
+    # a path is doubled rather than allowed to end the string early.
+    $q = { param($text) $text -replace "'", "''" }
+
+    $inner = @"
+`$Host.UI.RawUI.WindowTitle = 'DELTA setup - continuing after restart'
+Remove-ItemProperty -LiteralPath '$(& $q $Script:DeltaRunOnceKey)' -Name '$(& $q $Script:DeltaRunOnceName)' -ErrorAction SilentlyContinue
+Write-Host ''
+Write-Host '  DELTA setup is continuing after the restart.'
+Write-Host '  Approve the elevation prompt when it appears.'
+Write-Host ''
+Start-Sleep -Seconds 5
+try {
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -WorkingDirectory '$(& $q $ScriptRoot)' -ArgumentList '$(& $q $relaunch)' -ErrorAction Stop
+}
+catch {
+    Write-Host '  DELTA setup could not be started automatically:' -ForegroundColor Yellow
+    Write-Host "    `$(`$_.Exception.Message)"
+    Write-Host ''
+    Write-Host '  Continue by hand from an elevated PowerShell:'
+    Write-Host '    cd "$(& $q $ScriptRoot)"'
+    Write-Host '    .\setup.ps1'
+    Write-Host ''
+    Write-Host '  Press Enter to close this window.'
+    `$null = Read-Host
+}
+"@
+
+    # -EncodedCommand rather than a quoted one-liner: the registry value is
+    # handed to CreateProcess as-is, and a path with spaces, quotes or an
+    # ampersand in it has too many ways to be misread on the way through.
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:DeltaRunOnceKey)) {
+            $null = New-Item -Path $Script:DeltaRunOnceKey -Force -ErrorAction Stop
+        }
+        $null = New-ItemProperty -LiteralPath $Script:DeltaRunOnceKey -Name $Script:DeltaRunOnceName `
+            -Value $command -PropertyType String -Force -ErrorAction Stop
+        $result.Succeeded = $true
+    }
+    catch {
+        $result.Reason = $_.Exception.Message
+    }
+
+    return $result
+}
+
 function Request-DeltaWindowsRestart {
     <#
       Offers to restart Windows when a prerequisite has asked for one, and
@@ -376,6 +510,7 @@ function Request-DeltaWindowsRestart {
     #>
     param(
         [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][string]$InstallRoot,
         [bool]$AllowPrompt = $true
     )
 
@@ -396,10 +531,10 @@ function Request-DeltaWindowsRestart {
     }
 
     Write-Detail ''
-    Write-Detail 'This installer can restart Windows for you now.'
+    Write-Detail 'This installer can restart Windows for you now, and carry on by itself when you'
+    Write-Detail 'sign back in.'
     Write-Detail 'Restarting closes every open application on this machine, so save your work first.'
-    Write-Detail 'Nothing about the installation is lost either way - it resumes when you run'
-    Write-Detail 'setup.ps1 again after signing in.'
+    Write-Detail 'Nothing about the installation is lost either way.'
     Write-Host ''
 
     if (-not (Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]')) {
@@ -407,10 +542,27 @@ function Request-DeltaWindowsRestart {
         return $false
     }
 
+    # Registered only here, after an explicit Y, and only for a prompted run.
+    $continuation = Register-DeltaLogonContinuation -ScriptRoot $ScriptRoot -InstallRoot $InstallRoot
+
     Write-Detail ''
     Write-Detail 'Windows will restart in a few seconds.'
-    Write-Detail 'After signing in, run:'
-    Write-Detail $rerun
+    if ($continuation.Succeeded) {
+        Write-Detail ''
+        Write-Detail 'DELTA setup will continue AUTOMATICALLY the next time you sign in to this'
+        Write-Detail 'machine as this user. It opens an elevated PowerShell window and picks up from'
+        Write-Detail 'the state it finds - approve the elevation prompt when it appears.'
+        Write-Detail 'It is a one-time arrangement: it runs once and removes itself, whatever happens.'
+        Write-Detail ''
+        Write-Detail 'If you would rather do it yourself, close that window and run:'
+        Write-Detail $rerun
+    }
+    else {
+        # Never claim an automatic continuation that was not registered.
+        Write-DeltaWarning "Automatic continuation could not be registered: $($continuation.Reason)"
+        Write-Detail 'The restart still happens. After signing in, run:'
+        Write-Detail $rerun
+    }
     return $true
 }
 
@@ -713,6 +865,7 @@ try {
                     # cleanly before the machine goes down.
                     $Script:DeltaRestartConfirmed = Request-DeltaWindowsRestart `
                         -ScriptRoot $Script:DeltaScriptRoot `
+                        -InstallRoot $InstallRoot `
                         -AllowPrompt (-not $NonInteractive)
                 }
 
@@ -794,8 +947,12 @@ if ($Script:DeltaRestartConfirmed) {
         Restart-Computer -Force -ErrorAction Stop
     }
     catch {
+        # The restart did not happen, so the continuation registered for it must
+        # not be left behind to fire at some unrelated logon later.
+        $null = Unregister-DeltaLogonContinuation
         Write-Host ''
         Write-DeltaFailure "Windows could not be restarted: $($_.Exception.Message)"
+        Write-Detail 'The automatic continuation has been removed, so nothing will run unexpectedly.'
         Write-Detail 'Restart this machine yourself, sign in, and run setup.ps1 again.'
         Write-Detail 'Nothing about the installation changed - it resumes from where it stopped.'
     }

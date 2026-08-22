@@ -633,55 +633,444 @@ function Test-DeltaWindowsPrerequisite {
     return (New-DeltaCheckResult -Name 'Windows edition and build' -Severity 'ok' -Detail $detail)
 }
 
+# The Hyper-V Integration Services key. Its presence is the definitive marker
+# that this Windows is a Hyper-V GUEST rather than a Hyper-V host, and it
+# carries the guest's own VM name and its host's name - which is exactly what
+# the operator needs to run Set-VMProcessor in the right place.
+$Script:DeltaHyperVGuestKey = 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters'
+
+# Manufacturer/model strings that identify a virtual machine. Matched against
+# Win32_ComputerSystem, most specific first. 'unknown-vm' is a real answer:
+# a platform not on this list still gets generic guidance rather than a
+# confident claim about a hypervisor nobody identified.
+$Script:DeltaVirtualPlatformSignatures = [ordered]@{
+    'hyper-v'    = 'Microsoft Corporation.*Virtual Machine|Virtual Machine'
+    'vmware'     = 'VMware'
+    'virtualbox' = 'VirtualBox|innotek'
+    'kvm'        = 'KVM|QEMU|Red Hat'
+    'xen'        = 'Xen'
+    'ec2'        = 'Amazon EC2'
+    'gce'        = 'Google Compute Engine|Google'
+    'parallels'  = 'Parallels'
+}
+
+function Get-DeltaVirtualPlatformInfo {
+    <#
+      Whether this Windows is running on physical hardware or inside a virtual
+      machine, and on what.
+
+      This distinction is the whole fix. `HypervisorPresent = True` means only
+      "a hypervisor is running somewhere below this OS" and answers two
+      completely different questions the same way:
+
+        - a physical host with Hyper-V or VBS enabled, where Windows is the
+          root partition. Virtualization genuinely works, and Win32_Processor
+          reports its firmware flags as False because the hypervisor owns them.
+          This is the case the old check was written against.
+        - a guest VM. The hypervisor being reported is the HOST's, and it says
+          nothing whatsoever about whether this guest has been given the
+          virtualization extensions WSL2 needs.
+
+      Treating the second as proof is what produced a green
+      "[ ok ] Hardware virtualization" inside a Hyper-V guest that Docker then
+      refused with "Virtualization support not detected".
+    #>
+    param(
+        [object]$ComputerSystem,
+        # Injectable so the classification can be exercised without a machine
+        # that happens to be the platform under test.
+        [string]$GuestKeyPath = $Script:DeltaHyperVGuestKey
+    )
+
+    if (-not $ComputerSystem) {
+        $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    }
+
+    $result = [PSCustomObject]@{
+        IsVirtualMachine = $false
+        Platform         = 'physical'
+        Manufacturer     = [string]$ComputerSystem.Manufacturer
+        Model            = [string]$ComputerSystem.Model
+        VmName           = $null
+        HostName         = $null
+    }
+
+    # The Hyper-V guest key is checked first and is definitive - a Hyper-V host
+    # does not have it, a Hyper-V guest does.
+    if ($GuestKeyPath -and (Test-Path -LiteralPath $GuestKeyPath)) {
+        $result.IsVirtualMachine = $true
+        $result.Platform = 'hyper-v'
+        try {
+            $parameters = Get-ItemProperty -LiteralPath $GuestKeyPath -ErrorAction Stop
+            if ($parameters.PSObject.Properties.Name -contains 'VirtualMachineName') { $result.VmName = [string]$parameters.VirtualMachineName }
+            if ($parameters.PSObject.Properties.Name -contains 'HostName') { $result.HostName = [string]$parameters.HostName }
+        }
+        catch { }
+        if (-not $result.VmName) { $result.VmName = $env:COMPUTERNAME }
+        return $result
+    }
+
+    $identity = "$($result.Manufacturer) $($result.Model)"
+    foreach ($platform in $Script:DeltaVirtualPlatformSignatures.Keys) {
+        if ($identity -match $Script:DeltaVirtualPlatformSignatures[$platform]) {
+            $result.IsVirtualMachine = $true
+            $result.Platform = $platform
+            $result.VmName = $env:COMPUTERNAME
+            return $result
+        }
+    }
+
+    return $result
+}
+
+function Get-DeltaProcessorVirtualizationFlags {
+    <#
+      What the CPU reports about virtualization.
+
+      VMMonitorModeExtensions is the one that matters inside a guest: it is
+      VT-x/AMD-V being visible to THIS operating system, which is precisely
+      what a hypervisor either does or does not expose to a nested guest. A
+      Hyper-V guest without -ExposeVirtualizationExtensions reports it False;
+      with it, True.
+
+      On a root partition all of these read False regardless, because the
+      running hypervisor owns the feature - which is why they are never read
+      on their own, only alongside Get-DeltaVirtualPlatformInfo.
+    #>
+    param([object]$Processor)
+
+    if (-not $Processor) {
+        $Processor = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+    return [PSCustomObject]@{
+        Readable                  = [bool]$Processor
+        VirtualizationFirmwareEnabled = [bool]$Processor.VirtualizationFirmwareEnabled
+        VMMonitorModeExtensions       = [bool]$Processor.VMMonitorModeExtensions
+        SecondLevelAddressTranslation = [bool]$Processor.SecondLevelAddressTranslationExtensions
+    }
+}
+
+function Get-DeltaVirtualizationFeatureState {
+    <#
+      The two things about virtualization that CAN be fixed from inside this
+      machine: the Virtual Machine Platform optional feature that WSL2 runs on,
+      and the boot setting that decides whether the hypervisor starts at all.
+
+      Both are read defensively. A host where DISM or bcdedit cannot be
+      queried yields 'unknown' rather than a guess, and 'unknown' is never
+      treated as a fault to be repaired.
+    #>
+
+    $result = [PSCustomObject]@{
+        VirtualMachinePlatform = 'unknown'
+        HypervisorLaunchType   = 'unknown'
+    }
+
+    try {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -ErrorAction Stop
+        if ($feature) { $result.VirtualMachinePlatform = [string]$feature.State }
+    }
+    catch { }
+
+    try {
+        $bcdedit = Get-Command -Name 'bcdedit.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $capture = Invoke-DeltaProcessCapture -FilePath $bcdedit.Source -Arguments @('/enum', '{current}') -TimeoutSeconds 30
+        if ($capture.ExitCode -eq 0) {
+            $match = [regex]::Match([string]$capture.StdOut, '(?im)^\s*hypervisorlaunchtype\s+(\S+)\s*$')
+            if ($match.Success) { $result.HypervisorLaunchType = $match.Groups[1].Value }
+        }
+    }
+    catch { }
+
+    return $result
+}
+
+function Get-DeltaVirtualizationCapability {
+    <#
+      Whether WSL2 and Docker Desktop can actually use hardware virtualization
+      on this host, and if not, whether anything can be done about it here.
+
+      Verdict is one of:
+
+        available    positive evidence the capability exists
+        remediable   something this installer can turn on, then restart
+        unavailable  the capability is absent and cannot be fixed from inside
+                     this machine
+
+      The rule the old check broke: a hypervisor being present is evidence only
+      when this OS is the one running it. In a guest it is evidence of nothing,
+      and the verdict must come from whether the CPU's virtualization
+      extensions are visible to this guest.
+    #>
+    param(
+        [object]$Platform,
+        [object]$Flags,
+        [object]$Features,
+        [Nullable[bool]]$HypervisorPresent
+    )
+
+    if (-not $Platform)  { $Platform = Get-DeltaVirtualPlatformInfo }
+    if (-not $Flags)     { $Flags = Get-DeltaProcessorVirtualizationFlags }
+    if (-not $Features)  { $Features = Get-DeltaVirtualizationFeatureState }
+    if ($null -eq $HypervisorPresent) {
+        $HypervisorPresent = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).HypervisorPresent
+    }
+
+    $result = [PSCustomObject]@{
+        Verdict           = 'unavailable'
+        Evidence          = $null
+        Reason            = $null
+        Remedy            = $null
+        Platform          = $Platform
+        Flags             = $Flags
+        Features          = $Features
+        HypervisorPresent = [bool]$HypervisorPresent
+        RepairActions     = @()
+    }
+
+    $evidence = "HypervisorPresent=$($result.HypervisorPresent); " +
+                "host=$(if ($Platform.IsVirtualMachine) { "virtual machine ($($Platform.Platform))" } else { 'physical' }); " +
+                "VMMonitorModeExtensions=$($Flags.VMMonitorModeExtensions); " +
+                "VirtualizationFirmwareEnabled=$($Flags.VirtualizationFirmwareEnabled); " +
+                "SLAT=$($Flags.SecondLevelAddressTranslation); " +
+                "VirtualMachinePlatform=$($Features.VirtualMachinePlatform); " +
+                "hypervisorlaunchtype=$($Features.HypervisorLaunchType)"
+    $result.Evidence = $evidence
+
+    # Locally fixable gaps, collected first because they apply to physical
+    # hosts and guests alike and are worth repairing before despairing.
+    $repairs = New-Object System.Collections.ArrayList
+    if ($Features.VirtualMachinePlatform -eq 'Disabled') { $null = $repairs.Add('virtual-machine-platform') }
+    if ($Features.HypervisorLaunchType -eq 'Off')        { $null = $repairs.Add('hypervisor-launch-type') }
+    $result.RepairActions = $repairs.ToArray()
+
+    if (-not $Platform.IsVirtualMachine) {
+        # --- physical hardware -------------------------------------------
+        # A hypervisor running here IS this OS's own (root partition), so it is
+        # genuine evidence - the case the previous check was right about.
+        if ($result.HypervisorPresent -or $Flags.VirtualizationFirmwareEnabled -or $Flags.VMMonitorModeExtensions) {
+            if ($repairs.Count -gt 0) {
+                $result.Verdict = 'remediable'
+                $result.Reason = 'Hardware virtualization is available, but the Windows features WSL2 needs are not all turned on.'
+                return $result
+            }
+            $result.Verdict = 'available'
+            return $result
+        }
+
+        $result.Reason = 'Hardware virtualization is not enabled in this machine''s firmware. Docker Desktop cannot run Linux containers without it.'
+        $result.Remedy = 'Restart the machine, enter the firmware setup (BIOS/UEFI) and enable virtualization - usually called Intel VT-x or AMD-V, sometimes with a separate SLAT/VT-d entry. Then run this installer again.'
+        return $result
+    }
+
+    # --- virtual machine --------------------------------------------------
+    # HypervisorPresent is deliberately NOT consulted here. It is true in every
+    # guest and proves nothing about nested virtualization.
+    if ($Flags.VMMonitorModeExtensions) {
+        if ($repairs.Count -gt 0) {
+            $result.Verdict = 'remediable'
+            $result.Reason = 'Nested virtualization is exposed to this VM, but the Windows features WSL2 needs are not all turned on.'
+            return $result
+        }
+        $result.Verdict = 'available'
+        return $result
+    }
+
+    # No virtualization extensions visible to this guest. Turning Windows
+    # features on cannot conjure them - the fix is on the hypervisor host - so
+    # this is reported as unavailable even when a local repair is outstanding.
+    $result.Reason = 'This Windows is running inside a virtual machine that has not been given hardware virtualization extensions. WSL2 and Docker Desktop need nested virtualization, and the CPU does not expose it to this guest (VMMonitorModeExtensions = False).'
+    $result.Remedy = Get-DeltaNestedVirtualizationRemedy -Platform $Platform
+    return $result
+}
+
+function Get-DeltaNestedVirtualizationRemedy {
+    <#
+      What to do about a guest with no virtualization extensions, in the words
+      of the platform that hosts it.
+
+      Every branch is an instruction to be carried out somewhere else - on the
+      hypervisor host, with the VM shut down. None of it can be done from in
+      here, and this function exists so the installer says that plainly instead
+      of offering a repair it cannot perform.
+    #>
+    param([Parameter(Mandatory)][object]$Platform)
+
+    $name = if ($Platform.VmName) { $Platform.VmName } else { '<VM name>' }
+
+    switch ($Platform.Platform) {
+        'hyper-v' {
+            $host_ = if ($Platform.HostName) { " ($($Platform.HostName))" } else { '' }
+            return @"
+Nested virtualization must be enabled on the Hyper-V host$host_, not here:
+  1. Shut this VM down completely (a saved state or a restart is not enough).
+  2. On the Hyper-V host, in an elevated PowerShell:
+       Set-VMProcessor -VMName "$name" -ExposeVirtualizationExtensions `$true
+  3. Start the VM again and run this installer.
+"@
+        }
+        'vmware' {
+            return @"
+Nested virtualization must be enabled on the VMware host, not here:
+  1. Shut this VM down completely.
+  2. In the VM's settings, under Processors, tick
+     "Virtualize Intel VT-x/EPT or AMD-V/RVI".
+  3. Start the VM again and run this installer.
+"@
+        }
+        'virtualbox' {
+            return @"
+Nested virtualization must be enabled on the VirtualBox host, not here:
+  1. Shut this VM down completely.
+  2. On the host:  VBoxManage modifyvm "$name" --nested-hw-virt on
+  3. Start the VM again and run this installer.
+"@
+        }
+        'kvm' {
+            return @"
+Nested virtualization must be enabled on the KVM/QEMU host, not here:
+  1. Shut this VM down completely.
+  2. On the host, load the kvm_intel/kvm_amd module with nested=1 and give the
+     guest a CPU mode that passes the virtualization flags through
+     (for example host-passthrough).
+  3. Start the VM again and run this installer.
+"@
+        }
+        default {
+            return @"
+This machine is a virtual machine and its hypervisor is not exposing hardware
+virtualization to it. That cannot be changed from inside the guest:
+  1. Shut this VM down completely.
+  2. On the hypervisor that hosts it, enable nested virtualization - the
+     setting is usually called nested virtualization, VT-x/AMD-V passthrough,
+     or exposing virtualization extensions.
+  3. Start the VM again and run this installer.
+Cloud VMs often cannot do this at all; there, use an instance type that
+supports nested virtualization, or a physical host.
+"@
+        }
+    }
+}
+
+function Repair-DeltaVirtualizationPrerequisite {
+    <#
+      Turns on the virtualization features that CAN be turned on from here:
+      the Virtual Machine Platform optional feature, and the boot setting that
+      lets the hypervisor start.
+
+      Deliberately narrow. It never touches firmware, never claims to fix
+      nested virtualization, and is only ever called for a 'remediable'
+      verdict - which by construction means the capability itself is already
+      present and only Windows configuration is in the way.
+
+      Both changes need a restart to take effect, so this reports
+      RestartRequired and the caller routes into the existing reboot flow
+      rather than pretending the host is ready.
+    #>
+    param([Parameter(Mandatory)][object]$Capability)
+
+    $result = [PSCustomObject]@{
+        Attempted       = @()
+        Succeeded       = $true
+        RestartRequired = $false
+        Failures        = @()
+    }
+
+    $attempted = New-Object System.Collections.ArrayList
+    $failures = New-Object System.Collections.ArrayList
+
+    foreach ($action in $Capability.RepairActions) {
+        switch ($action) {
+            'virtual-machine-platform' {
+                $null = $attempted.Add('VirtualMachinePlatform')
+                Write-Detail 'Enabling the Virtual Machine Platform Windows feature...'
+                try {
+                    $null = Enable-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -All -NoRestart -ErrorAction Stop
+                    # Always a restart, regardless of what RestartNeeded says:
+                    # the hypervisor platform is not usable until the machine
+                    # comes back, and claiming otherwise is how a host ends up
+                    # being told it is ready when it is not.
+                    $result.RestartRequired = $true
+                    Write-Detail '[ ok ]     VirtualMachinePlatform enabled (a restart is needed for it to take effect).'
+                }
+                catch {
+                    $null = $failures.Add("VirtualMachinePlatform: $($_.Exception.Message)")
+                }
+            }
+            'hypervisor-launch-type' {
+                $null = $attempted.Add('hypervisorlaunchtype')
+                Write-Detail 'Setting the boot configuration to start the hypervisor (hypervisorlaunchtype Auto)...'
+                try {
+                    $bcdedit = Get-Command -Name 'bcdedit.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                    $capture = Invoke-DeltaProcessCapture -FilePath $bcdedit.Source -Arguments @('/set', 'hypervisorlaunchtype', 'Auto') -TimeoutSeconds 60
+                    if ($capture.ExitCode -ne 0) {
+                        $null = $failures.Add("bcdedit /set hypervisorlaunchtype Auto exited with $($capture.ExitCode): $($capture.StdErr)")
+                    }
+                    else {
+                        $result.RestartRequired = $true
+                        Write-Detail '[ ok ]     hypervisorlaunchtype set to Auto (a restart is needed for it to take effect).'
+                    }
+                }
+                catch {
+                    $null = $failures.Add("hypervisorlaunchtype: $($_.Exception.Message)")
+                }
+            }
+        }
+    }
+
+    $result.Attempted = $attempted.ToArray()
+    $result.Failures = $failures.ToArray()
+    $result.Succeeded = ($failures.Count -eq 0)
+    return $result
+}
+
 function Test-DeltaVirtualizationPrerequisite {
     <#
       Hardware virtualization (A§5.4 row 3).
 
-      Order matters, and this host is the reason. `HypervisorPresent = True`
-      is checked first and is conclusive: when a hypervisor is already
-      running, Windows itself is a guest and Win32_Processor reports
-      VirtualizationFirmwareEnabled and SecondLevelAddressTranslationExtensions
-      as False even though virtualization is plainly working - measured
-      directly on the assessment host, which runs Docker happily. Reading
-      those processor flags first would fail a host that is already
-      virtualizing.
+      The verdict comes from Get-DeltaVirtualizationCapability, which requires
+      positive evidence that WSL2 and Docker can actually use virtualization
+      on this host. `HypervisorPresent = True` is not that evidence on its own:
+      it is true in every guest VM, including one whose hypervisor exposes no
+      virtualization extensions at all. This check used to accept it and
+      reported a green tick on exactly such a host, which Docker then refused
+      to start on with "Virtualization support not detected".
 
-      Only when no hypervisor is running do the firmware flags mean anything,
-      and then `systeminfo` is the documented cross-check (A§5.4).
+      A 'remediable' verdict is reported as a notice, not an ok: the caller
+      repairs it, restarts, and the capability is measured again on the way
+      back. Nothing here reports ok on the strength of a repair that has not
+      yet taken effect.
+
+      The capability object is returned on the check as Capability, so the
+      caller can repair and re-measure without probing the host twice.
     #>
-    param([Parameter(Mandatory)][object]$WindowsInfo)
+    param(
+        [Parameter(Mandatory)][object]$WindowsInfo,
+        [object]$Capability
+    )
 
-    if ($WindowsInfo.HypervisorPresent) {
-        return (New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'ok' `
-            -Detail 'HypervisorPresent = True (a hypervisor is running, so virtualization is enabled).')
+    if (-not $Capability) {
+        $Capability = Get-DeltaVirtualizationCapability -HypervisorPresent ([bool]$WindowsInfo.HypervisorPresent)
     }
 
-    $processor = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
-    $firmwareEnabled = $false
-    $slat = $false
-    if ($processor) {
-        $firmwareEnabled = [bool]$processor.VirtualizationFirmwareEnabled
-        $slat = [bool]$processor.SecondLevelAddressTranslationExtensions
-    }
-
-    if ($firmwareEnabled) {
-        return (New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'ok' `
-            -Detail "HypervisorPresent = False, VirtualizationFirmwareEnabled = True (SLAT = $slat). Virtualization is enabled in firmware; no hypervisor is running yet.")
-    }
-
-    $systemInfoLine = $null
-    $systemInfo = Get-Command -Name 'systeminfo.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($systemInfo) {
-        $capture = Invoke-DeltaProcessCapture -FilePath $systemInfo.Source -Arguments @('/FO', 'LIST') -TimeoutSeconds 90
-        if ($capture.ExitCode -eq 0 -and $capture.StdOut) {
-            $systemInfoLine = ($capture.StdOut -split "`r?`n" | Where-Object { $_ -match 'Virtualization|Hyper-V' } | Select-Object -First 4) -join '; '
+    $check = switch ($Capability.Verdict) {
+        'available' {
+            New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'ok' -Detail $Capability.Evidence
+        }
+        'remediable' {
+            New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'notice' -Detail $Capability.Evidence `
+                -Reason $Capability.Reason `
+                -Remedy 'This installer can turn those features on and restart Windows.'
+        }
+        default {
+            New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'blocked' -Detail $Capability.Evidence `
+                -Reason $Capability.Reason -Remedy $Capability.Remedy
         }
     }
 
-    return (New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'blocked' `
-        -Detail "HypervisorPresent = False, VirtualizationFirmwareEnabled = False, SLAT = $slat. $systemInfoLine" `
-        -Reason 'Hardware virtualization is not available. Docker Desktop cannot run Linux containers without it.' `
-        -Remedy 'Restart the machine, enter the firmware setup (BIOS/UEFI) and enable virtualization - it is usually called Intel VT-x / AMD-V, sometimes with a separate SLAT / VT-d entry. On a virtual machine, enable nested virtualization on the hypervisor that hosts it. Then run this installer again.')
+    Add-Member -InputObject $check -MemberType NoteProperty -Name 'Capability' -Value $Capability
+    return $check
 }
 
 function Test-DeltaDiskSpacePrerequisite {
@@ -1755,9 +2144,44 @@ function Invoke-DeltaRuntimeStage {
     $windows = Get-DeltaWindowsInfo
     $result.Windows = $windows
 
+    $windowsCheck = Test-DeltaWindowsPrerequisite -WindowsInfo $windows
+    $virtualization = Test-DeltaVirtualizationPrerequisite -WindowsInfo $windows
+
+    # Everything this installer can fix about virtualization is fixed here,
+    # before Docker is downloaded or installed - a host that cannot virtualise
+    # must not be handed 600 MB and a silent install first, which is what the
+    # reported failure did.
+    if ($virtualization.Severity -eq 'notice' -and $virtualization.Capability -and
+        $virtualization.Capability.Verdict -eq 'remediable') {
+
+        Show-DeltaCheckResult -Check $virtualization
+        Write-Step 'Enabling the Windows features WSL2 needs'
+        Write-Detail $virtualization.Capability.Reason
+
+        $repair = Repair-DeltaVirtualizationPrerequisite -Capability $virtualization.Capability
+
+        if (-not $repair.Succeeded) {
+            foreach ($failure in $repair.Failures) { Write-DeltaWarning $failure }
+        }
+
+        if ($repair.RestartRequired) {
+            # Not "ok" - the features are set but not in effect, and the only
+            # honest thing to report is that a restart is owed. The capability
+            # is measured again on the next run, before anything else.
+            $result.Outcome = 'reboot-required'
+            $result.Reason = "$($repair.Attempted -join ' and ') enabled for WSL2. Windows must restart before the change takes effect."
+            $result.Checks = @($windowsCheck, $virtualization)
+            return $result
+        }
+
+        # Nothing was actually changed, so re-measure rather than assume.
+        Write-Detail 'Re-checking hardware virtualization...'
+        $virtualization = Test-DeltaVirtualizationPrerequisite -WindowsInfo $windows
+    }
+
     $checks = @(
-        (Test-DeltaWindowsPrerequisite -WindowsInfo $windows)
-        (Test-DeltaVirtualizationPrerequisite -WindowsInfo $windows)
+        $windowsCheck
+        $virtualization
         (Test-DeltaDiskSpacePrerequisite -InstallRoot $InstallRoot -WindowsInfo $windows)
     )
     $result.Checks = $checks

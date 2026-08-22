@@ -1777,6 +1777,17 @@ it does can reach this repository or GitHub:
 .\tools\Test-Release.ps1
 ```
 
+`tools\Test-VirtualizationPrerequisite.ps1` covers the hardware-virtualization
+prerequisite: physical hosts, guest VMs on five hypervisors, locally fixable
+feature gaps, and the case that motivated it — a Hyper-V guest reporting
+`HypervisorPresent = True` with no nested virtualization exposed. Every probe
+is injected, so all of it runs offline on any machine and changes nothing on
+the host:
+
+```powershell
+.\tools\Test-VirtualizationPrerequisite.ps1
+```
+
 `tools\Test-DockerInstallerAcquisition.ps1` covers how the installer obtains
 `Docker Desktop Installer.exe` — the `-DockerInstallerPath` → `installers\` →
 automatic-download order, and the verification that stands between a
