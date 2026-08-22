@@ -114,18 +114,23 @@ $Script:ChecksumPath = "$Script:ZipPath.sha256"
 # here - .claude\, doc\, .git\, .gitignore, logs\, installers\, tools\,
 # release.ps1, release\ itself - is never copied, by construction.
 #
-# start-delta.ps1 and rotate-nginx-logs.ps1 are required, not optional:
-# both are resolved at runtime as Join-Path <installer directory> <name>
-# (Delta.Docker.ps1's $Script:DeltaStartupScriptName and
+# bin\start-delta.ps1 and bin\rotate-nginx-logs.ps1 are required, not
+# optional: both are resolved at runtime as Join-Path <installer directory>
+# <relative path> (Delta.Docker.ps1's $Script:DeltaStartupScriptName and
 # Delta.Manage.ps1's $Script:DeltaNginxRotationScript) and registered as
 # scheduled tasks pointing at that path. A package without them installs
 # and then fails at boot, or silently at 03:30 - which is exactly the kind
 # of omission a whitelist is supposed to make impossible.
+#
+# The entries are repository-relative paths, not bare file names: each is
+# copied to the same relative path inside the package, so the two scripts
+# land in the package's bin\ and nowhere else. Copy-ReleaseFiles creates the
+# intervening directories.
 $Script:RequiredFiles = @(
     'setup.ps1',
     'uninstall.ps1',
-    'start-delta.ps1',
-    'rotate-nginx-logs.ps1'
+    'bin\start-delta.ps1',
+    'bin\rotate-nginx-logs.ps1'
 )
 
 $Script:OptionalFiles = @(
@@ -173,6 +178,11 @@ function Copy-ReleaseFiles {
       copying the repository wholesale and excluding development files
       afterward. A required file/directory that is missing stops the
       build immediately; an optional file that is absent is skipped.
+
+      A whitelist entry may name a file in a subdirectory (bin\...), in
+      which case the same relative path is reproduced inside the package
+      and its parent directory is created first - Copy-Item will not
+      create a missing destination directory on its own.
     #>
     Write-Step 'Copying files...'
 
@@ -181,7 +191,12 @@ function Copy-ReleaseFiles {
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             Stop-Release "Required file not found: $file"
         }
-        Copy-Item -LiteralPath $source -Destination (Join-Path -Path $Script:PackageDir -ChildPath $file)
+        $destination = Join-Path -Path $Script:PackageDir -ChildPath $file
+        $destinationDir = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $destinationDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $source -Destination $destination
         Write-Detail "Copied $file"
     }
 

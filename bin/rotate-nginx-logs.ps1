@@ -44,7 +44,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:DeltaScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+# This script lives in bin\, so the installer root - the directory holding
+# setup.ps1, lib\ and templates\ - is one level up from it. Everything below
+# resolves from there, never from the caller's working directory.
+$Script:DeltaScriptRoot = Split-Path -Path (Split-Path -Path $MyInvocation.MyCommand.Path -Parent) -Parent
 
 # The same library set and the same integrity check setup.ps1 makes: a
 # half-loaded library must be a refusal to start rather than a

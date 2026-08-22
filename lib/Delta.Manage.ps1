@@ -1462,7 +1462,8 @@ function Invoke-DeltaLogsMenu {
 
 $Script:DeltaNginxRotationRetain   = 7
 $Script:DeltaNginxRotationTaskTime = '03:30'
-$Script:DeltaNginxRotationScript   = 'rotate-nginx-logs.ps1'
+# Relative to the installer directory: the operational scripts live in bin\.
+$Script:DeltaNginxRotationScript   = 'bin\rotate-nginx-logs.ps1'
 
 function Get-DeltaNginxAccessLogPath {
     param([Parameter(Mandatory)][string]$InstallRoot)

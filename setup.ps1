@@ -361,14 +361,14 @@ function Show-DeltaRestartBehaviour {
         [string]$InstallRoot
     )
 
-    $startupScript = Join-Path -Path $ScriptRoot -ChildPath 'start-delta.ps1'
+    $startupScript = Join-Path -Path $ScriptRoot -ChildPath 'bin\start-delta.ps1'
 
     if (-not $Startup -or -not $Startup.Succeeded) {
         Write-Detail 'DELTA returns when Docker Desktop is running. Nothing on this machine starts Docker'
         Write-Detail 'before somebody signs in to Windows, and unattended startup could not be configured,'
         Write-Detail 'so after a restart that nobody signs in after, DELTA stays down.'
         if ($Startup -and $Startup.Reason) { Write-Detail "Reason: $($Startup.Reason)" }
-        Write-Detail "To bring it back by hand:  .\start-delta.ps1 -InstallRoot $InstallRoot"
+        Write-Detail "To bring it back by hand:  .\bin\start-delta.ps1 -InstallRoot $InstallRoot"
         return
     }
 
@@ -394,7 +394,7 @@ function Show-DeltaRestartBehaviour {
 
     Write-Detail ''
     Write-Detail "Startup log       $InstallRoot\logs\installer\startup.log"
-    Write-Detail "Start by hand     .\start-delta.ps1 -InstallRoot $InstallRoot"
+    Write-Detail "Start by hand     .\bin\start-delta.ps1 -InstallRoot $InstallRoot"
     if (-not (Test-Path -LiteralPath $startupScript -PathType Leaf)) {
         Write-DeltaWarning "The startup script is missing from $startupScript."
     }

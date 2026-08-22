@@ -273,8 +273,9 @@ function New-SandboxCheckout {
     $path = Join-Path -Path $Script:WorkRoot -ChildPath $Name
     New-Item -ItemType Directory -Path $path -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $path 'tools') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $path 'bin') -Force | Out-Null
 
-    foreach ($file in @('setup.ps1', 'uninstall.ps1', 'start-delta.ps1', 'rotate-nginx-logs.ps1', 'README.md')) {
+    foreach ($file in @('setup.ps1', 'uninstall.ps1', 'bin\start-delta.ps1', 'bin\rotate-nginx-logs.ps1', 'README.md')) {
         Copy-Item -LiteralPath (Join-Path $Script:ProjectRoot $file) -Destination (Join-Path $path $file) -Force
     }
     foreach ($dir in @('lib', 'templates')) {
@@ -600,6 +601,16 @@ function Test-PackagingAndArtifacts {
         Assert-Equal -Description 'packaged installer declares the released version' -Expected '1.0.0' -Actual $packaged
     }
 
+    # The operational scripts ship under bin\ and are not duplicated at the
+    # package root: the scheduled tasks the installer registers point at
+    # <install root>\bin\, so a package that put them anywhere else would
+    # install and then fail at boot, or silently at 03:30.
+    $packageRoot = Join-Path $extract 'DELTA-windows-installer-docker-1.0.0'
+    foreach ($script in @('start-delta.ps1', 'rotate-nginx-logs.ps1')) {
+        Assert-That -Description "package contains bin\$script" -Condition (Test-Path -LiteralPath (Join-Path $packageRoot "bin\$script") -PathType Leaf)
+        Assert-That -Description "package does not contain $script at its root" -Condition (-not (Test-Path -LiteralPath (Join-Path $packageRoot $script) -PathType Leaf))
+    }
+
     Start-TestCase 'Missing artifacts fail before publication'
 
     # ZIP missing.
@@ -620,7 +631,7 @@ function Test-PackagingAndArtifacts {
 
     # Build itself fails - a required file is absent from the tagged commit.
     $badBuild = New-SandboxCheckout -Name 'package-fails' -Version '1.0.0'
-    Remove-Item -LiteralPath (Join-Path $badBuild 'start-delta.ps1') -Force
+    Remove-Item -LiteralPath (Join-Path $badBuild 'bin\start-delta.ps1') -Force
     $resultBad = Invoke-WorkflowStep -StepName $Script:StepBuild -SandboxPath $badBuild -Values $values
     Assert-That -Description 'failed packaging fails the job' -Condition ($resultBad.ExitCode -ne 0)
     Assert-That -Description 'failed packaging names the missing file' -Condition ($resultBad.Output -match 'start-delta\.ps1')

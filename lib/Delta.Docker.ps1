@@ -1766,7 +1766,11 @@ $Script:DeltaDockerSettingsRelativePath = 'Docker\settings-store.json'
 # has to re-measure rather than assume (A§16.1).
 $Script:DeltaDockerServiceName = 'com.docker.service'
 
-$Script:DeltaStartupScriptName = 'start-delta.ps1'
+# Relative to the installer directory: the operational scripts live in bin\,
+# beside neither setup.ps1 nor the libraries. Registered scheduled tasks store
+# the resolved absolute path, so a task registered before the move is treated
+# as stale and re-pointed by Invoke-DeltaStartupConfiguration below.
+$Script:DeltaStartupScriptName = 'bin\start-delta.ps1'
 
 # The trigger fires at boot, and then waits. The delay is not a guess about
 # how long Docker takes - start-delta.ps1 waits for the engine itself - it is

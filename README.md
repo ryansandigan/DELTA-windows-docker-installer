@@ -387,7 +387,7 @@ it. So the management utility registers one scheduled task:
 DELTA (Docker) - <project> - NGINX log rotation
    trigger   daily at 03:30
    runs as   the account that installed DELTA, whether or not it is signed in
-   action    rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
+   action    bin\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
 ```
 
 It renames the current log to `access.log.<timestamp>`, tells NGINX to reopen
@@ -396,7 +396,7 @@ rotations. It touches nothing else in that folder, and an empty log is simply
 nothing to do. Run it by hand at any time:
 
 ```powershell
-.\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
+.\bin\rotate-nginx-logs.ps1 -InstallRoot C:\DELTA
 ```
 
 ### Updating DELTA
@@ -1437,7 +1437,7 @@ starts Docker before a sign-in, it registers **one scheduled task**:
 DELTA (Docker) - <project> - Startup
    trigger   at Windows startup, 60 seconds after boot
    runs as   the account that installed DELTA, whether or not it is signed in
-   action    start-delta.ps1 -InstallRoot C:\DELTA
+   action    bin\start-delta.ps1 -InstallRoot C:\DELTA
 ```
 
 The task runs the script once and exits. It starts Docker, waits for the engine,
@@ -1467,7 +1467,7 @@ Get-Content C:\DELTA\logs\installer\startup.log
 You can also run it by hand at any time — the same code path the task uses:
 
 ```powershell
-.\start-delta.ps1 -InstallRoot C:\DELTA
+.\bin\start-delta.ps1 -InstallRoot C:\DELTA
 ```
 
 Two things worth knowing:
