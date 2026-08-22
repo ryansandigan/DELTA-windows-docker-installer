@@ -116,34 +116,70 @@ function New-Features {
     }
 }
 
+function New-Runtime {
+    param([string]$Verdict = 'unknown', [string]$Reason = 'stubbed', [string]$Evidence = '', $ExitCode = 0)
+    return [PSCustomObject]@{ Verdict = $Verdict; Reason = $Reason; Evidence = $Evidence; ExitCode = $ExitCode }
+}
+
 Write-Host ''
 Write-Host '==> DELTA hardware-virtualization prerequisite tests' -ForegroundColor Cyan
 Write-Host "    Library under test: $(Join-Path $Script:ProjectRoot 'lib\Delta.Docker.ps1')"
 
 # ---------------------------------------------------------------------------
 
-Start-TestCase 'THE REPORTED BUG: Hyper-V guest, HypervisorPresent=True, no nested virtualization'
+Start-TestCase 'MEASURED ON A REAL SERVER 2022 GUEST: nested virtualization IS enabled, every guest flag reads False'
 
+# The Hyper-V host has ExposeVirtualizationExtensions = $true and the guest
+# runs Docker. Inside that guest, VMMonitorModeExtensions,
+# VirtualizationFirmwareEnabled and SecondLevelAddressTranslationExtensions all
+# report False, and systeminfo declines to show the Hyper-V requirements
+# because a hypervisor is present. Reading those Falses as a refusal is a false
+# negative, and blocking on it is as wrong as the original false positive was.
 $capability = Get-DeltaVirtualizationCapability `
     -HypervisorPresent $true `
     -Platform (New-Platform -IsVirtualMachine $true -Platform 'hyper-v' -VmName 'DELTA-APP-01' -HostName 'HV-HOST-A') `
-    -Flags    (New-Flags -VMMonitorModeExtensions $false) `
-    -Features (New-Features)
+    -Flags    (New-Flags) `
+    -Features (New-Features) `
+    -Runtime  (New-Runtime -Verdict 'unknown')
 
-Assert-Equal -Description 'verdict is unavailable, NOT available' -Expected 'unavailable' -Actual $capability.Verdict
-Assert-That  -Description 'the reason names nested virtualization' -Condition ($capability.Reason -match 'nested virtualization')
-Assert-That  -Description 'the reason names the flag that decided it' -Condition ($capability.Reason -match 'VMMonitorModeExtensions')
-Assert-That  -Description 'the remedy is Set-VMProcessor on the host' -Condition ($capability.Remedy -match 'Set-VMProcessor -VMName "DELTA-APP-01" -ExposeVirtualizationExtensions')
-Assert-That  -Description 'the remedy names the Hyper-V host' -Condition ($capability.Remedy -match 'HV-HOST-A')
-Assert-That  -Description 'the remedy says to shut the VM down' -Condition ($capability.Remedy -match 'Shut this VM down')
-Assert-That  -Description 'no local repair is offered' -Condition ($capability.RepairActions.Count -eq 0)
-Assert-That  -Description 'the evidence records HypervisorPresent=True' -Condition ($capability.Evidence -match 'HypervisorPresent=True')
-Assert-That  -Description 'the evidence records that this is a VM' -Condition ($capability.Evidence -match 'virtual machine \(hyper-v\)')
+Assert-Equal -Description 'verdict is unknown, NOT unavailable' -Expected 'unknown' -Actual $capability.Verdict
+Assert-That  -Description 'it says the question cannot be settled from inside the guest' -Condition ($capability.Reason -match 'cannot be determined from inside')
+Assert-That  -Description 'it says installation continues' -Condition ($capability.Reason -match 'Installation continues')
 
 $check = Test-DeltaVirtualizationPrerequisite -WindowsInfo ([PSCustomObject]@{ HypervisorPresent = $true }) -Capability $capability
-Assert-Equal -Description 'the prerequisite check is blocked' -Expected 'blocked' -Actual $check.Severity
+Assert-Equal -Description 'the prerequisite check is a NOTICE, not blocked' -Expected 'notice' -Actual $check.Severity
 Assert-Equal -Description 'it is still named Hardware virtualization' -Expected 'Hardware virtualization' -Actual $check.Name
 Assert-That  -Description 'the check carries the capability for the caller' -Condition ($null -ne $check.Capability)
+
+# The actionable host-side fix is preserved - as forward-looking guidance for
+# the failure that may never come, not as an accusation.
+Assert-That -Description 'the Set-VMProcessor remedy is still offered' -Condition ($capability.Remedy -match 'Set-VMProcessor -VMName "DELTA-APP-01" -ExposeVirtualizationExtensions')
+Assert-That -Description 'it names the Hyper-V host' -Condition ($capability.Remedy -match 'HV-HOST-A')
+Assert-That -Description 'it is framed conditionally on Docker failing later' -Condition ($capability.Remedy -match 'If Docker Desktop later reports')
+
+Start-TestCase 'Inconclusive evidence never becomes a hard failure, on any platform'
+
+foreach ($platform in @('hyper-v', 'vmware', 'virtualbox', 'kvm', 'xen', 'ec2', 'unknown-vm')) {
+    $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
+        -Platform (New-Platform -IsVirtualMachine $true -Platform $platform -VmName 'VM1') `
+        -Flags (New-Flags) -Features (New-Features) -Runtime (New-Runtime -Verdict 'unknown')
+    $check = Test-DeltaVirtualizationPrerequisite -WindowsInfo ([PSCustomObject]@{ HypervisorPresent = $true }) -Capability $capability
+    Assert-That -Description "$platform : unknown does not block" -Condition ($check.Severity -ne 'blocked')
+}
+
+Start-TestCase 'A guest that reports VirtualizationFirmwareEnabled is positive evidence too'
+
+# One-way evidence: True means yes. Either flag being True is enough.
+foreach ($case in @(
+    @{ Flags = (New-Flags -VMMonitorModeExtensions $true);       Label = 'VMMonitorModeExtensions' }
+    @{ Flags = (New-Flags -VirtualizationFirmwareEnabled $true); Label = 'VirtualizationFirmwareEnabled' }
+)) {
+    $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
+        -Platform (New-Platform -IsVirtualMachine $true -Platform 'hyper-v' -VmName 'VM1') `
+        -Flags $case.Flags -Features (New-Features)
+    Assert-Equal -Description "$($case.Label)=True -> available" -Expected 'available' -Actual $capability.Verdict
+    Assert-That  -Description "$($case.Label)=True needs no runtime probe" -Condition ($null -eq $capability.Runtime)
+}
 
 Start-TestCase 'The same guest, once nested virtualization IS exposed'
 
@@ -211,17 +247,74 @@ $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true -Platfo
 Assert-Equal -Description 'verdict is remediable' -Expected 'remediable' -Actual $capability.Verdict
 Assert-Equal -Description 'two repairs are queued' -Expected 2 -Actual $capability.RepairActions.Count
 
-Start-TestCase 'A guest with no extensions is NOT made remediable by a fixable feature gap'
+Start-TestCase 'A guest with a fixable feature gap is repaired FIRST, before anything is concluded'
 
-# The important asymmetry: turning Windows features on cannot conjure CPU
-# extensions the hypervisor is not exposing, so this stays unavailable even
-# though VirtualMachinePlatform is disabled and would otherwise be repaired.
+# Locally fixable prerequisites are needed either way, and the runtime probe
+# is only meaningful once they are in place - so this is remediable, and the
+# question of nested virtualization is deferred rather than answered wrongly.
 $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
     -Platform (New-Platform -IsVirtualMachine $true -Platform 'hyper-v' -VmName 'VM1') `
-    -Flags    (New-Flags -VMMonitorModeExtensions $false) `
+    -Flags    (New-Flags) `
     -Features (New-Features -VirtualMachinePlatform 'Disabled')
-Assert-Equal -Description 'verdict is unavailable, not remediable' -Expected 'unavailable' -Actual $capability.Verdict
-Assert-That  -Description 'the remedy still points at the hypervisor host' -Condition ($capability.Remedy -match 'Set-VMProcessor')
+Assert-Equal -Description 'verdict is remediable, not unavailable' -Expected 'remediable' -Actual $capability.Verdict
+Assert-That  -Description 'the repair is queued' -Condition ($capability.RepairActions -contains 'virtual-machine-platform')
+Assert-That  -Description 'it says the question cannot be settled until they are on' -Condition ($capability.Reason -match 'cannot be established from inside')
+Assert-That  -Description 'no runtime probe was run before the features are in place' -Condition ($null -eq $capability.Runtime)
+
+Start-TestCase 'A guest is blocked ONLY when the WSL2 runtime refuses, naming virtualization'
+
+$capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
+    -Platform (New-Platform -IsVirtualMachine $true -Platform 'hyper-v' -VmName 'DELTA-APP-01' -HostName 'HV-HOST-A') `
+    -Flags    (New-Flags) -Features (New-Features) `
+    -Runtime  (New-Runtime -Verdict 'unavailable' -Reason 'wsl.exe reported: 0x80370102 Please enable the Virtual Machine Platform Windows feature')
+Assert-Equal -Description 'verdict is unavailable' -Expected 'unavailable' -Actual $capability.Verdict
+Assert-That  -Description 'the reason quotes what WSL2 actually said' -Condition ($capability.Reason -match '0x80370102')
+Assert-That  -Description 'the remedy is the Set-VMProcessor command' -Condition ($capability.Remedy -match 'Set-VMProcessor -VMName "DELTA-APP-01" -ExposeVirtualizationExtensions')
+Assert-That  -Description 'the remedy names the Hyper-V host' -Condition ($capability.Remedy -match 'HV-HOST-A')
+Assert-That  -Description 'the remedy says to shut the VM down' -Condition ($capability.Remedy -match 'Shut this VM down')
+
+$check = Test-DeltaVirtualizationPrerequisite -WindowsInfo ([PSCustomObject]@{ HypervisorPresent = $true }) -Capability $capability
+Assert-Equal -Description 'and only then is the check blocked' -Expected 'blocked' -Actual $check.Severity
+
+Start-TestCase 'A guest where the WSL2 runtime is happy is available'
+
+$capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
+    -Platform (New-Platform -IsVirtualMachine $true -Platform 'hyper-v' -VmName 'VM1') `
+    -Flags (New-Flags) -Features (New-Features) -Runtime (New-Runtime -Verdict 'available')
+Assert-Equal -Description 'verdict is available' -Expected 'available' -Actual $capability.Verdict
+$check = Test-DeltaVirtualizationPrerequisite -WindowsInfo ([PSCustomObject]@{ HypervisorPresent = $true }) -Capability $capability
+Assert-Equal -Description 'the check is ok' -Expected 'ok' -Actual $check.Severity
+
+Start-TestCase 'The WSL2 runtime probe classifies its own output correctly'
+
+$fake = Join-Path $env:TEMP 'delta-fake-wsl.cmd'
+try {
+    foreach ($case in @(
+        @{ Body = '@echo 0x80370102 Please enable the Virtual Machine Platform Windows feature'; Code = 1; Expect = 'unavailable'; Label = 'HCS_E_HYPERV_NOT_INSTALLED' }
+        @{ Body = '@echo WSL2 is not supported with your current machine configuration';         Code = 1; Expect = 'unavailable'; Label = 'WSL2 unsupported machine configuration' }
+        @{ Body = '@echo Default Version: 2';                                                    Code = 0; Expect = 'available';   Label = 'healthy WSL2' }
+        @{ Body = '@echo The network name cannot be found';                                      Code = 5; Expect = 'unknown';     Label = 'unrelated failure' }
+
+        # Verbatim from a healthy host: Docker running, WSL2 working. The last
+        # line is about WSL**1** and is normal. An earlier signature list
+        # matched it and declared the machine incapable - on a guest that would
+        # have been a false stop, so it is pinned here.
+        @{ Body = "@echo Default Distribution: Ubuntu-24.04&@echo Default Version: 2&@echo WSL1 is not supported with your current machine configuration."
+           Code = 0; Expect = 'available'; Label = 'REAL healthy host mentioning WSL1' }
+
+        # Same text, but WSL actually failed. Now it counts.
+        @{ Body = '@echo WSL1 is not supported with your current machine configuration.'
+           Code = 1; Expect = 'unknown'; Label = 'WSL1 note on a failure is still not a WSL2 verdict' }
+    )) {
+        Set-Content -LiteralPath $fake -Value "$($case.Body)`r`n@exit /b $($case.Code)" -Encoding ascii
+        $runtime = Test-DeltaWsl2RuntimeCapability -WslPath $fake
+        Assert-Equal -Description "$($case.Label) -> $($case.Expect)" -Expected $case.Expect -Actual $runtime.Verdict
+    }
+}
+finally { Remove-Item -LiteralPath $fake -Force -ErrorAction SilentlyContinue }
+
+$runtime = Test-DeltaWsl2RuntimeCapability -WslPath (Join-Path $env:TEMP 'delta-no-such-wsl.exe')
+Assert-Equal -Description 'an unreachable wsl.exe is unknown, never unavailable' -Expected 'unknown' -Actual $runtime.Verdict
 
 Start-TestCase 'Unknown feature states are never treated as faults'
 
@@ -241,7 +334,8 @@ foreach ($case in @(
 )) {
     $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
         -Platform (New-Platform -IsVirtualMachine $true -Platform $case.Platform -VmName 'VM1') `
-        -Flags (New-Flags) -Features (New-Features)
+        -Flags (New-Flags) -Features (New-Features) `
+        -Runtime (New-Runtime -Verdict 'unavailable' -Reason 'wsl.exe reported: 0x80370102')
     Assert-Equal -Description "$($case.Platform): unavailable" -Expected 'unavailable' -Actual $capability.Verdict
     Assert-That  -Description "$($case.Platform): platform-specific remedy" -Condition ($capability.Remedy -match $case.Match)
     Assert-That  -Description "$($case.Platform): does not tell them to run Set-VMProcessor" -Condition ($capability.Remedy -notmatch 'Set-VMProcessor')
@@ -250,7 +344,8 @@ foreach ($case in @(
 Start-TestCase 'An unidentified hypervisor gets generic guidance, not a guess'
 
 $capability = Get-DeltaVirtualizationCapability -HypervisorPresent $true `
-    -Platform (New-Platform -IsVirtualMachine $true -Platform 'unknown-vm') -Flags (New-Flags) -Features (New-Features)
+    -Platform (New-Platform -IsVirtualMachine $true -Platform 'unknown-vm') -Flags (New-Flags) -Features (New-Features) `
+    -Runtime (New-Runtime -Verdict 'unavailable' -Reason 'wsl.exe reported: 0x80370102')
 Assert-Equal -Description 'unavailable' -Expected 'unavailable' -Actual $capability.Verdict
 Assert-That  -Description 'says nested virtualization must be enabled on the hypervisor' -Condition ($capability.Remedy -match 'nested virtualization')
 Assert-That  -Description 'names no specific product' -Condition ($capability.Remedy -notmatch 'Hyper-V|VMware|VirtualBox')
@@ -314,6 +409,10 @@ Assert-That -Description 'a repair that needs a restart returns reboot-required'
     $libraryText -match "(?s)if \(\`$repair\.RestartRequired\) \{.*?\`$result\.Outcome = 'reboot-required'")
 Assert-That -Description 'HypervisorPresent alone no longer produces an ok result' -Condition (
     $libraryText -notmatch "a hypervisor is running, so virtualization is enabled")
+Assert-That -Description 'guest processor flags being False is not a blocking condition on its own' -Condition (
+    $libraryText -notmatch "the CPU does not expose it to this guest")
+Assert-That -Description 'the unknown verdict is mapped to a notice, not blocked' -Condition (
+    $libraryText -match "(?s)'unknown' \{.*?-Severity 'notice'")
 
 # ---------------------------------------------------------------------------
 

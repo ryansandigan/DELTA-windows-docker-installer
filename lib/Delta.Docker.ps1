@@ -807,7 +807,10 @@ function Get-DeltaVirtualizationCapability {
         [object]$Platform,
         [object]$Flags,
         [object]$Features,
-        [Nullable[bool]]$HypervisorPresent
+        [Nullable[bool]]$HypervisorPresent,
+        # Injectable so the guest paths can be exercised without a hypervisor,
+        # and so the runtime is probed at most once per run.
+        [object]$Runtime
     )
 
     if (-not $Platform)  { $Platform = Get-DeltaVirtualPlatformInfo }
@@ -827,6 +830,7 @@ function Get-DeltaVirtualizationCapability {
         Features          = $Features
         HypervisorPresent = [bool]$HypervisorPresent
         RepairActions     = @()
+        Runtime           = $null
     }
 
     $evidence = "HypervisorPresent=$($result.HypervisorPresent); " +
@@ -865,9 +869,22 @@ function Get-DeltaVirtualizationCapability {
     }
 
     # --- virtual machine --------------------------------------------------
-    # HypervisorPresent is deliberately NOT consulted here. It is true in every
-    # guest and proves nothing about nested virtualization.
-    if ($Flags.VMMonitorModeExtensions) {
+    # HypervisorPresent is not consulted here: it is true in every guest and
+    # proves nothing about nested virtualization.
+    #
+    # The processor flags are ONE-WAY evidence, and this is the correction that
+    # matters. True means the extensions are visible and nested virtualization
+    # is genuinely there. False means nothing at all.
+    #
+    # Measured on a Windows Server 2022 Hyper-V guest whose host had
+    # ExposeVirtualizationExtensions = $true: VMMonitorModeExtensions,
+    # VirtualizationFirmwareEnabled and SecondLevelAddressTranslationExtensions
+    # ALL report False inside that guest, and systeminfo declines to show the
+    # Hyper-V requirements at all because a hypervisor is already present.
+    # Nested virtualization was working. Reading those False values as a
+    # refusal blocks a host that would have installed perfectly, which is the
+    # same mistake as the original bug wearing the opposite sign.
+    if ($Flags.VMMonitorModeExtensions -or $Flags.VirtualizationFirmwareEnabled) {
         if ($repairs.Count -gt 0) {
             $result.Verdict = 'remediable'
             $result.Reason = 'Nested virtualization is exposed to this VM, but the Windows features WSL2 needs are not all turned on.'
@@ -877,11 +894,151 @@ function Get-DeltaVirtualizationCapability {
         return $result
     }
 
-    # No virtualization extensions visible to this guest. Turning Windows
-    # features on cannot conjure them - the fix is on the hypervisor host - so
-    # this is reported as unavailable even when a local repair is outstanding.
-    $result.Reason = 'This Windows is running inside a virtual machine that has not been given hardware virtualization extensions. WSL2 and Docker Desktop need nested virtualization, and the CPU does not expose it to this guest (VMMonitorModeExtensions = False).'
-    $result.Remedy = Get-DeltaNestedVirtualizationRemedy -Platform $Platform
+    # Inconclusive so far. Fix what is locally fixable first - those features
+    # are needed either way, and the runtime probe below is only meaningful
+    # once they are in place and the machine has come back.
+    if ($repairs.Count -gt 0) {
+        $result.Verdict = 'remediable'
+        $result.Reason = 'The Windows features WSL2 needs are not all turned on. Whether this VM has nested virtualization cannot be established from inside it until they are.'
+        return $result
+    }
+
+    # Features are in place, so ask the strongest thing that can actually
+    # answer: does the WSL2 runtime start? Only a definite refusal from it
+    # counts as evidence of absence.
+    $runtime = if ($Runtime) { $Runtime } else { Test-DeltaWsl2RuntimeCapability }
+    $result.Runtime = $runtime
+    $result.Evidence = "$evidence; wsl2Runtime=$($runtime.Verdict)"
+
+    if ($runtime.Verdict -eq 'available') {
+        $result.Verdict = 'available'
+        return $result
+    }
+
+    if ($runtime.Verdict -eq 'unavailable') {
+        # Reliable evidence: the runtime itself refused, naming virtualization.
+        $result.Verdict = 'unavailable'
+        $result.Reason = "WSL2 cannot start on this VM because hardware virtualization is not available to it. $($runtime.Reason)"
+        $result.Remedy = Get-DeltaNestedVirtualizationRemedy -Platform $Platform
+        return $result
+    }
+
+    # Genuinely unknown, and unknown is never a stop. The guest-side flags
+    # cannot see nested virtualization, WSL2 has not refused, and the only
+    # thing that can settle it is Docker actually starting - so the install
+    # continues and the operator is told, in advance, what the failure would
+    # look like and what to do about it.
+    $result.Verdict = 'unknown'
+    $result.Reason = 'This is a virtual machine, and whether its hypervisor exposes hardware virtualization cannot be determined from inside it - a guest reports these processor flags as False either way. Installation continues.'
+    $result.Remedy = @"
+If Docker Desktop later reports "Virtualization support not detected", nested
+virtualization is genuinely missing and this is the fix:
+
+$(Get-DeltaNestedVirtualizationRemedy -Platform $Platform)
+"@
+    return $result
+}
+
+# Error signatures WSL2 produces when the platform it needs is not there.
+# HCS_E_HYPERV_NOT_INSTALLED (0x80370102) is the specific one a guest without
+# nested virtualization returns; 0x80370114 is its "required feature is not
+# installed" sibling.
+#
+# The text signatures are deliberately narrow. A first attempt matched the bare
+# phrase "not supported with your current machine configuration" and a lone
+# "virtualization", and on a perfectly healthy host - Docker running, WSL2
+# working - `wsl --status` prints:
+#
+#     Default Version: 2
+#     WSL1 is not supported with your current machine configuration.
+#
+# That line is about WSL**1** being unavailable, which is normal and harmless.
+# Matching it declared a working machine incapable, which on a guest would have
+# been the exact false stop this whole correction exists to remove. WSL2 is
+# named explicitly now, and a bare mention of virtualization is not enough.
+$Script:DeltaWslVirtualizationErrorSignatures = @(
+    '0x80370102'
+    '0x80370114'
+    'WSL2 is not supported with your current machine configuration'
+    'enable the Virtual Machine Platform'
+    'virtualization support'
+    'Virtualization support not detected'
+)
+
+function Test-DeltaWsl2RuntimeCapability {
+    <#
+      Whether the WSL2 runtime can actually use virtualization on this host.
+
+      This exists because the guest-side WMI flags cannot answer the question
+      and a wrong answer in either direction is expensive. It is deliberately
+      conservative in one direction only: it will say 'unavailable' just when
+      WSL itself refuses AND names virtualization in the refusal, and 'unknown'
+      for everything else - WSL not installed, WSL not yet version 2, a
+      timeout, an error about something unrelated.
+
+      'unknown' is the common answer before WSL is installed, and that is fine.
+      It is a reason to continue and let Docker settle it, not a reason to stop:
+      the whole point of the correction this function is part of is that an
+      absence of evidence was being reported as evidence of absence.
+    #>
+    param([string]$WslPath)
+
+    $result = [PSCustomObject]@{
+        Verdict  = 'unknown'
+        Reason   = $null
+        Evidence = $null
+        ExitCode = $null
+    }
+
+    if (-not $WslPath) {
+        $command = Get-Command -Name 'wsl.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) {
+            $result.Reason = 'wsl.exe is not present yet, so the WSL2 runtime could not be asked.'
+            return $result
+        }
+        $WslPath = $command.Source
+    }
+
+    $previousUtf8 = $env:WSL_UTF8
+    try {
+        # Without this, wsl.exe emits UTF-16 that arrives as interleaved nulls
+        # and no signature ever matches.
+        $env:WSL_UTF8 = '1'
+        $capture = Invoke-DeltaProcessCapture -FilePath $WslPath -Arguments @('--status') -TimeoutSeconds 60
+    }
+    catch {
+        $result.Reason = "The WSL2 runtime could not be asked: $($_.Exception.Message)"
+        return $result
+    }
+    finally {
+        $env:WSL_UTF8 = $previousUtf8
+    }
+
+    $output = "$($capture.StdOut) $($capture.StdErr)".Trim()
+    $result.ExitCode = $capture.ExitCode
+    $result.Evidence = ($output -split "`r?`n" | Where-Object { $_ } | Select-Object -First 3) -join '; '
+
+    # Success is checked BEFORE the signatures, and outranks them. wsl.exe
+    # exiting 0 means WSL is working; anything it printed on the way is
+    # commentary, not a refusal. Reading the text first is what let a note
+    # about WSL1 condemn a healthy WSL2 host.
+    if ($capture.ExitCode -eq 0) {
+        # The strongest positive signal obtainable without a distribution to
+        # boot - short of Docker itself, which comes later.
+        $result.Verdict = 'available'
+        $result.Reason = 'wsl.exe --status returned successfully and reported no virtualization problem.'
+        return $result
+    }
+
+    foreach ($signature in $Script:DeltaWslVirtualizationErrorSignatures) {
+        if ($output -match [regex]::Escape($signature)) {
+            $result.Verdict = 'unavailable'
+            $result.Reason = "wsl.exe reported: $($result.Evidence)"
+            return $result
+        }
+    }
+
+    $result.Reason = "wsl.exe --status exited with $($capture.ExitCode) for a reason unrelated to virtualization, so this proves nothing either way."
     return $result
 }
 
@@ -1062,6 +1219,13 @@ function Test-DeltaVirtualizationPrerequisite {
             New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'notice' -Detail $Capability.Evidence `
                 -Reason $Capability.Reason `
                 -Remedy 'This installer can turn those features on and restart Windows.'
+        }
+        'unknown' {
+            # A notice, never a stop. Inconclusive evidence is not failure, and
+            # a guest that cannot see its own virtualization flags is the
+            # ordinary case, not a broken one.
+            New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'notice' -Detail $Capability.Evidence `
+                -Reason $Capability.Reason -Remedy $Capability.Remedy
         }
         default {
             New-DeltaCheckResult -Name 'Hardware virtualization' -Severity 'blocked' -Detail $Capability.Evidence `
