@@ -86,6 +86,10 @@ $Script:DeltaRotateExitNotDone   = 11
 $exitCode = $Script:DeltaRotateExitOk
 $logDirectory = Join-Path -Path $InstallRoot -ChildPath 'logs\installer'
 
+# A scheduled job appending to the same startup.log, so the same rule as
+# bin\start-delta.ps1: no terminal animation from here.
+Set-DeltaActivityMode -Mode 'off'
+
 try {
     # Appended to the same file the startup task writes, for the same reason:
     # an operator looking into what a scheduled job did needs a history, not a

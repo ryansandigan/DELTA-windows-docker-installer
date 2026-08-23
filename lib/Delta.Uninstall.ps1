@@ -773,7 +773,13 @@ function Backup-DeltaInstallation {
 
     $archive = $null
     try {
-        $archive = New-DeltaInstallationArchive -SourceDirectory $Target.InstallRoot -DestinationPath $archivePath
+        # An installation with real uploads is gigabytes, and the compression
+        # loop says nothing until it is finished. Stop-Setup raised from inside
+        # it still unwinds exactly as before - Invoke-DeltaActivity stops the
+        # indicator on its way past and re-throws untouched.
+        $archive = Invoke-DeltaActivity -Message 'Archiving the installation' -ScriptBlock {
+            New-DeltaInstallationArchive -SourceDirectory $Target.InstallRoot -DestinationPath $archivePath
+        }
     }
     catch {
         Stop-Setup "The backup archive could not be created: $($_.Exception.Message)`nNothing was deleted. DELTA is exactly as it was."
@@ -785,7 +791,9 @@ function Backup-DeltaInstallation {
 
     # 5. Verification.
     Write-Step 'Verifying the backup archive'
-    $verification = Test-DeltaInstallationArchive -Archive $archive -Target $Target -DatabaseBackup $database
+    $verification = Invoke-DeltaActivity -Message 'Verifying the backup archive' -ScriptBlock {
+        Test-DeltaInstallationArchive -Archive $archive -Target $Target -DatabaseBackup $database
+    }
     if (-not $verification.Verified) {
         Stop-Setup "The backup archive did not verify: $($verification.Reason)`nNothing was deleted. DELTA is exactly as it was, and the unverified archive was left at '$($archive.Path)' for inspection."
     }

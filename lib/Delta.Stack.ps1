@@ -939,7 +939,14 @@ function Invoke-DeltaImagePull {
     Write-Step 'Pulling images'
     Write-Detail 'The first pull downloads roughly 700 MB and can take several minutes.'
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('pull') -TimeoutSeconds 3600
+    # Compose's own layer progress goes to the child's stdout, which
+    # Invoke-DeltaProcessCapture redirects and holds until the pull finishes -
+    # so from the operator's side this is a silent multi-minute wait. The
+    # redirect is not being undone here: capturing the output is what makes
+    # Get-DeltaPullFailureExplanation below able to say why a pull failed.
+    $capture = Invoke-DeltaActivity -Message 'Pulling container images' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('pull') -TimeoutSeconds 3600
+    }
 
     if ($capture.ExitCode -ne 0) {
         $text = (($capture.StdErr + "`n" + $capture.StdOut)).Trim()
@@ -1389,7 +1396,14 @@ function Start-DeltaStack {
 
     # --- db ---------------------------------------------------------------
     Write-Step 'Starting PostgreSQL'
-    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'db') -TimeoutSeconds 600
+    # `compose up -d` only, not the health wait that follows it.
+    # Wait-DeltaServiceHealthy reports elapsed seconds and the state it is
+    # seeing, which is information an animation would replace with less; the
+    # container creation in front of it says nothing at all, which is what the
+    # indicator is for. Same everywhere below.
+    $up = Invoke-DeltaActivity -Message 'Starting PostgreSQL' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'db') -TimeoutSeconds 600
+    }
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting the database container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result
@@ -1417,7 +1431,9 @@ function Start-DeltaStack {
     Write-Step 'Starting DELTA'
     Write-Detail 'The container initialises or migrates its own schema on start; a cold first start takes around 90 seconds.'
 
-    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'delta') -TimeoutSeconds 900
+    $up = Invoke-DeltaActivity -Message 'Starting DELTA' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'delta') -TimeoutSeconds 900
+    }
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting the DELTA container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result
@@ -1485,7 +1501,9 @@ function Start-DeltaStack {
     # --- nginx ------------------------------------------------------------
     $result.Stage = 'nginx'
     Write-Step 'Starting NGINX'
-    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'nginx') -TimeoutSeconds 600
+    $up = Invoke-DeltaActivity -Message 'Starting NGINX' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'nginx') -TimeoutSeconds 600
+    }
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting NGINX failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result

@@ -79,11 +79,10 @@ its own, though not the instant the desktop appears — see
   is not, the installer shows Docker's licensing terms, asks you to accept
   them, installs Docker Desktop silently, and asks you to restart Windows and
   run it again.
-  > Docker documents that Docker Desktop is not supported on Windows Server
-  > editions. It installs and runs correctly there and DELTA was validated on
-  > Server 2025 — but if Docker Desktop itself misbehaves, support for it comes
-  > from this project, not from Docker. The installer discloses this before
-  > installing anything.
+  > Docker Desktop is not officially supported by Docker on Windows Server.
+  > DELTA has been successfully tested with Docker Desktop on Windows Server
+  > 2022 and 2025. The installer states this and asks before installing
+  > anything.
 - **About 20 GB free** on the system volume, and internet access to
   `ghcr.io` and `docker.io` for the first run.
 
@@ -1885,4 +1884,23 @@ run offline and change nothing:
 
 ```powershell
 .\tools\Test-RuntimeSequencing.ps1
+```
+
+`tools\Test-ActivityIndicator.ps1` covers the generic terminal activity
+indicator — the animated line a long-running operation shows while it is in
+progress. What it proves is the contract every caller depends on rather than
+any particular operation: the wrapped operation runs exactly once, its result
+comes back unchanged for every shape a PowerShell operation can return, an
+exception propagates untouched, and the animation is gone on the success path,
+the throwing path and the early-return path with no leftover dots and no stray
+newline. It also asserts the two properties that keep a captured run readable —
+a redirected or non-interactive run emits one static line and not a single
+control character, and the transcript records the operation once and never a
+frame — and that no animation is running at the instant any shared prompt is
+displayed. The animation never touches the real console: it is written to a
+`StringWriter` and the emitted characters are read back and checked. No test
+asserts an exact frame count, so it does not become flaky on a loaded machine:
+
+```powershell
+.\tools\Test-ActivityIndicator.ps1
 ```

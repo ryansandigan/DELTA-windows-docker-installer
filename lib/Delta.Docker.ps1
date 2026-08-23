@@ -1169,9 +1169,17 @@ function Repair-DeltaVirtualizationPrerequisite {
         switch ($action) {
             'virtual-machine-platform' {
                 $null = $attempted.Add('VirtualMachinePlatform')
-                Write-Detail 'Enabling the Virtual Machine Platform Windows feature...'
                 try {
-                    $null = Enable-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -All -NoRestart -ErrorAction Stop
+                    # The static "Enabling..." line this replaces said the same
+                    # sentence and logged the same DETAIL entry; the difference
+                    # is only that it now animates while DISM works, which on a
+                    # cold host is minutes with nothing on screen. A feature
+                    # that cannot be enabled still throws out of here into the
+                    # catch below - the indicator is stopped by
+                    # Invoke-DeltaActivity's finally on the way past.
+                    $null = Invoke-DeltaActivity -Message 'Enabling the Virtual Machine Platform Windows feature' -ScriptBlock {
+                        Enable-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -All -NoRestart -ErrorAction Stop
+                    }
                     # Always a restart, regardless of what RestartNeeded says:
                     # the hypervisor platform is not usable until the machine
                     # comes back, and claiming otherwise is how a host ends up
@@ -1449,7 +1457,9 @@ function Install-DeltaWsl {
     Write-Detail 'Running: wsl --install --no-distribution'
     Write-Detail 'No Linux distribution is created. Docker Desktop supplies its own.'
 
-    $capture = Invoke-DeltaWslCommand -Arguments @('--install', '--no-distribution') -TimeoutSeconds 900
+    $capture = Invoke-DeltaActivity -Message 'Installing the Windows Subsystem for Linux' -ScriptBlock {
+        Invoke-DeltaWslCommand -Arguments @('--install', '--no-distribution') -TimeoutSeconds 900
+    }
 
     if ($capture.ExitCode -ne 0) {
         $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
@@ -1900,7 +1910,9 @@ function Start-DeltaDockerEngine {
 
     Write-Detail "Running: docker desktop start --timeout $TimeoutSeconds"
     # The CLI's own timeout plus a small margin for it to return.
-    $capture = Invoke-DeltaDockerCommand -Arguments @('desktop', 'start', '--timeout', "$TimeoutSeconds") -TimeoutSeconds ($TimeoutSeconds + 30)
+    $capture = Invoke-DeltaActivity -Message 'Starting Docker Desktop' -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @('desktop', 'start', '--timeout', "$TimeoutSeconds") -TimeoutSeconds ($TimeoutSeconds + 30)
+    }
 
     if ($capture.ExitCode -ne 0) {
         $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
@@ -1937,7 +1949,11 @@ function Set-DeltaDockerLinuxEngine {
     }
 
     Write-Detail 'Running: docker desktop engine use linux'
-    $capture = Invoke-DeltaDockerCommand -Arguments @('desktop', 'engine', 'use', 'linux') -TimeoutSeconds 300
+    # The confirmation above has already been answered, so nothing is waiting
+    # on the operator here - only on Docker.
+    $capture = Invoke-DeltaActivity -Message 'Switching Docker Desktop to Linux containers' -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @('desktop', 'engine', 'use', 'linux') -TimeoutSeconds 300
+    }
     if ($capture.ExitCode -ne 0) {
         $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
         if ($detail) { Write-Detail $detail }
@@ -1984,17 +2000,23 @@ function Get-DeltaComposeState {
 
 function Show-DeltaServerSkuCaveat {
     <#
-      C1. Docker documents that Docker Desktop is not supported on Windows
-      Server; it nonetheless installs and runs correctly there (A§2.3,
-      verified on Server 2025). This is a disclosure obligation, never a
-      refusal - the decision belongs to the operator.
+      C1. Two facts, both of which the operator needs and neither of which is
+      the other's answer: Docker does not support Docker Desktop on Windows
+      Server, and DELTA has been tested on it there anyway (Server 2022 and
+      Server 2025). Stating both and asking is the whole of this function.
 
-      -RequireConfirmation is passed only on the path that is about to
-      install Docker, matching A§5.6's "print an explicit notice before
-      installing Docker". On a host where Docker is already present the
-      obligation already exists and belongs to the operator, so the notice is
-      displayed and recorded without interrupting a rerun - the same
-      treatment A§5.6 prescribes explicitly for C2.
+      What it deliberately no longer does is argue. The earlier wording
+      explained at length that this was "a disclosure, not a refusal" and that
+      "the decision is yours" - which is what a [y/N] prompt already says, at
+      more length and less clearly. It also echoed $WindowsInfo.Caption, so a
+      host running an evaluation build was told it was running an evaluation
+      build in the middle of a support notice that had nothing to do with it.
+
+      -RequireConfirmation is passed only on the path that is about to install
+      Docker, matching A§5.6's "print an explicit notice before installing
+      Docker". On a host where Docker is already present nothing is being
+      installed, so the same two facts are recorded without interrupting a
+      rerun - the treatment A§5.6 prescribes explicitly for C2.
     #>
     param(
         [Parameter(Mandatory)][object]$WindowsInfo,
@@ -2005,29 +2027,25 @@ function Show-DeltaServerSkuCaveat {
         return $true
     }
 
-    Write-Step 'Vendor support notice (server edition)'
-
     if (-not $RequireConfirmation) {
-        Write-Detail "This host is $($WindowsInfo.Caption)."
-        Write-Detail 'Docker documents that Docker Desktop is not supported on Windows Server editions.'
-        Write-Detail 'It installs and runs correctly there, and DELTA was validated on Server 2025, but'
-        Write-Detail 'support for Docker Desktop itself would come from this project, not from Docker.'
+        Write-Step 'Windows Server detected'
+        Write-Detail 'Docker Desktop is not officially supported by Docker on Windows Server.'
+        Write-Detail 'DELTA has been successfully tested with Docker Desktop on Windows Server 2022'
+        Write-Detail 'and 2025.'
         Write-Detail 'Docker Desktop is already installed here, so this is recorded, not asked.'
         return $true
     }
 
-    return (Read-DeltaYesNoConfirmation -Body {
-        Write-Host "This host is $($WindowsInfo.Caption)."
-        Write-Host ''
-        Write-Host 'Docker documents that Docker Desktop is NOT SUPPORTED on Windows Server'
-        Write-Host 'editions. In testing it installs and runs correctly on Windows Server 2025,'
-        Write-Host 'and DELTA was validated there - but if Docker Desktop itself misbehaves on'
-        Write-Host 'this host, Docker will not support it.'
-        Write-Host ''
-        Write-Host 'This is a disclosure, not a refusal. The decision is yours.'
-        Write-Host ''
-        Write-Host 'Continue and install Docker Desktop on this server?'
-    })
+    Write-Host ''
+    Write-Host ('-' * $Script:DeltaBannerWidth)
+    Write-Step 'Windows Server detected'
+    Write-Host ''
+    Write-Host 'Docker Desktop is not officially supported by Docker on Windows Server.'
+    Write-Host 'DELTA has been successfully tested with Docker Desktop on Windows'
+    Write-Host 'Server 2022 and 2025.'
+    Write-Host ''
+
+    return (Read-DeltaInlineConfirmation -Prompt 'Continue with Docker Desktop installation? [y/N]')
 }
 
 function Confirm-DeltaDockerLicensing {
@@ -2409,7 +2427,13 @@ function Resolve-DeltaDockerInstaller {
         }
         catch { }
 
-        Invoke-WebRequest -Uri $Script:DeltaDockerInstallerUrl -OutFile $destination -UseBasicParsing -ErrorAction Stop
+        # The progress bar is suppressed above for throughput, which leaves a
+        # 600 MB transfer with nothing on screen at all. The activity indicator
+        # is what replaces it, and it costs nothing: it does not poll the
+        # transfer, count bytes or claim a percentage it cannot know.
+        Invoke-DeltaActivity -Message 'Downloading Docker Desktop' -ScriptBlock {
+            Invoke-WebRequest -Uri $Script:DeltaDockerInstallerUrl -OutFile $destination -UseBasicParsing -ErrorAction Stop
+        }
         $downloaded = $true
     }
     catch {
@@ -2473,7 +2497,14 @@ function Install-DeltaDockerDesktop {
     Write-Detail "Running: `"$InstallerPath`" $($arguments -join ' ')"
     Write-Detail 'This usually takes several minutes and produces no output until it finishes.'
 
-    $capture = Invoke-DeltaProcessCapture -FilePath $InstallerPath -Arguments $arguments -TimeoutSeconds 3600
+    # "Produces no output until it finishes" is exactly the case the activity
+    # indicator exists for: the installer is running, nothing is being written,
+    # and the operator has no other way to tell a working install from a hung
+    # one. Nothing about the install itself changes - the same arguments, the
+    # same seam, the same hour-long budget.
+    $capture = Invoke-DeltaActivity -Message 'Installing Docker Desktop' -ScriptBlock {
+        Invoke-DeltaProcessCapture -FilePath $InstallerPath -Arguments $arguments -TimeoutSeconds 3600
+    }
 
     $result = [PSCustomObject]@{
         Succeeded      = $false

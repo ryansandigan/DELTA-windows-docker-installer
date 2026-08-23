@@ -2244,10 +2244,16 @@ function New-DeltaDatabaseBackup {
 
     $started = Get-Date
     $result.Stage = 'dump'
-    $capture = Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-        'exec', '-T', 'db',
-        'pg_dump', '-U', $Configuration.PostgresUser, '-d', $Configuration.PostgresDb, '-Fc'
-    ) -OutputFile $target -TimeoutSeconds $TimeoutSeconds
+    # The dump streams into $target with nothing on screen: stdout is the
+    # archive itself, so there is no progress output to show and never will be.
+    # $started/$DurationSecs are taken outside the wrapper, so the reported
+    # duration is still the dump's and not the indicator's.
+    $capture = Invoke-DeltaActivity -Message 'Creating database backup' -ScriptBlock {
+        Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'exec', '-T', 'db',
+            'pg_dump', '-U', $Configuration.PostgresUser, '-d', $Configuration.PostgresDb, '-Fc'
+        ) -OutputFile $target -TimeoutSeconds $TimeoutSeconds
+    }
     $result.DurationSecs = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
 
     $failure = $null
@@ -2893,9 +2899,11 @@ function Invoke-DeltaUpdate {
     $result.Stage = 'pull'
     Write-Host ''
     Write-Step 'Pulling the new DELTA image'
-    $pull = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-        'pull', $Script:DeltaUpdateService
-    ) -TimeoutSeconds 3600
+    $pull = Invoke-DeltaActivity -Message 'Pulling the new DELTA image' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'pull', $Script:DeltaUpdateService
+        ) -TimeoutSeconds 3600
+    }
 
     if ($pull.ExitCode -ne 0) {
         $text = (($pull.StdErr + "`n" + $pull.StdOut)).Trim()
@@ -2923,9 +2931,11 @@ function Invoke-DeltaUpdate {
     Write-Step 'Recreating the DELTA application container'
     Write-Detail 'Only the delta service. The database container, its volume and NGINX are not touched.'
 
-    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-        'up', '-d', '--no-deps', $Script:DeltaUpdateService
-    ) -TimeoutSeconds 900
+    $up = Invoke-DeltaActivity -Message 'Recreating the DELTA application container' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'up', '-d', '--no-deps', $Script:DeltaUpdateService
+        ) -TimeoutSeconds 900
+    }
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Recreating the DELTA container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim()). The database and its backup are untouched."
         return $result

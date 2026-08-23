@@ -103,6 +103,14 @@ $Script:DeltaStartupExitStackFailed  = 13
 $exitCode = $Script:DeltaStartupExitOk
 $logDirectory = Join-Path -Path $InstallRoot -ChildPath 'logs\installer'
 
+# No terminal animation from here, ever. This script's normal caller is a
+# scheduled task at boot with nobody watching it, and its output is the
+# appended startup.log an operator reads afterwards - the one file where a
+# stream of animation frames would be worst. The console probe would refuse
+# most of these sessions on its own; saying it outright means it does not
+# depend on how the task happens to have been registered.
+Set-DeltaActivityMode -Mode 'off'
+
 try {
     # One appended file, not one per boot: after a restart the operator needs
     # to read a history, not to work out which of forty transcripts was this

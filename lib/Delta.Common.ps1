@@ -276,6 +276,12 @@ function Stop-DeltaLog {
     #>
     param([int]$ExitCode = 0)
 
+    # The backstop for the activity indicator. Every wrapped operation already
+    # stops its own in a finally block; this is what catches an activity that
+    # was started with Start-DeltaActivity directly and then abandoned, so a
+    # run can never end with a worker still drawing dots over the exit banner.
+    Stop-DeltaActivity
+
     if (-not $Script:DeltaLogPath) {
         return
     }
@@ -288,7 +294,413 @@ function Get-DeltaLogPath {
 }
 
 # ---------------------------------------------------------------------------
+# Activity indicator
+#
+# One animated line for any operation that has been STARTED and is being
+# WAITED ON. It carries no knowledge of what is being waited for: the caller
+# supplies a message and a scriptblock, and everything below - the animation,
+# the same-line rendering, the cursor, the cleanup on success and on failure,
+# and the decision about whether to animate at all - belongs to this section.
+# Nothing else in this installer implements an animation loop.
+#
+# Three properties are worth stating because they are what make it safe to
+# wrap an arbitrary operation:
+#
+#   It is an ACTIVITY indicator, not a progress bar. Three frames, no
+#   percentage, no estimated completion. This installer cannot know how far
+#   through a 600 MB download or a Docker Desktop install it is, and inventing
+#   a number would be inventing a fact.
+#
+#   The frames never reach the transcript. Start-DeltaActivity writes ONE
+#   line to the log - "<message>..." - and the animation after that is
+#   presentation only, emitted through a TextWriter that the log has no
+#   connection to. A transcript therefore reads the same whether the run was
+#   animated or not.
+#
+#   The animated line is ERASED when the activity ends, not terminated with a
+#   newline. What is left on screen after a wrapped operation is exactly what
+#   was there before this section existed, which is why wrapping an operation
+#   changes no output an operator or a test reads.
+#
+# The animation runs on its own runspace because the operation being decorated
+# is a blocking call - a child process, a WaitForExit, an Invoke-WebRequest -
+# and the main thread is inside it. That means two threads can reach the
+# console, so every write goes through $state.Sync, and the main thread's own
+# writes (Write-Detail and its siblings below, and every prompt) suspend or
+# stop the animation first rather than racing it.
+# ---------------------------------------------------------------------------
+
+$Script:DeltaActivityFrames     = @('.', '..', '...')
+$Script:DeltaActivityIntervalMs = 400
+$Script:DeltaActivityIndent     = '    '
+
+# 'auto' decides per activity from the console; 'off' never animates and
+# prints the static line instead. setup.ps1 turns it off for -NonInteractive,
+# and the test suites turn it off to assert that a redirected run stays clean.
+$Script:DeltaActivityMode = 'auto'
+
+# The one activity that can be running, or $null. Nesting is not supported and
+# is not silently tolerated either: Start-DeltaActivity stops whatever was
+# running first, so two animations can never share a line.
+$Script:DeltaActivity = $null
+
+# Runs in its own runspace, with $state supplied by Start-DeltaActivity. It
+# knows nothing about this installer - none of the functions in this file
+# exist in that runspace - so $state and the TextWriter on it are the whole of
+# its world.
+$Script:DeltaActivityWorker = {
+    # Frame 0 was already drawn synchronously by Start-DeltaActivity, so this
+    # picks up at frame 1 rather than repeating it.
+    $index = 1
+    while (-not $state.Stop.WaitOne(0)) {
+        [System.Threading.Monitor]::Enter($state.Sync)
+        try {
+            if (-not $state.Paused) {
+                $frame = $state.Frames[$index % $state.Frames.Count]
+                # Padded to the widest frame rather than erased first: the line
+                # is rewritten in one write, so there is no instant at which a
+                # blanked line is on screen.
+                $state.Writer.Write("`r" + ($state.Indent + $state.Message + $frame).PadRight($state.Width))
+                $state.Writer.Flush()
+                $state.Drawn = $state.Width
+                $index++
+            }
+        }
+        catch {
+            # A console that cannot be written to ends the ANIMATION. It never
+            # ends the operation the animation was decorating.
+            $state.Failed = $true
+            break
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($state.Sync)
+        }
+
+        # Waiting on the stop event rather than sleeping is what makes
+        # Stop-DeltaActivity return immediately instead of up to one frame
+        # later.
+        if ($state.Stop.WaitOne($state.IntervalMs)) { break }
+    }
+}
+
+function Set-DeltaActivityMode {
+    <#
+      'auto' (the default) or 'off'. 'off' is not a cosmetic preference: it is
+      how a caller that knows more than the console probe does - an unattended
+      run, a test - says that same-line updates are not wanted here.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('auto', 'off')][string]$Mode)
+
+    if ($Mode -eq 'off') { Stop-DeltaActivity }
+    $Script:DeltaActivityMode = $Mode
+}
+
+function Get-DeltaActivityMode {
+    return $Script:DeltaActivityMode
+}
+
+function Test-DeltaActivityRunning {
+    <#
+      Whether an animation is live right now. Exists so that the "no animation
+      is ever running while a prompt is on screen" rule can be asserted rather
+      than assumed.
+    #>
+    return ($null -ne $Script:DeltaActivity)
+}
+
+function Test-DeltaActivitySupported {
+    <#
+      Whether same-line animation is appropriate on this console for a line
+      $Width characters wide. Answers only the question; starts nothing.
+
+      Every branch here fails CLOSED - a host this cannot positively identify
+      as an interactive console gets static output, because the cost of
+      guessing wrong is a log file full of carriage returns.
+    #>
+    param([Parameter(Mandatory)][int]$Width)
+
+    if ($Script:DeltaActivityMode -eq 'off') { return $false }
+
+    try {
+        # Redirected output is a file or a pipe. A carriage return is not a
+        # cursor movement there, it is a byte, and every frame would become
+        # another line of the operator's log.
+        if ([Console]::IsOutputRedirected) { return $false }
+
+        # A service, a scheduled task, a session with no window station.
+        if (-not [Environment]::UserInteractive) { return $false }
+
+        # ConsoleHost is the only host whose [Console] writes land in the same
+        # place as its Write-Host writes. In the ISE, and in an editor-hosted
+        # PowerShell, they are two different sinks - animating one while the
+        # installer writes to the other is worse than not animating at all.
+        if ($Host.Name -ne 'ConsoleHost') { return $false }
+
+        # A line as wide as the window wraps, and a carriage return then
+        # returns to the start of the wrapped remainder rather than to the
+        # start of the line - which is how an animation ends up smeared across
+        # two rows.
+        if ([Console]::BufferWidth -le $Width) { return $false }
+    }
+    catch {
+        return $false
+    }
+
+    return $true
+}
+
+function Clear-DeltaActivityLine {
+    <#
+      Blanks whatever the animation last drew and leaves the cursor at the
+      start of that line, so the next write starts from column 0 on a line
+      with nothing on it. Callers hold $State.Sync.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+
+    if ($State.Drawn -le 0) { return }
+    try {
+        $State.Writer.Write("`r" + (' ' * $State.Drawn) + "`r")
+        $State.Writer.Flush()
+    }
+    catch { }
+    $State.Drawn = 0
+}
+
+function Start-DeltaActivity {
+    <#
+      Begins animating "<message>." / ".." / "..." on one line, and returns
+      immediately. The caller is then responsible for Stop-DeltaActivity -
+      which is why almost every caller should use Invoke-DeltaActivity below
+      instead, and let a finally block own that.
+
+      Exactly one line reaches the transcript, here, whether or not anything
+      is animated. Everything after it is presentation.
+
+      -Writer is the test seam. Supplying one both redirects the animation
+      away from the console and asserts that same-line updates are safe on it,
+      so the console capability probe is skipped - but 'off' still wins, because
+      'off' is a statement about what the caller wants, not about the terminal.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [System.IO.TextWriter]$Writer
+    )
+
+    # Never two at once. A second animation on the same line would corrupt
+    # both, and an abandoned first one would never be stopped.
+    Stop-DeltaActivity
+
+    $line = $Script:DeltaActivityIndent + $Message
+    $longest = 0
+    foreach ($frame in $Script:DeltaActivityFrames) {
+        if ($frame.Length -gt $longest) { $longest = $frame.Length }
+    }
+    $width = $line.Length + $longest
+
+    Write-DeltaLogLine -Message "$Message..." -Level 'DETAIL'
+
+    $animate = if ($PSBoundParameters.ContainsKey('Writer')) {
+        ($Script:DeltaActivityMode -ne 'off')
+    }
+    else {
+        Test-DeltaActivitySupported -Width $width
+    }
+
+    if (-not $animate) {
+        # The documented fallback: the same sentence, once, with no control
+        # characters in it at all.
+        Write-Host "$line..."
+        return
+    }
+
+    $state = [PSCustomObject]@{
+        Message    = $Message
+        Indent     = $Script:DeltaActivityIndent
+        Frames     = $Script:DeltaActivityFrames
+        IntervalMs = $Script:DeltaActivityIntervalMs
+        Width      = $width
+        Drawn      = 0
+        Paused     = $false
+        Failed     = $false
+        Sync       = (New-Object object)
+        Stop       = (New-Object System.Threading.ManualResetEvent($false))
+        Writer     = $(if ($PSBoundParameters.ContainsKey('Writer')) { $Writer } else { [Console]::Out })
+        Runspace   = $null
+        Shell      = $null
+        Handle     = $null
+    }
+
+    $runspace = $null
+    try {
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $runspace.Open()
+        $runspace.SessionStateProxy.SetVariable('state', $state)
+
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        $null = $shell.AddScript($Script:DeltaActivityWorker.ToString())
+
+        $state.Runspace = $runspace
+        $state.Shell    = $shell
+        $state.Handle   = $shell.BeginInvoke()
+    }
+    catch {
+        # An animation that could not be started is not a failure of the
+        # operation it was decorating. Say the same thing statically and carry
+        # on, exactly as an unsupported console does.
+        if ($runspace) { try { $runspace.Dispose() } catch { } }
+        try { $state.Stop.Close() } catch { }
+        Write-Host "$line..."
+        return
+    }
+
+    $Script:DeltaActivity = $state
+
+    # The first frame is drawn here, synchronously, rather than being left to
+    # the worker's first pass. Opening a runspace takes long enough to be a
+    # visible gap between an operation starting and anything appearing, and
+    # drawing it here makes "an activity is running" and "something is on
+    # screen" the same fact from the moment this function returns - which is
+    # what lets Stop-DeltaActivity always have a line to erase.
+    [System.Threading.Monitor]::Enter($state.Sync)
+    try {
+        try {
+            $state.Writer.Write("`r" + ($state.Indent + $state.Message + $state.Frames[0]).PadRight($state.Width))
+            $state.Writer.Flush()
+            $state.Drawn = $state.Width
+        }
+        catch { }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($state.Sync)
+    }
+}
+
+function Suspend-DeltaActivity {
+    <#
+      Erases the animated line and holds the animation until
+      Resume-DeltaActivity, so the caller can write to the console without the
+      worker drawing into the middle of it. A no-op when nothing is animating,
+      which is the usual case for the output helpers that call it.
+    #>
+    $state = $Script:DeltaActivity
+    if (-not $state) { return }
+
+    [System.Threading.Monitor]::Enter($state.Sync)
+    try {
+        $state.Paused = $true
+        Clear-DeltaActivityLine -State $state
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($state.Sync)
+    }
+}
+
+function Resume-DeltaActivity {
+    <#
+      Lets the animation draw again. The worker redraws the whole line from
+      column 0 on its next frame, so nothing has to be restored here.
+    #>
+    $state = $Script:DeltaActivity
+    if (-not $state) { return }
+    $state.Paused = $false
+}
+
+function Stop-DeltaActivity {
+    <#
+      Ends the animation and leaves the cursor on an empty line at column 0.
+      Idempotent, and safe to call when nothing was ever started - which is
+      what lets every caller put it in a finally block without first asking
+      whether there is anything to stop.
+
+      Order matters. The worker is signalled and joined BEFORE the line is
+      erased, so there is no frame in flight that could redraw over the blank.
+    #>
+    $state = $Script:DeltaActivity
+    if (-not $state) { return }
+
+    # Released first, so that a failure anywhere below cannot leave a second
+    # Stop looking at an activity this one already owns.
+    $Script:DeltaActivity = $null
+
+    try { $null = $state.Stop.Set() } catch { }
+
+    if ($state.Handle) {
+        # The worker waits on the stop event instead of sleeping, so this
+        # normally returns at once. It is bounded anyway: a stuck animation
+        # must never be able to hold up the installer.
+        try { $null = $state.Handle.AsyncWaitHandle.WaitOne(2000) } catch { }
+    }
+    if ($state.Shell) {
+        try { if ($state.Handle -and -not $state.Handle.IsCompleted) { $state.Shell.Stop() } } catch { }
+        try { $state.Shell.Dispose() } catch { }
+    }
+    if ($state.Runspace) {
+        try { $state.Runspace.Dispose() } catch { }
+    }
+
+    [System.Threading.Monitor]::Enter($state.Sync)
+    try { Clear-DeltaActivityLine -State $state }
+    finally { [System.Threading.Monitor]::Exit($state.Sync) }
+
+    try { $state.Stop.Close() } catch { }
+}
+
+function Invoke-DeltaActivity {
+    <#
+      The one API a caller needs: run $ScriptBlock while "<message>..."
+      animates, and guarantee the animation is gone by the time this returns,
+      however it returns.
+
+        $capture = Invoke-DeltaActivity -Message 'Installing Docker Desktop' -ScriptBlock {
+            Invoke-DeltaProcessCapture -FilePath $installer -Arguments $arguments
+        }
+
+      The scriptblock's output is this function's output, unaltered and
+      unbuffered - it is invoked with & so it can still read the locals of the
+      scope it was written in, exactly like Read-DeltaYesNoConfirmation's body.
+      An exception thrown inside it propagates untouched; this adds no catch,
+      because swallowing an operation's error to keep an animation tidy would
+      be the worst possible trade.
+
+      Cleanup is a finally block, so it also runs when the operation returns
+      early, when a called process fails, and when PowerShell unwinds the
+      pipeline after Ctrl+C.
+
+      What this deliberately does NOT do is print the caller's step heading or
+      its result. Those already exist at the call sites, and an activity that
+      restated them would change what a run looks like on screen for no reason.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [System.IO.TextWriter]$Writer
+    )
+
+    if ($PSBoundParameters.ContainsKey('Writer')) {
+        Start-DeltaActivity -Message $Message -Writer $Writer
+    }
+    else {
+        Start-DeltaActivity -Message $Message
+    }
+
+    try {
+        & $ScriptBlock
+    }
+    finally {
+        Stop-DeltaActivity
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Console output vocabulary (reused from the reference installer, A§23)
+#
+# Every one of these suspends a running activity before it writes and lets it
+# resume afterwards. That is what keeps the animation from interleaving with a
+# log line, a warning, an error or a command's output: the animated line is
+# always the last line on screen, and it is erased before anything else is
+# written under it.
 # ---------------------------------------------------------------------------
 
 function Show-Section {
@@ -296,6 +708,7 @@ function Show-Section {
         [Parameter(Mandatory)][string]$Title,
         [string]$Subtitle
     )
+    Suspend-DeltaActivity
     $rule = '=' * $Script:DeltaBannerWidth
     Write-Host ''
     Write-Host $rule
@@ -305,37 +718,48 @@ function Show-Section {
     }
     Write-Host $rule
     Write-Host ''
+    Resume-DeltaActivity
 
     Write-DeltaLogLine -Message "== $Title$(if ($Subtitle) { " - $Subtitle" })" -Level 'SECTION'
 }
 
 function Write-Step {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    Suspend-DeltaActivity
     Write-Host "==> $Message" -ForegroundColor Cyan
+    Resume-DeltaActivity
     Write-DeltaLogLine -Message $Message -Level 'STEP'
 }
 
 function Write-Detail {
     param([AllowEmptyString()][string]$Message)
+    Suspend-DeltaActivity
     Write-Host "    $Message"
+    Resume-DeltaActivity
     Write-DeltaLogLine -Message $Message -Level 'DETAIL'
 }
 
 function Write-Success {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    Suspend-DeltaActivity
     Write-Host $Message -ForegroundColor Green
+    Resume-DeltaActivity
     Write-DeltaLogLine -Message $Message -Level 'SUCCESS'
 }
 
 function Write-DeltaWarning {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    Suspend-DeltaActivity
     Write-Host "    $Message" -ForegroundColor Yellow
+    Resume-DeltaActivity
     Write-DeltaLogLine -Message $Message -Level 'WARNING'
 }
 
 function Write-DeltaFailure {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    Suspend-DeltaActivity
     Write-Host $Message -ForegroundColor Red
+    Resume-DeltaActivity
     Write-DeltaLogLine -Message $Message -Level 'ERROR'
 }
 
@@ -355,6 +779,14 @@ function Read-DeltaYesNoConfirmation {
       was written in.
     #>
     param([Parameter(Mandatory)][scriptblock]$Body)
+
+    # Stopped, not suspended. An activity indicator animating over a question
+    # claims that something is still in progress while the installer is in fact
+    # doing nothing but waiting for this operator - and there is no correct
+    # moment to resume it afterwards, because the answer decides what happens
+    # next. Every prompt in this installer goes through one of the three
+    # readers here or through a dialog below, so this is the whole of the rule.
+    Stop-DeltaActivity
 
     $rule = '-' * $Script:DeltaBannerWidth
     Write-Host ''
@@ -389,6 +821,7 @@ function Read-DeltaInlineConfirmation {
     #>
     param([Parameter(Mandatory)][string]$Prompt)
 
+    Stop-DeltaActivity
     $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
     $confirmed = ($choice -in @('Y', 'y'))
     Write-DeltaLogLine -Message "$Prompt -> $(if ($confirmed) { 'yes' } else { 'no' })" -Level 'DETAIL'
@@ -414,6 +847,7 @@ function Read-DeltaDefaultYesAnswer {
     #>
     param([Parameter(Mandatory)][string]$Prompt)
 
+    Stop-DeltaActivity
     $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
 
     $answer = 'unrecognised'
@@ -489,6 +923,10 @@ function Select-DeltaSslFile {
         [Parameter(Mandatory)][string]$Title,
         [Parameter(Mandatory)][string]$Filter
     )
+
+    # A modal dialog is a prompt with a window around it, and gets the same
+    # treatment as the typed ones: nothing animates while this waits.
+    Stop-DeltaActivity
 
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
         Write-DeltaWarning 'A file selection window cannot be opened from this session: PowerShell is not running on an STA thread.'
@@ -567,6 +1005,8 @@ function Select-DeltaFolder {
         [Parameter(Mandatory)][string]$Description,
         [string]$InitialPath
     )
+
+    Stop-DeltaActivity
 
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
         Write-DeltaWarning 'A folder selection window cannot be opened from this session: PowerShell is not running on an STA thread.'

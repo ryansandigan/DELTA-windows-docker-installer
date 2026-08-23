@@ -818,6 +818,15 @@ $exitCode = $Script:DeltaExitSuccess
 # back.
 $Script:DeltaRestartConfirmed = $false
 
+# Terminal animation is for somebody who is watching. An unattended run is by
+# definition one nobody is, and its output is usually being captured - so the
+# activity indicator falls back to a single static line per operation. The
+# console probe would catch a redirected run on its own; this catches the run
+# that is unattended on a real console, which the probe cannot see.
+if ($NonInteractive) {
+    Set-DeltaActivityMode -Mode 'off'
+}
+
 try {
     $logPath = Start-DeltaLog -Directory $LogDirectory
 
