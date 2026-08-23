@@ -243,7 +243,11 @@ UPDATE public.super_admin_users SET password = crypt(:'password', gen_salt('bf',
         $env:DELTA_ADMIN_NEW_PASSWORD = $plain
         $plain = $null
 
-        $capture = Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds 120 -StandardInput $sql
+        # Straight after the operator has answered a password prompt, so the
+        # pause while psql runs in the container is one they are watching.
+        $capture = Invoke-DeltaActivity -Message 'Applying the administrator password' -WhenIdle -ScriptBlock {
+            Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds 120 -StandardInput $sql
+        }
     }
     finally {
         if ($null -eq $previous) { Remove-Item Env:\DELTA_ADMIN_NEW_PASSWORD -ErrorAction SilentlyContinue }
@@ -321,7 +325,9 @@ SELECT (password = crypt(:'candidate', password)) FROM public.super_admin_users 
         Register-DeltaSecretValue -Value $plain
         $env:DELTA_ADMIN_NEW_PASSWORD = $plain
         $plain = $null
-        $capture = Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds 120 -StandardInput $sql
+        $capture = Invoke-DeltaActivity -Message 'Verifying the administrator password' -WhenIdle -ScriptBlock {
+            Invoke-DeltaDockerCommand -Arguments $arguments -TimeoutSeconds 120 -StandardInput $sql
+        }
     }
     finally {
         if ($null -eq $previous) { Remove-Item Env:\DELTA_ADMIN_NEW_PASSWORD -ErrorAction SilentlyContinue }
@@ -941,8 +947,12 @@ function Stop-DeltaInstallation {
     Write-Detail 'This stops the containers. Nothing is removed - not the containers, the network, the'
     Write-Detail 'data volume, the uploads, the certificates or the configuration.'
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName `
-        -Arguments @('stop') -TimeoutSeconds $TimeoutSeconds
+    # A stop waits for each container's own shutdown, and PostgreSQL's is not
+    # instant: this can be half a minute with nothing on screen.
+    $capture = Invoke-DeltaActivity -Message 'Stopping the containers' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName `
+            -Arguments @('stop') -TimeoutSeconds $TimeoutSeconds
+    }
 
     if ($capture.ExitCode -ne 0) {
         $result.Reason = "docker compose stop failed: $((($capture.StdErr + ' ' + $capture.StdOut)).Trim())"
@@ -1230,6 +1240,12 @@ function Watch-DeltaComposeLogs {
 
     $process = $null
     $previousMode = $null
+    # The live-output exception, made explicit rather than left to the fact
+    # that no caller currently wraps this. The operation here IS the output:
+    # a child process writing straight to this console, which dots would be
+    # drawn on top of. Suspended for its duration, so anything still in
+    # progress underneath comes back when the viewer closes.
+    Suspend-DeltaActivity
     try {
         try { $previousMode = [Console]::TreatControlCAsInput; [Console]::TreatControlCAsInput = $true } catch { }
 
@@ -1252,6 +1268,7 @@ function Watch-DeltaComposeLogs {
         }
         Write-Host ''
         Write-DeltaLogLine -Message "Closed the log viewer: $Title" -Level 'DETAIL'
+        Resume-DeltaActivity
     }
 }
 
@@ -1275,6 +1292,11 @@ function Watch-DeltaFileTail {
     Show-DeltaTailBanner -What $Title
     Write-Host "File: $Path"
     Write-Host ''
+
+    # Live output, so nothing animates over it - the same exception, and the
+    # same mechanism, as the container log viewer above.
+    Suspend-DeltaActivity
+    try {
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-DeltaWarning 'That log file does not exist yet.'
@@ -1344,6 +1366,9 @@ function Watch-DeltaFileTail {
         Write-Host ''
         Write-DeltaLogLine -Message "Closed the log viewer: $Title" -Level 'DETAIL'
     }
+
+    }
+    finally { Resume-DeltaActivity }
 }
 
 function Confirm-DeltaStackUnaffected {
@@ -2010,9 +2035,13 @@ function Test-DeltaBackupArchive {
         }
     }
 
-    $capture = Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
-        'exec', '-T', 'db', 'pg_restore', '--list'
-    ) -InputFile $Path -TimeoutSeconds $TimeoutSeconds
+    # Reading the whole archive back through pg_restore takes as long as the
+    # archive is big, and says nothing at all while it does.
+    $capture = Invoke-DeltaActivity -Message 'Verifying the database backup' -WhenIdle -ScriptBlock {
+        Invoke-DeltaComposeBinary -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
+            'exec', '-T', 'db', 'pg_restore', '--list'
+        ) -InputFile $Path -TimeoutSeconds $TimeoutSeconds
+    }
 
     if ($capture.ExitCode -ne 0) {
         $detail = (($capture.StdErr + ' ' + $capture.StdOut)).Trim()
@@ -2488,9 +2517,14 @@ function Get-DeltaRemoteImageDigest {
         Reason    = $null
     }
 
-    $capture = Invoke-DeltaDockerCommand -Arguments @(
-        'buildx', 'imagetools', 'inspect', $Reference, '--format', '{{.Manifest.Digest}}'
-    ) -TimeoutSeconds $TimeoutSeconds
+    # A registry round trip over whatever this host's connection is. It has its
+    # own two-minute budget, which is how long the terminal could otherwise sit
+    # still for.
+    $capture = Invoke-DeltaActivity -Message 'Querying the registry for the current image' -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @(
+            'buildx', 'imagetools', 'inspect', $Reference, '--format', '{{.Manifest.Digest}}'
+        ) -TimeoutSeconds $TimeoutSeconds
+    }
 
     if ($capture.Error -eq 'not-found') {
         $result.Reason = 'The docker CLI was not found on PATH, so the registry could not be queried.'
@@ -2756,9 +2790,11 @@ function Update-DeltaNginxUpstream {
     }
 
     $result.Attempted = $true
-    $reload = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-        'exec', '-T', 'nginx', 'nginx', '-s', 'reload'
-    ) -TimeoutSeconds 120
+    $reload = Invoke-DeltaActivity -Message 'Reloading NGINX' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'exec', '-T', 'nginx', 'nginx', '-s', 'reload'
+        ) -TimeoutSeconds 120
+    }
 
     if ($reload.ExitCode -ne 0) {
         $result.Reason = "NGINX would not reload: $((($reload.StdErr + ' ' + $reload.StdOut)).Trim())"
@@ -2950,9 +2986,11 @@ function Invoke-DeltaUpdate {
     $running = Get-DeltaRunningImageIdentity -InstallRoot $InstallRoot -Configuration (Get-DeltaStackConfiguration -InstallRoot $InstallRoot)
     if ($running.Succeeded -and $running.RunningDigest -ne $check.RemoteDigest) {
         Write-Detail 'The container is still on the previous image; recreating it explicitly.'
-        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-            'up', '-d', '--no-deps', '--force-recreate', $Script:DeltaUpdateService
-        ) -TimeoutSeconds 900
+        $up = Invoke-DeltaActivity -Message 'Recreating the DELTA application container' -ScriptBlock {
+            Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+                'up', '-d', '--no-deps', '--force-recreate', $Script:DeltaUpdateService
+            ) -TimeoutSeconds 900
+        }
         if ($up.ExitCode -ne 0) {
             $result.Reason = "The DELTA container could not be recreated onto the new image: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
             return $result

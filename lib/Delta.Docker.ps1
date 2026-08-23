@@ -1861,30 +1861,38 @@ function Get-DeltaDockerDesktopStatus {
 function Wait-DeltaDockerEngine {
     <#
       Polls `docker info` until the engine answers or the budget runs out.
-      Reports elapsed time rather than a spinner, because the interesting
-      question when this takes a while is how long it has taken (A§22,
-      health-check timeout row).
+
+      It reports elapsed time every fifteen seconds AND animates throughout,
+      which are two different statements: the elapsed line says how long this
+      has taken, and the indicator says the installer is still asking. The five
+      second sleep between probes used to be five seconds of terminal that
+      looked stopped - which is also what a hung engine looks like.
+
+      -WhenIdle: this is usually the second half of "Starting Docker Desktop",
+      and inside that it runs under that message rather than replacing it.
     #>
     param([int]$TimeoutSeconds = 300)
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $lastReport = Get-Date
-    $state = $null
+    return (Invoke-DeltaActivity -Message 'Waiting for the Docker engine' -WhenIdle -ScriptBlock {
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $lastReport = Get-Date
+        $state = $null
 
-    while ((Get-Date) -lt $deadline) {
-        $state = Get-DeltaDockerEngineState
-        if ($state.Status -eq 'ready' -or $state.Status -eq 'wrong-mode') {
-            return $state
+        while ((Get-Date) -lt $deadline) {
+            $state = Get-DeltaDockerEngineState
+            if ($state.Status -eq 'ready' -or $state.Status -eq 'wrong-mode') {
+                return $state
+            }
+            if (((Get-Date) - $lastReport).TotalSeconds -ge 15) {
+                $lastReport = Get-Date
+                $elapsed = [int]($TimeoutSeconds - ($deadline - (Get-Date)).TotalSeconds)
+                Write-Detail "Still waiting for the Docker engine ($elapsed s elapsed)..."
+            }
+            Start-Sleep -Seconds 5
         }
-        if (((Get-Date) - $lastReport).TotalSeconds -ge 15) {
-            $lastReport = Get-Date
-            $elapsed = [int]($TimeoutSeconds - ($deadline - (Get-Date)).TotalSeconds)
-            Write-Detail "Still waiting for the Docker engine ($elapsed s elapsed)..."
-        }
-        Start-Sleep -Seconds 5
-    }
 
-    return $state
+        return $state
+    })
 }
 
 function Start-DeltaDockerEngine {
@@ -1909,17 +1917,28 @@ function Start-DeltaDockerEngine {
     }
 
     Write-Detail "Running: docker desktop start --timeout $TimeoutSeconds"
-    # The CLI's own timeout plus a small margin for it to return.
-    $capture = Invoke-DeltaActivity -Message 'Starting Docker Desktop' -ScriptBlock {
-        Invoke-DeltaDockerCommand -Arguments @('desktop', 'start', '--timeout', "$TimeoutSeconds") -TimeoutSeconds ($TimeoutSeconds + 30)
-    }
 
-    if ($capture.ExitCode -ne 0) {
-        $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
-        if ($detail) { Write-Detail $detail }
-    }
+    # One activity across both halves. `docker desktop start` returning is not
+    # the engine being up - the wait after it is where most of the time goes -
+    # so the message stays on screen until the engine answers or the budget
+    # runs out. Wait-DeltaDockerEngine is -WhenIdle, so it defers to this
+    # rather than starting a second line.
+    $engine = $null
+    Start-DeltaActivity -Message 'Starting Docker Desktop'
+    try {
+        # The CLI's own timeout plus a small margin for it to return.
+        $capture = Invoke-DeltaDockerCommand -Arguments @('desktop', 'start', '--timeout', "$TimeoutSeconds") -TimeoutSeconds ($TimeoutSeconds + 30)
 
-    return (Wait-DeltaDockerEngine -TimeoutSeconds 120)
+        if ($capture.ExitCode -ne 0) {
+            $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
+            if ($detail) { Write-Detail $detail }
+        }
+
+        $engine = Wait-DeltaDockerEngine -TimeoutSeconds 120
+    }
+    finally { Stop-DeltaActivity }
+
+    return $engine
 }
 
 function Set-DeltaDockerLinuxEngine {
@@ -1950,16 +1969,23 @@ function Set-DeltaDockerLinuxEngine {
 
     Write-Detail 'Running: docker desktop engine use linux'
     # The confirmation above has already been answered, so nothing is waiting
-    # on the operator here - only on Docker.
-    $capture = Invoke-DeltaActivity -Message 'Switching Docker Desktop to Linux containers' -ScriptBlock {
-        Invoke-DeltaDockerCommand -Arguments @('desktop', 'engine', 'use', 'linux') -TimeoutSeconds 300
-    }
-    if ($capture.ExitCode -ne 0) {
-        $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
-        if ($detail) { Write-Detail $detail }
-    }
+    # on the operator here - only on Docker. Both halves under one message, for
+    # the same reason as Start-DeltaDockerEngine above: the engine restarting
+    # after the switch is the part that takes minutes.
+    $engine = $null
+    Start-DeltaActivity -Message 'Switching Docker Desktop to Linux containers'
+    try {
+        $capture = Invoke-DeltaDockerCommand -Arguments @('desktop', 'engine', 'use', 'linux') -TimeoutSeconds 300
+        if ($capture.ExitCode -ne 0) {
+            $detail = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
+            if ($detail) { Write-Detail $detail }
+        }
 
-    return (Wait-DeltaDockerEngine -TimeoutSeconds 180)
+        $engine = Wait-DeltaDockerEngine -TimeoutSeconds 180
+    }
+    finally { Stop-DeltaActivity }
+
+    return $engine
 }
 
 function Get-DeltaComposeState {

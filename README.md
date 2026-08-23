@@ -1893,13 +1893,20 @@ any particular operation: the wrapped operation runs exactly once, its result
 comes back unchanged for every shape a PowerShell operation can return, an
 exception propagates untouched, and the animation is gone on the success path,
 the throwing path and the early-return path with no leftover dots and no stray
-newline. It also asserts the two properties that keep a captured run readable —
-a redirected or non-interactive run emits one static line and not a single
-control character, and the transcript records the operation once and never a
-frame — and that no animation is running at the instant any shared prompt is
-displayed. The animation never touches the real console: it is written to a
-`StringWriter` and the emitted characters are read back and checked. No test
-asserts an exact frame count, so it does not become flaky on a loaded machine:
+newline. It also asserts what makes the line continuous rather than
+intermittent — a polling operation still animating after each of its sleeps, an
+intermediate status line suspending the animation and never ending it, a nested
+inner operation taking the line over and handing it straight back, and an
+operation marked as part of a larger one drawing nothing of its own — and the
+two properties that keep a captured run readable: a redirected or
+non-interactive run emits one static line per announced operation and not a
+single control character, and the transcript records the operation once and
+never a frame. At the instant any shared prompt is displayed it asserts both
+halves of the prompt rule: nothing is animating, and the operation that asked
+the question is still in progress, so it resumes once the answer is in. The
+animation never touches the real console: it is written to a `StringWriter` and
+the emitted characters are read back and checked. No test asserts an exact frame
+count, so it does not become flaky on a loaded machine:
 
 ```powershell
 .\tools\Test-ActivityIndicator.ps1

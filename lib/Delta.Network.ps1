@@ -1141,7 +1141,9 @@ function Test-DeltaNginxConfiguration {
         return [PSCustomObject]@{ Tested = $false; Succeeded = $false; Output = $null; Reason = 'NGINX is not running yet, so its configuration will be validated when it starts.' }
     }
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('exec', '-T', 'nginx', 'nginx', '-t') -TimeoutSeconds 120
+    $capture = Invoke-DeltaActivity -Message 'Testing the NGINX configuration' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('exec', '-T', 'nginx', 'nginx', '-t') -TimeoutSeconds 120
+    }
     $output = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
 
     return [PSCustomObject]@{
@@ -1164,7 +1166,9 @@ function Invoke-DeltaNginxReload {
         [Parameter(Mandatory)][string]$ProjectName
     )
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('exec', '-T', 'nginx', 'nginx', '-s', 'reload') -TimeoutSeconds 120
+    $capture = Invoke-DeltaActivity -Message 'Reloading NGINX' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('exec', '-T', 'nginx', 'nginx', '-s', 'reload') -TimeoutSeconds 120
+    }
     return ($capture.ExitCode -eq 0)
 }
 

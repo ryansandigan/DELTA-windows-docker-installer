@@ -331,7 +331,9 @@ function Restore-DeltaTlsSnapshot {
     # The previous .env is back, so recreating nginx re-publishes exactly the
     # ports it had before.
     if ($RecreateNginx) {
-        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', '--no-deps', 'nginx') -TimeoutSeconds 300
+        $up = Invoke-DeltaActivity -Message 'Restoring the NGINX container' -WhenIdle -ScriptBlock {
+            Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', '--no-deps', 'nginx') -TimeoutSeconds 300
+        }
         $result.NginxRecreated = ($up.ExitCode -eq 0)
     }
     else {
@@ -523,7 +525,12 @@ function Set-DeltaTlsState {
         # either. --no-deps keeps it to this one service.
         $result.Stage = 'nginx-recreate'
         Write-Step 'Recreating the NGINX container'
-        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $projectName -Arguments @('up', '-d', '--no-deps', 'nginx') -TimeoutSeconds 300
+        # The health wait below announces itself (-WhenIdle finds nothing
+        # running once this returns), so the two halves are consecutive
+        # activities rather than one - there is no gap between them.
+        $up = Invoke-DeltaActivity -Message 'Recreating the NGINX container' -ScriptBlock {
+            Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $projectName -Arguments @('up', '-d', '--no-deps', 'nginx') -TimeoutSeconds 300
+        }
         if ($up.ExitCode -ne 0) {
             Write-DeltaFailure "The NGINX container could not be recreated: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
             & $rollback

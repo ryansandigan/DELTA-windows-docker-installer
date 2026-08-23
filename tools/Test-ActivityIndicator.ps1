@@ -303,36 +303,79 @@ Assert-That  'and a second stop is harmless'            (-not (Test-DeltaActivit
 Assert-That  'with the line cleared by the first stop'  (Test-LineWasCleared -Text $afterFirstStop)
 Assert-Equal 'and the second writing nothing at all'    $afterFirstStop.Length (Get-SinkText -Sink $sink).Length
 
-Start-TestCase 'Two activities never share a line'
+Start-TestCase 'Two activities never share a line, and the outer one comes back'
 
-$first  = New-ActivitySink
-$second = New-ActivitySink
-Start-DeltaActivity -Message 'First operation' -Writer $first.Writer
+# Nesting, which is what an inner operation inside an outer one is. Only one
+# line is ever drawn: the inner one takes it over and hands it back.
+$outer = New-ActivitySink
+$inner = New-ActivitySink
+Start-DeltaActivity -Message 'Outer operation' -Writer $outer.Writer
 Start-Sleep -Milliseconds $Script:SettleMs
 
-# Read the first sink at the moment it is superseded, then again well after,
-# so "the replaced worker really stopped" is a measurement rather than a hope.
-Start-DeltaActivity -Message 'Second operation' -Writer $second.Writer
-$firstAtHandover = Get-SinkText -Sink $first
+# Read the outer sink at the moment the inner takes over, then again well
+# after, so "the outer worker really stopped drawing" is a measurement.
+Start-DeltaActivity -Message 'Inner operation' -Writer $inner.Writer
+$outerAtHandover = Get-SinkText -Sink $outer
+Assert-That  'starting an inner activity cleared the outer line' (Test-LineWasCleared -Text $outerAtHandover)
+Assert-That  'the outer animated while it owned the line'        ((Get-FrameCount -Text $outerAtHandover -Message 'Outer operation') -ge 1)
+
 Start-Sleep -Milliseconds $Script:SettleMs
+$outerWhileInner = Get-SinkText -Sink $outer
+Assert-Equal 'and drew nothing at all while the inner ran'       $outerAtHandover.Length $outerWhileInner.Length
+Assert-That  'while the inner animated'                          ((Get-FrameCount -Text (Get-SinkText -Sink $inner) -Message 'Inner operation') -ge 1)
+Assert-Equal 'with both activities in progress'                  2 (Get-DeltaActivityDepth)
+
+# The property the whole correction is about: finishing the inner operation
+# must not leave the outer one - which is still in progress - looking idle.
 Stop-DeltaActivity
+$innerText = Get-SinkText -Sink $inner
+$outerAtHandback = Get-SinkText -Sink $outer
+Assert-That  'the inner line was cleared when it ended'          (Test-LineWasCleared -Text $innerText)
+Assert-Equal 'the outer operation is in progress again'          1 (Get-DeltaActivityDepth)
+Assert-That  'and it is animating again'                         (Test-DeltaActivityAnimating)
+Assert-That  'having redrawn immediately, not on the next tick'  ($outerAtHandback.Length -gt $outerWhileInner.Length)
 
-$firstText  = Get-SinkText -Sink $first
-$secondText = Get-SinkText -Sink $second
-Assert-That  'starting a second activity cleared the first' (Test-LineWasCleared -Text $firstAtHandover)
-Assert-That  'the first animated while it owned the line'   ((Get-FrameCount -Text $firstAtHandover -Message 'First operation') -ge 1)
-Assert-Equal 'and drew nothing more after being replaced'   $firstAtHandover.Length $firstText.Length
-Assert-That  'the second animated'                          ((Get-FrameCount -Text $secondText -Message 'Second operation') -ge 1)
-Assert-That  'and the second was cleared on stop'           (Test-LineWasCleared -Text $secondText)
-Assert-That  'nothing is running at the end'                (-not (Test-DeltaActivityRunning))
+Start-Sleep -Milliseconds $Script:SettleMs
+$outerAfter = Get-SinkText -Sink $outer
+Assert-That  'and it keeps animating afterwards'                 ($outerAfter.Length -gt $outerAtHandback.Length)
 
-Start-TestCase 'Stop-DeltaLog is a backstop for an abandoned activity'
+Stop-DeltaActivity
+Assert-That  'stopping the outer ends everything'                (-not (Test-DeltaActivityRunning))
+Assert-That  'the outer line was cleared'                        (Test-LineWasCleared -Text (Get-SinkText -Sink $outer))
+Assert-That  'the outer never left its line'                     (Test-StayedOnOneLine -Text (Get-SinkText -Sink $outer))
+Assert-That  'and neither did the inner'                         (Test-StayedOnOneLine -Text $innerText)
+
+Start-TestCase 'A nested activity is cleaned up at every depth when the inner one throws'
+
+$outer = New-ActivitySink
+$inner = New-ActivitySink
+$caught = $null
+try {
+    $null = Invoke-DeltaActivity -Message 'Outer operation' -Writer $outer.Writer -ScriptBlock {
+        Start-Sleep -Milliseconds 100
+        $null = Invoke-DeltaActivity -Message 'Inner operation' -Writer $inner.Writer -ScriptBlock {
+            Start-Sleep -Milliseconds 100
+            throw 'the inner operation failed'
+        }
+    }
+}
+catch { $caught = $_ }
+
+Assert-That  'the exception propagated through both levels' ($null -ne $caught)
+Assert-Equal 'unaltered'                                    'the inner operation failed' $caught.Exception.Message
+Assert-Equal 'and no activity survives at any depth'        0 (Get-DeltaActivityDepth)
+Assert-That  'the inner line was cleared'                   (Test-LineWasCleared -Text (Get-SinkText -Sink $inner))
+Assert-That  'and so was the outer'                         (Test-LineWasCleared -Text (Get-SinkText -Sink $outer))
+
+Start-TestCase 'Stop-DeltaLog is a backstop for abandoned activities at every depth'
 
 $sink = New-ActivitySink
-Start-DeltaActivity -Message 'Abandoned' -Writer $sink.Writer
+Start-DeltaActivity -Message 'Abandoned outer' -Writer $sink.Writer
+Start-DeltaActivity -Message 'Abandoned inner' -Writer $sink.Writer
+Assert-Equal 'two activities were abandoned' 2 (Get-DeltaActivityDepth)
 Stop-DeltaLog -ExitCode 0
-Assert-That 'closing the transcript stops a stray animation' (-not (Test-DeltaActivityRunning))
-Assert-That 'and clears its line'                            (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+Assert-That 'closing the transcript stops every stray animation' (-not (Test-DeltaActivityRunning))
+Assert-That 'and clears the line'                                (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
 
 # --- concurrent output ------------------------------------------------------
 
@@ -367,15 +410,137 @@ $null = Invoke-DeltaActivity -Message 'Working' -Writer $sink.Writer -ScriptBloc
     Write-Detail 'something happened half-way through'
     Write-DeltaWarning 'and something else did too'
     Start-Sleep -Milliseconds $Script:SettleMs
-}
+} 6>$null
 $emitted = Get-SinkText -Sink $sink
 Assert-That 'the animation resumed after the interruption' ((Get-FrameCount -Text $emitted -Message 'Working') -ge 2)
 Assert-That 'the animated line never wrote a newline'      (Test-StayedOnOneLine -Text $emitted)
 Assert-That 'and finished cleared'                         (Test-LineWasCleared -Text $emitted)
 
+# --- the lifetime of a whole logical operation ------------------------------
+
+Start-TestCase 'A polling operation stays animated between its observations'
+
+# The shape of every wait in this installer, and the defect this suite exists
+# to prevent coming back: a loop that observes, prints occasionally, and SLEEPS.
+# The sleeps are the interval that used to look like a stopped terminal.
+$sink = New-ActivitySink
+$Script:Polls = 0
+$marks = New-Object 'System.Collections.Generic.List[int]'
+
+$outcome = Invoke-DeltaActivity -Message 'Waiting for delta to become healthy' -Writer $sink.Writer -ScriptBlock {
+    while ($Script:Polls -lt 4) {
+        $Script:Polls++
+        # What the loop has learnt so far, printed as a real status line.
+        if ($Script:Polls -eq 2) { Write-Detail "Waiting for delta (6 s; state running, health starting)" }
+        Start-Sleep -Milliseconds $Script:SettleMs
+        $null = $marks.Add((Get-SinkText -Sink $sink).Length)
+    }
+    return [PSCustomObject]@{ Succeeded = $true; ElapsedSeconds = 12 }
+} 6>$null
+
+$emitted = Get-SinkText -Sink $sink
+Assert-Equal 'the loop ran to completion'                    4 $Script:Polls
+Assert-That  'and its result reached the caller'             ($outcome.Succeeded -and $outcome.ElapsedSeconds -eq 12)
+Assert-That  'the line was still drawing after every sleep'  (($marks[0] -lt $marks[1]) -and ($marks[1] -lt $marks[2]) -and ($marks[2] -lt $marks[3]))
+Assert-That  'including the sleep after the status line'     ($marks[1] -lt $marks[2])
+Assert-That  'it never left its line'                        (Test-StayedOnOneLine -Text $emitted)
+Assert-That  'and finished cleared'                          (Test-LineWasCleared -Text $emitted)
+Assert-That  'with nothing left in progress'                 (-not (Test-DeltaActivityRunning))
+
+Start-TestCase 'An intermediate status line suspends the animation and never ends it'
+
+$sink = New-ActivitySink
+$Script:AnimatingDuringWrite = $null
+$null = Invoke-DeltaActivity -Message 'Working' -Writer $sink.Writer -ScriptBlock {
+    Start-Sleep -Milliseconds 100
+    # Write-Host is stubbed for the length of this call so the check runs at
+    # the instant the status text would be reaching the terminal - which is the
+    # instant at which a frame must not be able to interleave with it.
+    function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$Rest, $ForegroundColor)
+        $Script:AnimatingDuringWrite = Test-DeltaActivityAnimating
+    }
+    Write-Detail 'a status line'
+} 6>$null
+
+Assert-Equal 'nothing is animating while the status is written' $false $Script:AnimatingDuringWrite
+Assert-That  'and the activity was still in progress after it'  ((Get-FrameCount -Text (Get-SinkText -Sink $sink) -Message 'Working') -ge 1)
+
+# --- operations that are part of something larger ---------------------------
+
+Start-TestCase '-WhenIdle announces an operation reached on its own'
+
+$sink = New-ActivitySink
+$null = Invoke-DeltaActivity -Message 'Waiting for the Docker engine' -WhenIdle -Writer $sink.Writer -ScriptBlock {
+    Start-Sleep -Milliseconds $Script:SettleMs
+}
+Assert-That 'it animated, because nothing else was'    ((Get-FrameCount -Text (Get-SinkText -Sink $sink) -Message 'Waiting for the Docker engine') -ge 1)
+Assert-That 'and cleaned up after itself'              (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+
+Start-TestCase '-WhenIdle runs under the operation that is already in progress'
+
+$outerSink = New-ActivitySink
+$innerSink = New-ActivitySink
+$Script:InnerRan = 0
+
+$result = Invoke-DeltaActivity -Message 'Starting DELTA' -Writer $outerSink.Writer -ScriptBlock {
+    Start-Sleep -Milliseconds $Script:SettleMs
+    $depthOutside = Get-DeltaActivityDepth
+    $inner = Invoke-DeltaActivity -Message 'Waiting for delta to become healthy' -WhenIdle -Writer $innerSink.Writer -ScriptBlock {
+        $Script:InnerRan++
+        Start-Sleep -Milliseconds $Script:SettleMs
+        return "depth $((Get-DeltaActivityDepth)) inside"
+    }
+    return "$inner, $depthOutside outside"
+}
+
+$outerText = Get-SinkText -Sink $outerSink
+Assert-Equal 'the inner operation ran exactly once'              1 $Script:InnerRan
+Assert-Equal 'its result reached the caller'                     'depth 1 inside, 1 outside' $result
+Assert-Equal 'it started no activity of its own'                 0 (Get-SinkText -Sink $innerSink).Length
+Assert-That  'the outer message never left the screen'           ((Get-FrameCount -Text $outerText -Message 'Starting DELTA') -ge 2)
+Assert-That  'and the outer kept drawing throughout'             ((Get-FrameCount -Text $outerText -Message 'Starting DELTA') -ge 4)
+Assert-That  'on one line'                                       (Test-StayedOnOneLine -Text $outerText)
+Assert-That  'cleared at the end'                                (Test-LineWasCleared -Text $outerText)
+
+Start-TestCase 'The Start/try/finally form covers a sequence with early returns'
+
+# The form the stack call sites use: one activity across `compose up` AND the
+# health wait, where the failure branches return from the calling function.
+function Invoke-SequenceThatReturnsEarly {
+    param([Parameter(Mandatory)][object]$Sink, [Parameter(Mandatory)][bool]$Fail)
+
+    $up = $null
+    $health = $null
+    Start-DeltaActivity -Message 'Starting DELTA' -Writer $Sink.Writer
+    try {
+        Start-Sleep -Milliseconds 100
+        $up = [PSCustomObject]@{ ExitCode = $(if ($Fail) { 1 } else { 0 }) }
+        if ($up.ExitCode -eq 0) {
+            Start-Sleep -Milliseconds $Script:SettleMs
+            $health = [PSCustomObject]@{ Succeeded = $true }
+        }
+    }
+    finally { Stop-DeltaActivity }
+
+    if ($up.ExitCode -ne 0) { return 'compose failed' }
+    if (-not $health.Succeeded) { return 'unhealthy' }
+    return 'started'
+}
+
+$sink = New-ActivitySink
+Assert-Equal 'the whole sequence ran under one activity' 'started' (Invoke-SequenceThatReturnsEarly -Sink $sink -Fail $false)
+Assert-That  'which animated across both halves'         ((Get-FrameCount -Text (Get-SinkText -Sink $sink) -Message 'Starting DELTA') -ge 2)
+Assert-That  'and was cleaned up'                        (-not (Test-DeltaActivityRunning))
+Assert-That  'leaving a cleared line'                    (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+
+$sink = New-ActivitySink
+Assert-Equal 'an early return still leaves the function' 'compose failed' (Invoke-SequenceThatReturnsEarly -Sink $sink -Fail $true)
+Assert-That  'with no activity left running'             (-not (Test-DeltaActivityRunning))
+Assert-That  'and a cleared line'                        (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+
 # --- prompts ----------------------------------------------------------------
 
-Start-TestCase 'No animation is ever running while a prompt waits for input'
+Start-TestCase 'No animation is ever drawing while a prompt waits for input'
 
 # Read-Host cannot be driven from here, so each reader is called from a wrapper
 # that defines its own Read-Host - the same technique the install-root suite
@@ -386,10 +551,17 @@ Start-TestCase 'No animation is ever running while a prompt waits for input'
 # scriptblock, because a scriptblock invoked with & runs against the scope it
 # was WRITTEN in, which would put the stand-in out of reach and quietly test
 # nothing at all.
+#
+# Two different questions are recorded at the prompt, and the difference is the
+# point. Nothing may be DRAWING - that is the rule. But the operation the
+# question was asked from is still in progress, and stays in progress, so that
+# it can carry on animating once the answer is in.
+$Script:AnimatingAtPrompt = $null
 $Script:RunningAtPrompt = $null
 $Script:PromptCount = 0
 
 function Start-PromptFixture {
+    $Script:AnimatingAtPrompt = $null
     $Script:RunningAtPrompt = $null
     $Script:PromptCount = 0
     $sink = New-ActivitySink
@@ -403,11 +575,14 @@ function Invoke-InlineConfirmationWithLiveActivity {
     function Read-Host {
         param([string]$Prompt, [switch]$AsSecureString)
         $Script:PromptCount++
+        $Script:AnimatingAtPrompt = Test-DeltaActivityAnimating
         $Script:RunningAtPrompt = Test-DeltaActivityRunning
+        # Read at the instant the question is on screen, not afterwards: by the
+        # time the reader returns the activity has legitimately resumed.
+        $Script:SinkAtPrompt = Get-SinkText -Sink $Sink
         return 'n'
     }
-    try { $null = Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]' }
-    finally { Stop-DeltaActivity }
+    $null = Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]'
 }
 
 function Invoke-DefaultYesAnswerWithLiveActivity {
@@ -415,11 +590,14 @@ function Invoke-DefaultYesAnswerWithLiveActivity {
     function Read-Host {
         param([string]$Prompt, [switch]$AsSecureString)
         $Script:PromptCount++
+        $Script:AnimatingAtPrompt = Test-DeltaActivityAnimating
         $Script:RunningAtPrompt = Test-DeltaActivityRunning
+        # Read at the instant the question is on screen, not afterwards: by the
+        # time the reader returns the activity has legitimately resumed.
+        $Script:SinkAtPrompt = Get-SinkText -Sink $Sink
         return 'n'
     }
-    try { $null = Read-DeltaDefaultYesAnswer -Prompt 'Use C:\DELTA? [Y/n]' }
-    finally { Stop-DeltaActivity }
+    $null = Read-DeltaDefaultYesAnswer -Prompt 'Use C:\DELTA? [Y/n]'
 }
 
 function Invoke-YesNoConfirmationWithLiveActivity {
@@ -427,30 +605,44 @@ function Invoke-YesNoConfirmationWithLiveActivity {
     function Read-Host {
         param([string]$Prompt, [switch]$AsSecureString)
         $Script:PromptCount++
+        $Script:AnimatingAtPrompt = Test-DeltaActivityAnimating
         $Script:RunningAtPrompt = Test-DeltaActivityRunning
+        # Read at the instant the question is on screen, not afterwards: by the
+        # time the reader returns the activity has legitimately resumed.
+        $Script:SinkAtPrompt = Get-SinkText -Sink $Sink
         return 'n'
     }
-    try { $null = Read-DeltaYesNoConfirmation -Body { Write-Host 'Accept the licence?' } 6>$null }
-    finally { Stop-DeltaActivity }
+    # A body that writes through the output helpers, because those suspend and
+    # resume - and if suspension did not count, the resume inside the body
+    # would restart the animation with the question still on screen.
+    $null = Read-DeltaYesNoConfirmation -Body {
+        Write-Detail 'A detail line inside the question.'
+        Write-Host 'Accept the licence?'
+    } 6>$null
 }
 
-$sink = Start-PromptFixture
-Invoke-InlineConfirmationWithLiveActivity -Sink $sink
-Assert-Equal 'Read-DeltaInlineConfirmation reached its prompt' 1 $Script:PromptCount
-Assert-Equal 'with no animation running'                       $false $Script:RunningAtPrompt
-Assert-That  'and the animated line already erased'            (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+foreach ($case in @(
+    @{ Name = 'Read-DeltaInlineConfirmation'; Invoke = 'Invoke-InlineConfirmationWithLiveActivity' }
+    @{ Name = 'Read-DeltaDefaultYesAnswer';   Invoke = 'Invoke-DefaultYesAnswerWithLiveActivity'   }
+    @{ Name = 'Read-DeltaYesNoConfirmation';  Invoke = 'Invoke-YesNoConfirmationWithLiveActivity'  }
+)) {
+    $sink = Start-PromptFixture
+    & $case.Invoke -Sink $sink
 
-$sink = Start-PromptFixture
-Invoke-DefaultYesAnswerWithLiveActivity -Sink $sink
-Assert-Equal 'Read-DeltaDefaultYesAnswer reached its prompt'   1 $Script:PromptCount
-Assert-Equal 'with no animation running'                       $false $Script:RunningAtPrompt
-Assert-That  'and the animated line already erased'            (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+    Assert-Equal "$($case.Name) reached its prompt"      1 $Script:PromptCount
+    Assert-Equal 'with nothing animating'                $false $Script:AnimatingAtPrompt
+    Assert-Equal 'the operation still in progress'       $true $Script:RunningAtPrompt
+    Assert-That  'and the animated line already erased'  (Test-LineWasCleared -Text $Script:SinkAtPrompt)
 
-$sink = Start-PromptFixture
-Invoke-YesNoConfirmationWithLiveActivity -Sink $sink
-Assert-Equal 'Read-DeltaYesNoConfirmation reached its prompt'  1 $Script:PromptCount
-Assert-Equal 'with no animation running'                       $false $Script:RunningAtPrompt
-Assert-That  'and the animated line already erased'            (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+    # And the other half of the rule: the answer is in, the operation is still
+    # running, so it says so again.
+    Assert-That 'the activity resumes once the answer is in' (Test-DeltaActivityAnimating)
+    Start-Sleep -Milliseconds $Script:SettleMs
+    Assert-That 'and draws again'                            ((Get-SinkText -Sink $sink).Length -gt $Script:SinkAtPrompt.Length)
+
+    Stop-DeltaActivity
+    Assert-That 'the whole exchange stayed on one line'      (Test-StayedOnOneLine -Text (Get-SinkText -Sink $sink))
+}
 
 # --- non-interactive / redirected -------------------------------------------
 
@@ -473,6 +665,27 @@ Assert-That  'with no carriage return in it'                   ($emittedHost[0] 
 Assert-That  'no backspace in it'                              ($emittedHost[0] -notmatch "`b")
 Assert-That  'and no escape sequence in it'                    ($emittedHost[0] -notmatch "$([char]27)")
 Assert-That  'no activity is left running'                     (-not (Test-DeltaActivityRunning))
+
+Start-TestCase 'Nested operations stay static and clean with animation turned off'
+
+$sink = New-ActivitySink
+$emittedHost = @(Invoke-DeltaActivity -Message 'Starting DELTA' -Writer $sink.Writer -ScriptBlock {
+    $null = Invoke-DeltaActivity -Message 'An inner operation' -Writer $sink.Writer -ScriptBlock {
+        Start-Sleep -Milliseconds 50
+    }
+    # And an operation that is part of the one already in progress says nothing
+    # extra in a log, exactly as it draws nothing extra on a console.
+    $null = Invoke-DeltaActivity -Message 'Waiting for delta to become healthy' -WhenIdle -Writer $sink.Writer -ScriptBlock {
+        Start-Sleep -Milliseconds 50
+    }
+} 6>&1 | ForEach-Object { [string]$_ })
+
+Assert-Equal 'nothing at all was drawn to the terminal writer'  0 (Get-SinkText -Sink $sink).Length
+Assert-Equal 'one static line per announced operation'          2 $emittedHost.Count
+Assert-Equal 'the outer one first'                              '    Starting DELTA...' $emittedHost[0]
+Assert-Equal 'then the inner one'                               '    An inner operation...' $emittedHost[1]
+Assert-That  'with no control characters anywhere'              (-not ($emittedHost | Where-Object { $_ -match "[`r`b$([char]27)]" }))
+Assert-That  'and nothing left in progress'                     (-not (Test-DeltaActivityRunning))
 
 Set-DeltaActivityMode -Mode 'auto'
 

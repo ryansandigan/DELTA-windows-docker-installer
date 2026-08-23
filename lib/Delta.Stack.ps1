@@ -808,6 +808,18 @@ function Wait-DeltaServiceHealthy {
       Waits for one service to report healthy. A container that has exited is
       reported immediately rather than waited on to the end of the budget - the
       interesting failure is almost always visible in its logs within seconds.
+
+      This is a waiting operation like any other, and it says so for its whole
+      duration. The elapsed-time line every fifteen seconds is what it has
+      OBSERVED; the indicator is that it is still looking. The two are not
+      alternatives - without the indicator, this function's own three-second
+      sleeps are up to fifteen seconds of terminal that looks stopped, which is
+      exactly what it looks like when Docker has died.
+
+      -WhenIdle because a health wait is normally part of a larger operation
+      ("Starting DELTA" is `compose up` AND this). Inside one, this runs under
+      that operation's message; reached on its own - from the update flow, from
+      a management action - it announces itself.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -816,36 +828,38 @@ function Wait-DeltaServiceHealthy {
         [int]$TimeoutSeconds = 120
     )
 
-    $started = Get-Date
-    $deadline = $started.AddSeconds($TimeoutSeconds)
-    $lastReport = $started
-    $last = $null
+    return (Invoke-DeltaActivity -Message "Waiting for $Service to become healthy" -WhenIdle -ScriptBlock {
+        $started = Get-Date
+        $deadline = $started.AddSeconds($TimeoutSeconds)
+        $lastReport = $started
+        $last = $null
 
-    while ((Get-Date) -lt $deadline) {
-        $status = Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $ProjectName
-        $last = $status | Where-Object { $_.Service -eq $Service } | Select-Object -First 1
+        while ((Get-Date) -lt $deadline) {
+            $status = Get-DeltaComposeServiceStatus -InstallRoot $InstallRoot -ProjectName $ProjectName
+            $last = $status | Where-Object { $_.Service -eq $Service } | Select-Object -First 1
 
-        if ($last) {
-            if ($last.Health -eq 'healthy') {
+            if ($last) {
+                if ($last.Health -eq 'healthy') {
+                    $elapsed = [int]((Get-Date) - $started).TotalSeconds
+                    Write-Detail "[ ok ]     $Service healthy after $elapsed s"
+                    return [PSCustomObject]@{ Succeeded = $true; Status = $last; ElapsedSeconds = $elapsed }
+                }
+                if ($last.State -eq 'exited' -or $last.State -eq 'dead') {
+                    return [PSCustomObject]@{ Succeeded = $false; Status = $last; ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds }
+                }
+            }
+
+            if (((Get-Date) - $lastReport).TotalSeconds -ge 15) {
+                $lastReport = Get-Date
                 $elapsed = [int]((Get-Date) - $started).TotalSeconds
-                Write-Detail "[ ok ]     $Service healthy after $elapsed s"
-                return [PSCustomObject]@{ Succeeded = $true; Status = $last; ElapsedSeconds = $elapsed }
+                $where = if ($last) { "state $($last.State), health $($last.Health)" } else { 'container not created yet' }
+                Write-Detail "Waiting for $Service ($elapsed s; $where)"
             }
-            if ($last.State -eq 'exited' -or $last.State -eq 'dead') {
-                return [PSCustomObject]@{ Succeeded = $false; Status = $last; ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds }
-            }
+            Start-Sleep -Seconds 3
         }
 
-        if (((Get-Date) - $lastReport).TotalSeconds -ge 15) {
-            $lastReport = Get-Date
-            $elapsed = [int]((Get-Date) - $started).TotalSeconds
-            $where = if ($last) { "state $($last.State), health $($last.Health)" } else { 'container not created yet' }
-            Write-Detail "Waiting for $Service ($elapsed s; $where)"
-        }
-        Start-Sleep -Seconds 3
-    }
-
-    return [PSCustomObject]@{ Succeeded = $false; Status = $last; ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds }
+        return [PSCustomObject]@{ Succeeded = $false; Status = $last; ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds }
+    })
 }
 
 function Show-DeltaServiceLogs {
@@ -860,7 +874,12 @@ function Show-DeltaServiceLogs {
         [int]$Tail = 40
     )
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('logs', '--no-color', '--tail', "$Tail", $Service) -TimeoutSeconds 120
+    # Fetching the log is a wait; printing it is output. Only the fetch is
+    # wrapped - this runs straight after a failure, which is the worst moment
+    # to leave the operator looking at a terminal that has stopped.
+    $capture = Invoke-DeltaActivity -Message "Reading the $Service log" -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('logs', '--no-color', '--tail', "$Tail", $Service) -TimeoutSeconds 120
+    }
     $text = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
     if (-not $text) { return }
 
@@ -1145,6 +1164,23 @@ function Get-DeltaDatabaseFacts {
         [Parameter(Mandatory)][object]$Configuration
     )
 
+    return (Invoke-DeltaActivity -Message 'Reading the database version and extensions' -WhenIdle -ScriptBlock {
+        Get-DeltaDatabaseFactsCore -InstallRoot $InstallRoot -Configuration $Configuration
+    })
+}
+
+function Get-DeltaDatabaseFactsCore {
+    <#
+      The three queries themselves. Separated from the activity wrapper above
+      only so the wrapper stays one line: three `docker compose exec psql`
+      round trips are several seconds of silence, and the operator is waiting
+      for them like anything else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
     $facts = [PSCustomObject]@{
         ServerVersion  = $null
         PostgresMajor  = $null
@@ -1204,6 +1240,13 @@ function Test-DeltaMigrationOutcome {
         Reason        = $null
     }
 
+    # The log read and the two queries below are three container round trips
+    # with nothing on screen between them. Wrapped as one operation because
+    # that is what it is: the operator is waiting for the verification, not for
+    # `compose logs`. Nothing inside returns from this function, so the
+    # scriptblock form is safe here.
+    $null = Invoke-DeltaActivity -Message 'Verifying database initialisation' -WhenIdle -ScriptBlock {
+
     $logs = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('logs', '--no-color', 'delta') -TimeoutSeconds 120
     $logText = (($logs.StdOut + "`n" + $logs.StdErr))
     $logLines = @($logText -split "`r?`n")
@@ -1239,6 +1282,8 @@ function Test-DeltaMigrationOutcome {
     $tables = Invoke-DeltaPsql -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -User $Configuration.PostgresUser -Database $Configuration.PostgresDb -Query 'select count(*) from pg_tables where schemaname = ''public'';' -TuplesOnly
     if ($tables.ExitCode -eq 0 -and $tables.StdOut) {
         $result.TableCount = ($tables.StdOut -split "`r?`n" | Select-Object -First 1).Trim()
+    }
+
     }
 
     if (-not $result.Branch) {
@@ -1299,6 +1344,11 @@ function Test-DeltaHttpEndpoint {
     $previousProtocol = [System.Net.ServicePointManager]::SecurityProtocol
     $captured = $null
 
+    # A request that is going to time out takes the whole budget - up to sixty
+    # seconds - to say so, and a stack that has just started is exactly when
+    # that happens. -WhenIdle: inside a larger operation this is part of it.
+    return (Invoke-DeltaActivity -Message 'Waiting for an answer over HTTP' -WhenIdle -ScriptBlock {
+
     try {
         if ($isHttps) {
             [System.Net.ServicePointManager]::SecurityProtocol =
@@ -1355,6 +1405,8 @@ function Test-DeltaHttpEndpoint {
 
     $result.Succeeded = ($result.StatusCode -ge 200 -and $result.StatusCode -lt 400)
     return $result
+
+    })
 }
 
 # ---------------------------------------------------------------------------
@@ -1396,20 +1448,33 @@ function Start-DeltaStack {
 
     # --- db ---------------------------------------------------------------
     Write-Step 'Starting PostgreSQL'
-    # `compose up -d` only, not the health wait that follows it.
-    # Wait-DeltaServiceHealthy reports elapsed seconds and the state it is
-    # seeing, which is information an animation would replace with less; the
-    # container creation in front of it says nothing at all, which is what the
-    # indicator is for. Same everywhere below.
-    $up = Invoke-DeltaActivity -Message 'Starting PostgreSQL' -ScriptBlock {
-        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'db') -TimeoutSeconds 600
+    # ONE activity for the whole logical operation, not for the `compose up`
+    # inside it. `up -d` returns as soon as the container is created, which is
+    # a second or two; everything the operator is actually waiting for happens
+    # in the health wait after it. An indicator that stopped when Compose
+    # returned would go quiet at the exact moment the wait began. Same shape
+    # for the two services below.
+    #
+    # Start/try/finally rather than Invoke-DeltaActivity because the failure
+    # branches return from THIS function: moving them into a scriptblock would
+    # make those returns leave the scriptblock instead, and the stage would
+    # carry on as though nothing had failed.
+    $up = $null
+    $health = $null
+    Start-DeltaActivity -Message 'Starting PostgreSQL'
+    try {
+        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'db') -TimeoutSeconds 600
+        if ($up.ExitCode -eq 0) {
+            $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'db' -TimeoutSeconds $Script:DeltaDbHealthTimeoutSeconds
+        }
     }
+    finally { Stop-DeltaActivity }
+
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting the database container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result
     }
 
-    $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'db' -TimeoutSeconds $Script:DeltaDbHealthTimeoutSeconds
     if (-not $health.Succeeded) {
         Write-DeltaFailure ''
         Write-DeltaFailure "PostgreSQL did not become healthy within $Script:DeltaDbHealthTimeoutSeconds seconds."
@@ -1431,15 +1496,25 @@ function Start-DeltaStack {
     Write-Step 'Starting DELTA'
     Write-Detail 'The container initialises or migrates its own schema on start; a cold first start takes around 90 seconds.'
 
-    $up = Invoke-DeltaActivity -Message 'Starting DELTA' -ScriptBlock {
-        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'delta') -TimeoutSeconds 900
+    # The cold start this step just warned about is the health wait, not the
+    # `up`. This is the one place in the installer where the terminal used to
+    # sit still for ninety seconds.
+    $up = $null
+    $health = $null
+    Start-DeltaActivity -Message 'Starting DELTA'
+    try {
+        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'delta') -TimeoutSeconds 900
+        if ($up.ExitCode -eq 0) {
+            $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'delta' -TimeoutSeconds $Script:DeltaAppHealthTimeoutSeconds
+        }
     }
+    finally { Stop-DeltaActivity }
+
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting the DELTA container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result
     }
 
-    $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'delta' -TimeoutSeconds $Script:DeltaAppHealthTimeoutSeconds
     if (-not $health.Succeeded) {
         Write-DeltaFailure ''
         Write-DeltaFailure "DELTA did not become healthy within $Script:DeltaAppHealthTimeoutSeconds seconds."
@@ -1501,15 +1576,22 @@ function Start-DeltaStack {
     # --- nginx ------------------------------------------------------------
     $result.Stage = 'nginx'
     Write-Step 'Starting NGINX'
-    $up = Invoke-DeltaActivity -Message 'Starting NGINX' -ScriptBlock {
-        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'nginx') -TimeoutSeconds 600
+    $up = $null
+    $health = $null
+    Start-DeltaActivity -Message 'Starting NGINX'
+    try {
+        $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @('up', '-d', 'nginx') -TimeoutSeconds 600
+        if ($up.ExitCode -eq 0) {
+            $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'nginx' -TimeoutSeconds $Script:DeltaNginxHealthTimeoutSeconds
+        }
     }
+    finally { Stop-DeltaActivity }
+
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Starting NGINX failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result
     }
 
-    $health = Wait-DeltaServiceHealthy -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Service 'nginx' -TimeoutSeconds $Script:DeltaNginxHealthTimeoutSeconds
     if (-not $health.Succeeded) {
         Write-DeltaFailure ''
         Write-DeltaFailure "NGINX did not become healthy within $Script:DeltaNginxHealthTimeoutSeconds seconds."

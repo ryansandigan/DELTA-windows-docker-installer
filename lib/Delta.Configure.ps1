@@ -411,9 +411,11 @@ done
 if [ -n "$(printenv SMTP_PASS 2>/dev/null || true)" ]; then echo "SMTP_PASS=<set>"; else echo "SMTP_PASS=<unset>"; fi
 '@
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
-        'exec', '-T', 'delta', 'sh', '-c', $script
-    ) -TimeoutSeconds 120
+    $capture = Invoke-DeltaActivity -Message 'Reading the delta container environment' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
+            'exec', '-T', 'delta', 'sh', '-c', $script
+        ) -TimeoutSeconds 120
+    }
 
     if ($capture.ExitCode -ne 0) {
         $result.Reason = "The delta container's environment could not be read: $((($capture.StdErr + ' ' + $capture.StdOut)).Trim())"
@@ -782,9 +784,13 @@ function Update-DeltaApplicationContainer {
         return $result
     }
 
-    $up = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-        'up', '-d', '--no-deps', 'delta'
-    ) -TimeoutSeconds 900
+    # The health wait below announces itself once this returns, so the pair is
+    # continuous: container recreation, then waiting for it to come up.
+    $up = Invoke-DeltaActivity -Message 'Recreating the DELTA application container' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+            'up', '-d', '--no-deps', 'delta'
+        ) -TimeoutSeconds 900
+    }
     if ($up.ExitCode -ne 0) {
         $result.Reason = "Recreating the DELTA container failed: $((($up.StdErr + ' ' + $up.StdOut)).Trim())"
         return $result

@@ -248,6 +248,11 @@ function Get-DeltaUninstallSurvey {
         [bool]$DockerAvailable = $true
     )
 
+    # Four Docker queries and a recursive walk of uploads\, which on a real
+    # installation is where the gigabytes are. -WhenIdle: the uninstall
+    # announces its own steps, and this runs inside them.
+    return (Invoke-DeltaActivity -Message 'Surveying what is still installed' -WhenIdle -ScriptBlock {
+
     $survey = [PSCustomObject]@{
         DockerAvailable = $DockerAvailable
         Containers      = @()
@@ -322,6 +327,8 @@ function Get-DeltaUninstallSurvey {
     $survey.Files = $files.ToArray()
 
     return $survey
+
+    })
 }
 
 # ---------------------------------------------------------------------------
@@ -695,7 +702,9 @@ function Stop-DeltaRuntimeForBackup {
         return
     }
 
-    $stop = Invoke-DeltaCompose -InstallRoot $Target.InstallRoot -ProjectName $Target.ProjectName -Arguments @('stop') -TimeoutSeconds 300
+    $stop = Invoke-DeltaActivity -Message 'Stopping the containers' -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $Target.InstallRoot -ProjectName $Target.ProjectName -Arguments @('stop') -TimeoutSeconds 300
+    }
     if ($stop.ExitCode -ne 0) {
         Stop-Setup "The DELTA containers could not be stopped: $((($stop.StdErr + ' ' + $stop.StdOut)).Trim())`nNothing was archived and nothing was deleted."
     }
@@ -874,8 +883,13 @@ function Invoke-DeltaComposeDown {
         }
     }
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName `
-        -Arguments (@('down') + $Arguments) -TimeoutSeconds $TimeoutSeconds
+    # Every container's shutdown, then the network. Minutes on a busy host, and
+    # silent throughout. -WhenIdle so a caller that has already announced a
+    # larger removal keeps its own message.
+    $capture = Invoke-DeltaActivity -Message 'Removing the containers and the project network' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName `
+            -Arguments (@('down') + $Arguments) -TimeoutSeconds $TimeoutSeconds
+    }
     return ([PSCustomObject]@{ ExitCode = $capture.ExitCode; StdOut = $capture.StdOut; StdErr = $capture.StdErr; Refused = $false })
 }
 
@@ -1042,7 +1056,11 @@ function Remove-DeltaDataVolume {
         return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Already absent' -Detail $null)
     }
 
-    $remove = Invoke-DeltaDockerCommand -Arguments @('volume', 'rm', $Target.PgDataVolume) -TimeoutSeconds 120
+    # Deleting a data directory the size of the database. Docker returns when
+    # the files are gone, not before.
+    $remove = Invoke-DeltaActivity -Message "Removing the $($Target.PgDataVolume) volume" -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @('volume', 'rm', $Target.PgDataVolume) -TimeoutSeconds 120
+    }
     if ($remove.ExitCode -ne 0) {
         return (New-DeltaUninstallStep -Resource $Target.PgDataVolume -Kind 'volume' -Outcome 'Failed' `
             -Detail (($remove.StdErr + ' ' + $remove.StdOut)).Trim())
@@ -1084,7 +1102,10 @@ function Remove-DeltaInstallationTree {
     }
 
     try {
-        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        # An installation with real uploads is a recursive delete of gigabytes.
+        Invoke-DeltaActivity -Message 'Deleting the installation directory' -WhenIdle -ScriptBlock {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        }
     }
     catch {
         return (New-DeltaUninstallStep -Resource $path -Kind 'file' -Outcome 'Failed' -Detail $_.Exception.Message)
