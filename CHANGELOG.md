@@ -4,6 +4,13 @@ All notable changes to the DELTA Windows Docker Installer will be documented in 
 
 ## [Unreleased]
 
+### Fixed
+
+- The Docker Desktop licensing disclosure is no longer shown twice. It used to be presented before the WSL platform was checked, so a host that needed WSL accepted the licence, installed WSL, was told to restart, and was asked to accept the same licence again on the way back. Backend prerequisites are now satisfied first, and the disclosure appears only when an installation is genuinely about to be attempted in that same run.
+- Docker Desktop is no longer reported missing because the current PowerShell process cannot see it. "Docker Desktop is installed", "the `docker` command resolves here", "the engine is running" and "the engine is ready for Linux containers" are now measured as four separate facts: installation is read from the Windows registration (per machine *and* per user) and from Docker's own program directories, and the process PATH is repaired from the discovered install location before the CLI is judged absent. A stale PATH, a stopped engine, or an engine that is still starting can no longer trigger a second installation or a second licence prompt.
+- An installation whose files are present but whose `docker.exe` cannot be found is now reported, with the three ways to resolve it, instead of being reinstalled over.
+- A successful Docker Desktop installation no longer forces a restart unconditionally. The run continues to engine readiness when Docker's own installer did not ask for one, and stops cleanly for a restart when it did.
+
 ### Changed
 
 - A new interactive installation now asks where to install rather than assuming `C:\DELTA` silently: `Use C:\DELTA as the installation directory? [Y/n]`. Enter accepts the default; declining opens a Windows folder-selection dialog — the same picker convention the certificate questions use, so no filesystem path is ever typed at a prompt. Cancelling the dialog returns to the question instead of cancelling the installation, and a directory that fails validation is refused with its reason and asked again.

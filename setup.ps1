@@ -345,7 +345,21 @@ function Show-DeltaRuntimeOutcome {
         }
         default {
             Write-Detail 'Installation cannot continue until the problem reported above is resolved.'
-            Write-Detail 'Nothing was installed or changed.'
+            # Only claimed when it is true. A run that installed Docker Desktop
+            # and then found the engine unusable has changed this machine, and
+            # telling the operator otherwise invites them to "start again" -
+            # which is how a second Docker installation gets attempted over the
+            # first.
+            if ($Runtime.PSObject.Properties.Name -contains 'DockerInstallAttempted' -and $Runtime.DockerInstallAttempted) {
+                Write-Detail 'Docker Desktop was installed by this run. Rerunning setup.ps1 detects it and does not'
+                Write-Detail 'install it again or ask you to accept the licence again.'
+            }
+            elseif ($Runtime.PSObject.Properties.Name -contains 'WslInstalled' -and $Runtime.WslInstalled) {
+                Write-Detail 'The WSL platform was installed by this run. Nothing about Docker was changed.'
+            }
+            else {
+                Write-Detail 'Nothing was installed or changed.'
+            }
             return $Script:DeltaExitPrerequisiteFailed
         }
     }

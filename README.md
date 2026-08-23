@@ -1872,3 +1872,17 @@ offline on a machine that already has Docker and never executes an installer:
 ```powershell
 .\tools\Test-DockerInstallerAcquisition.ps1
 ```
+
+`tools\Test-RuntimeSequencing.ps1` covers the order the runtime stage does
+things in, and the Docker detection that order depends on: a prerequisite that
+needs a restart must stop the run before any Docker prompt or download, the
+licensing disclosure must appear exactly once and only when an installation is
+about to be attempted in that same run, and Docker Desktop installed / CLI
+visible / engine ready must stay three separate facts. Every host probe is a
+scripted stand-in, so all six scenarios — clean machine, resume after restart,
+Docker already installed, stale PATH, engine still starting, and a plain rerun —
+run offline and change nothing:
+
+```powershell
+.\tools\Test-RuntimeSequencing.ps1
+```

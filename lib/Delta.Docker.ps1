@@ -69,6 +69,34 @@ $Script:DeltaDiskWarningGb = 25
 # A§5.4 / A§22: `docker desktop start --timeout 300`.
 $Script:DeltaEngineStartTimeoutSeconds = 300
 
+# Where Windows records that Docker Desktop is installed. Read - never written -
+# so that "is Docker Desktop on this machine" can be answered without asking the
+# current process's PATH, which is the one thing about a freshly installed
+# application that is reliably stale.
+#
+# HKCU is in the list because Docker Desktop installs per user on this class of
+# host: the assessment machine has no com.docker.service and no machine-wide
+# registration at all, and a detector that only read HKLM would call that host
+# "Docker absent" and offer to install it again.
+$Script:DeltaDockerDesktopUninstallKeys = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+
+# The DisplayName Docker Desktop registers under. Anchored, for the same reason
+# the signer pattern is: "Docker Desktop Feedback Tool" is not Docker Desktop.
+$Script:DeltaDockerDesktopDisplayNamePattern = '^Docker Desktop$'
+
+# The two roots Docker Desktop actually installs into - per machine and per
+# user - and the bin directory inside each that holds docker.exe. Probed when
+# the registry says nothing, because a repaired or relocated installation is
+# still an installation.
+$Script:DeltaDockerDesktopProgramRoots = @(
+    'Docker\Docker'
+    'Programs\DockerDesktop'
+)
+
 # ---------------------------------------------------------------------------
 # Process seams
 #
@@ -1488,8 +1516,13 @@ function Initialize-DeltaDockerPath {
       per user - are probed, and the first one that holds docker.exe is
       prepended to this process's PATH only. The operator's environment is
       never modified.
+
+      -SearchPath is tried before the built-in candidates, so a caller that has
+      already located the installation - Get-DeltaDockerPresence reads it out of
+      the registry - does not have to hope the standard directories are the ones
+      this host used.
     #>
-    param()
+    param([string[]]$SearchPath)
 
     $result = [PSCustomObject]@{ Resolved = $false; Path = $null; Repaired = $false }
 
@@ -1501,6 +1534,7 @@ function Initialize-DeltaDockerPath {
     }
 
     $candidates = @(
+        $SearchPath
         (Join-Path -Path "$env:ProgramFiles"   -ChildPath 'Docker\Docker\resources\bin')
         (Join-Path -Path "$env:LOCALAPPDATA"   -ChildPath 'Programs\DockerDesktop\resources\bin')
         (Join-Path -Path "$env:ProgramData"    -ChildPath 'DockerDesktop\version-bin')
@@ -1519,6 +1553,199 @@ function Initialize-DeltaDockerPath {
     }
 
     return $result
+}
+
+function Get-DeltaDockerDesktopInstallState {
+    <#
+      Whether Docker Desktop is INSTALLED on this host - which is a different
+      question from whether `docker` resolves in this process, and a different
+      question again from whether the engine is up.
+
+      It exists because those three were previously one test. `Get-Command
+      docker` returning nothing was read as "Docker is not installed", and the
+      response to that is to disclose the licence and install Docker Desktop.
+      A process whose PATH predates the installation, a per-user installation
+      read from a session that never signed in after it, or an elevated shell
+      launched from a stale environment all produce that same nothing - and all
+      three would have been answered with a redundant reinstall.
+
+      Two independent sources, either of which is sufficient:
+
+        registry    the Windows uninstall registration, per machine and per
+                    user. Authoritative about "installed", and carries the
+                    version and the install location.
+        filesystem  Docker Desktop.exe or docker.exe under one of the roots the
+                    product installs into. Catches an installation whose
+                    registration is damaged, and locates the bin directory the
+                    registry does not always name.
+
+      Neither source is asked whether Docker WORKS. That is what the engine
+      probe is for, and conflating the two is the bug this function splits
+      apart.
+    #>
+    param(
+        # Injectable so the registry and filesystem branches can be exercised
+        # against fixtures rather than against whatever this machine happens to
+        # have installed.
+        [string[]]$UninstallKeyPath = $Script:DeltaDockerDesktopUninstallKeys,
+        [string[]]$ProgramRoot
+    )
+
+    $result = [PSCustomObject]@{
+        Installed       = $false
+        Version         = $null
+        InstallLocation = $null
+        DesktopExe      = $null
+        CliPath         = $null
+        BinDirectory    = $null
+        Sources         = @()
+        Evidence        = 'No Docker Desktop registration and no Docker Desktop files were found.'
+    }
+
+    $sources = New-Object System.Collections.ArrayList
+    $evidence = New-Object System.Collections.ArrayList
+
+    # --- registry ---------------------------------------------------------
+    foreach ($keyPath in @($UninstallKeyPath)) {
+        if (-not $keyPath) { continue }
+        $entries = $null
+        try {
+            $entries = Get-ChildItem -LiteralPath $keyPath -ErrorAction Stop
+        }
+        catch { continue }
+
+        foreach ($entry in $entries) {
+            $properties = $null
+            try { $properties = Get-ItemProperty -LiteralPath $entry.PSPath -ErrorAction Stop }
+            catch { continue }
+
+            $displayName = [string]$properties.DisplayName
+            if ($displayName -notmatch $Script:DeltaDockerDesktopDisplayNamePattern) { continue }
+
+            $result.Installed = $true
+            if (-not $result.Version -and $properties.DisplayVersion) {
+                $result.Version = [string]$properties.DisplayVersion
+            }
+            if (-not $result.InstallLocation -and $properties.InstallLocation) {
+                $result.InstallLocation = ([string]$properties.InstallLocation).TrimEnd('\')
+            }
+            if ($sources -notcontains 'registry') { $null = $sources.Add('registry') }
+            $null = $evidence.Add("registry: $displayName $($properties.DisplayVersion) under $keyPath")
+            break
+        }
+    }
+
+    # --- filesystem -------------------------------------------------------
+    # The install location from the registry first, then the standard roots.
+    # Both are probed even when the registry already answered, because the bin
+    # directory is what Initialize-DeltaDockerPath needs and the registration
+    # does not always name it.
+    $roots = New-Object System.Collections.ArrayList
+    if ($result.InstallLocation) { $null = $roots.Add($result.InstallLocation) }
+
+    if ($ProgramRoot) {
+        foreach ($root in $ProgramRoot) { if ($root) { $null = $roots.Add($root.TrimEnd('\')) } }
+    }
+    else {
+        foreach ($base in @("$env:ProgramFiles", "$env:LOCALAPPDATA")) {
+            if (-not $base) { continue }
+            foreach ($relative in $Script:DeltaDockerDesktopProgramRoots) {
+                $null = $roots.Add((Join-Path -Path $base -ChildPath $relative))
+            }
+        }
+    }
+
+    foreach ($root in $roots) {
+        if (-not $root) { continue }
+
+        $desktopExe = Join-Path -Path $root -ChildPath 'Docker Desktop.exe'
+        if (-not $result.DesktopExe -and (Test-Path -LiteralPath $desktopExe -PathType Leaf)) {
+            $result.DesktopExe = $desktopExe
+            $result.Installed = $true
+            if (-not $result.InstallLocation) { $result.InstallLocation = $root }
+            if ($sources -notcontains 'filesystem') { $null = $sources.Add('filesystem') }
+            $null = $evidence.Add("filesystem: $desktopExe")
+        }
+
+        $bin = Join-Path -Path $root -ChildPath 'resources\bin'
+        $cli = Join-Path -Path $bin -ChildPath 'docker.exe'
+        if (-not $result.CliPath -and (Test-Path -LiteralPath $cli -PathType Leaf)) {
+            $result.CliPath = $cli
+            $result.BinDirectory = $bin
+            $result.Installed = $true
+            if (-not $result.InstallLocation) { $result.InstallLocation = $root }
+            if ($sources -notcontains 'filesystem') { $null = $sources.Add('filesystem') }
+            $null = $evidence.Add("filesystem: $cli")
+        }
+    }
+
+    $result.Sources = $sources.ToArray()
+    if ($evidence.Count -gt 0) { $result.Evidence = $evidence -join '; ' }
+    return $result
+}
+
+function Get-DeltaDockerPresence {
+    <#
+      The one place that decides whether this host needs Docker Desktop
+      installed, by measuring four separate conditions and keeping them
+      separate:
+
+        Installed    Docker Desktop's registration or files exist on disk
+        CliPresent   `docker` resolves in THIS process, after PATH repair
+        EngineReady  `docker info` answers, in Linux-container mode
+        Condition    the single verdict the caller acts on
+
+      Condition is one of:
+
+        absent       nothing on this host is Docker Desktop. The only condition
+                     that may lead to an installation, and therefore the only
+                     one that may show the licensing disclosure.
+        broken       Docker Desktop is registered or present, and docker.exe
+                     still cannot be found after PATH repair. Reported, never
+                     reinstalled over: a damaged installation is repaired by
+                     Docker's own installer, and an automatic reinstall on top
+                     of one is how an operator loses a working configuration.
+        engine-down  installed, CLI usable, daemon not answering
+        wrong-mode   installed, daemon answering, Windows containers
+        ready        installed, daemon answering, Linux containers
+        error        installed, CLI usable, and `docker info` failed for a
+                     reason this installer will not guess at
+
+      PATH is repaired before the CLI is judged absent, and the repair is
+      reported, because "Docker is missing" and "this shell has not been told
+      where Docker is" call for completely different responses.
+    #>
+    param(
+        # Injectable so the composition can be exercised without a host that
+        # happens to be in the state under test.
+        [object]$InstallState
+    )
+
+    if (-not $InstallState) { $InstallState = Get-DeltaDockerDesktopInstallState }
+
+    $searchPath = @()
+    if ($InstallState.BinDirectory) { $searchPath += $InstallState.BinDirectory }
+
+    $pathState = Initialize-DeltaDockerPath -SearchPath $searchPath
+    $engine = Get-DeltaDockerEngineState
+
+    $cliPresent = ($engine.Status -ne 'cli-absent')
+
+    $condition =
+        if (-not $cliPresent -and -not $InstallState.Installed) { 'absent' }
+        elseif (-not $cliPresent) { 'broken' }
+        else { $engine.Status }
+
+    return [PSCustomObject]@{
+        Condition    = $condition
+        Installed    = [bool]($InstallState.Installed -or $cliPresent)
+        InstallState = $InstallState
+        CliPresent   = $cliPresent
+        CliPath      = $(if ($engine.Path) { $engine.Path } else { $pathState.Path })
+        PathRepaired = [bool]$pathState.Repaired
+        Engine       = $engine
+        EngineReady  = ($engine.Status -eq 'ready')
+    }
 }
 
 function Get-DeltaDockerEngineState {
@@ -1893,6 +2120,35 @@ function Save-DeltaRuntimeFacts {
     return $result
 }
 
+function Get-DeltaRuntimeFact {
+    <#
+      Reads one fact back out of .delta-install.json, or $null.
+
+      Resume ASSISTANCE only. Nothing this returns is allowed to decide what the
+      installer does: the prerequisite state, the Docker installation and the
+      engine are all measured on the host every run, and a persisted fact that
+      disagrees with the machine loses. What it is for is saying something true
+      that the machine cannot say for itself - "the restart you were asked for
+      on Tuesday has happened, and the feature it was for is now in effect" -
+      and reporting is the only thing it is used for.
+
+      A first run on a machine with no installation root yet persists nothing at
+      all, which is precisely why the real state has to be authoritative.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $state = $null
+    try { $state = Read-DeltaInstallState -InstallRoot $InstallRoot }
+    catch { return $null }
+
+    if (-not $state -or -not $state.Exists -or -not $state.IsValid -or -not $state.Data) { return $null }
+    if (@($state.Data.PSObject.Properties.Name) -notcontains $Name) { return $null }
+    return $state.Data.$Name
+}
+
 # ---------------------------------------------------------------------------
 # Docker Desktop installation (A§5.5)
 # ---------------------------------------------------------------------------
@@ -2260,6 +2516,74 @@ function Show-DeltaCheckResult {
     }
 }
 
+function Get-DeltaDockerBackendPlan {
+    <#
+      Which Docker Desktop backend applies on this host, and what Windows has to
+      provide for it. Called before anything is installed, so the prerequisites
+      that get satisfied are the ones the backend actually needs.
+
+      Two cases, and the difference between them is the whole point:
+
+        a NEW installation. Install-DeltaDockerDesktop asks for --backend=wsl-2,
+        so the WSL platform is genuinely required and is installed first.
+
+        an EXISTING installation. Docker Desktop is already running on whatever
+        backend it was configured with - Hyper-V is a supported one - and this
+        installer has no business changing it. Nothing is required, nothing is
+        installed, and WSL is read for the record only.
+
+      RequiresLinuxDistribution is always false and is stated rather than
+      implied. The WSL PLATFORM is infrastructure Docker's own engine runs on;
+      a user-facing distribution such as Ubuntu is a separate thing that DELTA
+      never needs and this installer never creates (A§5.2). `wsl --install` is
+      always called with --no-distribution.
+    #>
+    param([Parameter(Mandatory)][object]$Presence)
+
+    if ($Presence.Installed) {
+        return [PSCustomObject]@{
+            Backend                   = 'existing'
+            RequiresWslPlatform       = $false
+            RequiresLinuxDistribution = $false
+            Reason                    = 'Docker Desktop is already installed, so it keeps the backend it was configured with. This installer does not change a working backend, and does not add WSL to a host that is not using it.'
+        }
+    }
+
+    return [PSCustomObject]@{
+        Backend                   = 'wsl-2'
+        RequiresWslPlatform       = $true
+        RequiresLinuxDistribution = $false
+        Reason                    = 'Docker Desktop will be installed with --backend=wsl-2, so the WSL platform must be in place first. No Linux distribution is created: Docker Desktop supplies its own.'
+    }
+}
+
+function Show-DeltaDockerPresence {
+    <#
+      Prints the four Docker conditions separately, because they are four
+      different facts and the transcript of a run that got this wrong should
+      show which one was misread.
+    #>
+    param([Parameter(Mandatory)][object]$Presence)
+
+    $install = $Presence.InstallState
+
+    $installedText = if ($install.Installed) {
+        "yes$(if ($install.Version) { " (version $($install.Version))" })$(if ($install.InstallLocation) { " at $($install.InstallLocation)" })"
+    }
+    elseif ($Presence.CliPresent) { 'yes (inferred from a working docker CLI)' }
+    else { 'no' }
+
+    $cliText = if ($Presence.CliPresent) {
+        "$($Presence.CliPath)$(if ($Presence.PathRepaired) { ' (found off PATH and added to this process only)' })"
+    }
+    else { 'not resolvable in this process' }
+
+    Write-Detail ("{0,-28} {1}" -f 'Docker Desktop installed', $installedText)
+    Write-Detail ("{0,-28} {1}" -f 'docker CLI', $cliText)
+    Write-Detail ("{0,-28} {1}" -f 'Docker engine', $Presence.Engine.Status)
+    if ($install.Evidence) { Write-Detail ("{0,-28} {1}" -f 'Evidence', $install.Evidence) }
+}
+
 function Invoke-DeltaRuntimeStage {
     <#
       The Phase 2 stage: prove the host can run Linux containers, disclose
@@ -2276,8 +2600,29 @@ function Invoke-DeltaRuntimeStage {
 
       It creates no directories, generates no artefacts, pulls no images and
       starts no containers. The only host changes it can make are the ones
-      its specification calls for: installing WSL (no distribution) and
-      installing or starting Docker Desktop, each behind its own disclosure.
+      its specification calls for: enabling the Windows features WSL2 needs,
+      installing the WSL platform (no distribution), and installing or starting
+      Docker Desktop.
+
+      ORDER, which is the correctness property this stage exists to hold:
+
+        1. Windows prerequisites, including everything about virtualization
+           this installer can fix, and a clean stop for a restart if fixing it
+           needs one.
+        2. Detect Docker Desktop - installed, CLI-visible and engine-ready
+           measured as three separate facts.
+        3. Only if Docker Desktop is genuinely ABSENT: satisfy the backend
+           prerequisites for the installation that is about to happen, and stop
+           cleanly for a restart if they need one. Nothing about Docker has
+           been asked or installed at this point.
+        4. Only once those prerequisites hold, and only when about to install:
+           the C1 and C2 disclosures, then the installation.
+        5. Engine readiness, Compose, and the recorded facts.
+
+      What that ordering rules out, and what an earlier version of this stage
+      did: accepting the Docker licence, then discovering WSL was missing,
+      installing it, requiring a restart, and asking for the same acceptance
+      again on the way back.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -2292,14 +2637,22 @@ function Invoke-DeltaRuntimeStage {
     $result = [PSCustomObject]@{
         Outcome      = 'blocked'
         Reason       = $null
+        Stage        = 'prerequisites'
         Windows      = $null
         Checks       = @()
         Wsl          = $null
         Docker       = $null
+        Presence     = $null
+        Backend      = $null
         Compose      = $null
         Caveats      = [ordered]@{}
         StateWrite   = $null
         PendingFacts = [ordered]@{}
+        # What this run actually asked and actually did, so the tests can assert
+        # on the absence of a prompt as precisely as on its presence.
+        Prompted     = [ordered]@{ serverSku = $false; licensing = $false }
+        DockerInstallAttempted = $false
+        WslInstalled           = $false
     }
 
     # --- Windows prerequisites -------------------------------------------
@@ -2332,9 +2685,21 @@ function Invoke-DeltaRuntimeStage {
             # Not "ok" - the features are set but not in effect, and the only
             # honest thing to report is that a restart is owed. The capability
             # is measured again on the next run, before anything else.
+            #
+            # Nothing about Docker has been asked, downloaded or installed at
+            # this point, and that is the invariant: the run stops here with the
+            # host holding exactly one half-finished thing - a Windows feature
+            # waiting for a restart - rather than that plus a Docker install.
             $result.Outcome = 'reboot-required'
             $result.Reason = "$($repair.Attempted -join ' and ') enabled for WSL2. Windows must restart before the change takes effect."
             $result.Checks = @($windowsCheck, $virtualization)
+            $null = Save-DeltaRuntimeFacts -InstallRoot $InstallRoot -Facts ([ordered]@{
+                prerequisites = [ordered]@{
+                    restartRequestedAt = (Get-Date).ToUniversalTime().ToString('o')
+                    actions            = @($repair.Attempted)
+                    reason             = $result.Reason
+                }
+            })
             return $result
         }
 
@@ -2372,16 +2737,132 @@ function Invoke-DeltaRuntimeStage {
         Write-DeltaWarning "Windows is already waiting for a restart ($($pending.Signals -join '; ')). Installing over a pending restart can fail in confusing ways."
     }
 
+    # A restart this installer asked for, that has now happened. Said only
+    # after the live prerequisite checks above have already passed on their own
+    # evidence - the note explains a machine state, it never establishes one.
+    $priorPrerequisite = Get-DeltaRuntimeFact -InstallRoot $InstallRoot -Name 'prerequisites'
+    if ($priorPrerequisite -and $priorPrerequisite.restartRequestedAt) {
+        Write-Detail ''
+        Write-Detail "A previous run enabled $(@($priorPrerequisite.actions) -join ' and ') and asked for a restart ($($priorPrerequisite.restartRequestedAt))."
+        Write-Detail 'Those prerequisites measure as satisfied now, so that work is done and is not repeated.'
+        $null = Save-DeltaRuntimeFacts -InstallRoot $InstallRoot -Facts ([ordered]@{
+            prerequisites = [ordered]@{
+                completedAt = (Get-Date).ToUniversalTime().ToString('o')
+                actions     = @($priorPrerequisite.actions)
+            }
+        })
+    }
+
     # --- Docker present? --------------------------------------------------
+    #
+    # Installed, CLI-visible and engine-ready are three facts, not one. They
+    # are measured here, before any decision is taken, so that a Docker Desktop
+    # this process cannot see on its PATH is reported as what it is rather than
+    # answered with a second installation.
     Write-Step 'Detecting Docker'
 
-    $engine = Get-DeltaDockerEngineState
-    $result.Docker = $engine
+    $presence = Get-DeltaDockerPresence
+    $result.Presence = $presence
+    $result.Docker = $presence.Engine
+    $engine = $presence.Engine
 
-    if ($engine.Status -eq 'cli-absent') {
-        Write-Detail 'The docker CLI is not present on this host.'
+    Show-DeltaDockerPresence -Presence $presence
+
+    $backend = Get-DeltaDockerBackendPlan -Presence $presence
+    $result.Backend = $backend
+
+    if ($presence.Condition -eq 'broken') {
+        # Registered or present on disk, and docker.exe cannot be found even
+        # after this process's PATH was repaired from the installation
+        # location. That is a damaged installation, and the answer to a damaged
+        # installation is Docker's own repair - not this installer silently
+        # laying a second one on top of it.
+        Write-DeltaFailure ''
+        Write-DeltaFailure 'Docker Desktop is installed on this host, but its docker.exe could not be found.'
+        Write-Detail $presence.InstallState.Evidence
+        Write-Detail ''
+        Write-Detail 'This installer will not reinstall over an existing Docker Desktop. Either:'
+        Write-Detail '  - start Docker Desktop and let it repair itself, then run this installer again; or'
+        Write-Detail '  - repair or reinstall Docker Desktop from Apps & features, then run this installer again; or'
+        Write-Detail '  - uninstall Docker Desktop completely, and this installer will install it fresh.'
+        $result.Stage = 'docker-detection'
+        $result.Reason = 'Docker Desktop is installed but its command-line client could not be located.'
+        return $result
+    }
+
+    if ($presence.Condition -eq 'absent') {
+        $result.Stage = 'docker-backend-prerequisites'
+
+        # --- Backend prerequisites, BEFORE anything Docker ----------------
+        #
+        # This is the ordering fix. The WSL platform is provisioned here, while
+        # the run still has nothing invested in it: no licence has been
+        # accepted, no 600 MB has been downloaded, no vendor installer has run.
+        # If it needs a restart the run stops clean, and the next run comes back
+        # to a host with its prerequisites in place and no half-installed Docker
+        # to reason about.
+        Write-Step 'Preparing the Docker backend'
+        Write-Detail "Backend for a new installation: $($backend.Backend)."
+        Write-Detail $backend.Reason
+
+        if ($backend.RequiresWslPlatform) {
+            $wsl = Get-DeltaWslState
+            $result.Wsl = $wsl
+            Write-Detail "WSL status: $($wsl.Status)$(if ($wsl.Version) { " (version $($wsl.Version))" })"
+
+            if ($wsl.Status -eq 'absent' -or $wsl.Status -eq 'outdated') {
+                $wslInstall = Install-DeltaWsl
+                if (-not $wslInstall.Succeeded) {
+                    Write-DeltaFailure ''
+                    Write-DeltaFailure 'Installing the Windows Subsystem for Linux failed.'
+                    Write-Detail "wsl.exe exited with $($wslInstall.ExitCode)."
+                    if ($wslInstall.Detail) { Write-Detail $wslInstall.Detail }
+                    $result.Reason = 'WSL could not be installed.'
+                    return $result
+                }
+
+                $result.WslInstalled = $true
+                $result.Outcome = 'reboot-required'
+                $result.Reason = 'The WSL platform was installed. Windows must restart before it takes effect, and Docker Desktop is installed after that - nothing about Docker has been downloaded, accepted or installed yet.'
+                $null = Save-DeltaRuntimeFacts -InstallRoot $InstallRoot -Facts ([ordered]@{
+                    prerequisites = [ordered]@{
+                        restartRequestedAt = (Get-Date).ToUniversalTime().ToString('o')
+                        actions            = @('wsl-platform')
+                        backend            = $backend.Backend
+                        reason             = $result.Reason
+                    }
+                })
+                return $result
+            }
+
+            # Already satisfied - the resumed run after the restart above lands
+            # here, and so does a host that had WSL all along. Nothing is
+            # installed, nothing is asked, and the run carries straight on.
+            #
+            # 'unknown' is not treated as a fault, for the reason
+            # Test-DeltaWsl2RuntimeCapability spells out: wsl.exe answering in a
+            # way this parser does not recognise is not evidence that WSL is
+            # missing, and Docker's own installer settles it either way.
+            if ($wsl.Status -eq 'ready') {
+                Write-Detail "[ ok ]     WSL platform                 ready$(if ($wsl.Version) { " $($wsl.Version)" })"
+            }
+            else {
+                Write-DeltaWarning "wsl.exe answered in a way this installer does not recognise, so the WSL platform could not be confirmed. Installation continues; Docker Desktop's own installer will settle it."
+                if ($wsl.Detail) { Write-Detail $wsl.Detail }
+            }
+        }
+
+        # --- Now, and only now, is a new installation about to happen -----
+        #
+        # Every prerequisite for it holds. The disclosures below are therefore
+        # asked once, for an installation that is actually going to be
+        # attempted in this same run - not before a restart that would have
+        # made the answer stale.
+        $result.Stage = 'docker-install'
+        $result.DockerInstallAttempted = $true
 
         # C1 before installing (A§5.6), then C2 before --accept-license.
+        $result.Prompted['serverSku'] = [bool]$windows.IsServerSku
         if (-not (Show-DeltaServerSkuCaveat -WindowsInfo $windows -RequireConfirmation)) {
             $result.Outcome = 'declined'
             $result.Reason = 'The server-edition support notice was not accepted, so Docker Desktop was not installed.'
@@ -2392,6 +2873,7 @@ function Invoke-DeltaRuntimeStage {
             $result.Caveats['serverSku'] = $true
         }
 
+        $result.Prompted['licensing'] = $true
         if (-not (Confirm-DeltaDockerLicensing)) {
             $result.Outcome = 'declined'
             $result.Reason = 'The Docker Desktop licence terms were not accepted, so Docker Desktop was not installed.'
@@ -2401,27 +2883,6 @@ function Invoke-DeltaRuntimeStage {
         $result.Caveats['licensing'] = $true
         $result.PendingFacts['caveatsAcknowledged'] = $result.Caveats
         $null = Save-DeltaRuntimeFacts -InstallRoot $InstallRoot -Facts $result.PendingFacts
-
-        # WSL2 must be in place before Docker Desktop's WSL2 backend.
-        Write-Step 'Checking WSL2'
-        $wsl = Get-DeltaWslState
-        $result.Wsl = $wsl
-        Write-Detail "WSL status: $($wsl.Status)$(if ($wsl.Version) { " (version $($wsl.Version))" })"
-
-        if ($wsl.Status -eq 'absent' -or $wsl.Status -eq 'outdated') {
-            $install = Install-DeltaWsl
-            if (-not $install.Succeeded) {
-                Write-DeltaFailure ''
-                Write-DeltaFailure 'Installing the Windows Subsystem for Linux failed.'
-                Write-Detail "wsl.exe exited with $($install.ExitCode)."
-                if ($install.Detail) { Write-Detail $install.Detail }
-                $result.Reason = 'WSL could not be installed.'
-                return $result
-            }
-            $result.Outcome = 'reboot-required'
-            $result.Reason = 'The Windows Subsystem for Linux was installed. Windows must restart before Docker Desktop can be installed.'
-            return $result
-        }
 
         $installer = Resolve-DeltaDockerInstaller -InstallerPath $DockerInstallerPath -SearchRoot $ScriptRoot -AllowDownload $AllowDownload
         if (-not $installer.Path) {
@@ -2452,22 +2913,67 @@ function Invoke-DeltaRuntimeStage {
         }
 
         Write-Success 'Docker Desktop installed.'
-        $result.Outcome = 'reboot-required'
-        $result.Reason = 'Docker Desktop was installed. Restart Windows, sign in, and run setup.ps1 again to continue.'
-        return $result
+        $null = Save-DeltaRuntimeFacts -InstallRoot $InstallRoot -Facts ([ordered]@{
+            dockerInstall = [ordered]@{
+                installedAt    = (Get-Date).ToUniversalTime().ToString('o')
+                exitCode       = $install.ExitCode
+                rebootRequired = [bool]$install.RebootRequired
+                backend        = $backend.Backend
+            }
+        })
+
+        # Re-measure. docker.exe has just appeared on disk and this process's
+        # PATH predates it by definition, so the detection that follows an
+        # install is the one most likely to be misread as "still absent".
+        Write-Step 'Re-detecting Docker after the installation'
+        $presence = Get-DeltaDockerPresence
+        $result.Presence = $presence
+        $result.Docker = $presence.Engine
+        $engine = $presence.Engine
+        Show-DeltaDockerPresence -Presence $presence
+
+        if (-not $presence.Installed) {
+            $result.Reason = 'The Docker Desktop installer reported success, but nothing on this host looks like an installed Docker Desktop afterwards.'
+            Write-DeltaFailure ''
+            Write-DeltaFailure $result.Reason
+            Write-Detail 'Check Docker''s own installation log before running this again.'
+            foreach ($path in @(Get-DeltaDockerInstallLogPaths)) { Write-Detail "  $path" }
+            return $result
+        }
+
+        $postInstallPending = Test-DeltaPendingReboot
+        if ($install.RebootRequired -or $postInstallPending.IsPending) {
+            $result.Outcome = 'reboot-required'
+            $signals = if ($postInstallPending.Signals.Count -gt 0) { " ($($postInstallPending.Signals -join '; '))" } else { '' }
+            $result.Reason = "Docker Desktop was installed and Windows must restart before it can run$signals. Restart, sign in, and run setup.ps1 again - the licence has been accepted and the installation is not repeated."
+            return $result
+        }
+
+        # No restart is owed, so the run continues into engine readiness rather
+        # than sending the operator through a reboot the vendor did not ask for.
+        # If the engine cannot be brought up from here, the readiness section
+        # below reports that on its own evidence.
+        Write-Detail 'Docker''s installer did not ask for a restart, so this run continues to the engine.'
+    }
+    else {
+        # --- Docker already present: disclose, do NOT ask ------------------
+        #
+        # No licensing prompt on this path, in any of its forms: a rerun, a
+        # resume after a prerequisite restart, an engine that is still starting,
+        # or a CLI that was only found because PATH was repaired above. The
+        # acceptance is only required for an installation, and no installation
+        # is going to happen here.
+        $null = Show-DeltaServerSkuCaveat -WindowsInfo $windows
+        if ($windows.IsServerSku) {
+            $result.Caveats['serverSku'] = $true
+        }
+        Write-Step 'Docker Desktop licensing'
+        Write-Detail 'Docker Desktop is already installed, so its licence terms are already in force.'
+        Write-Detail 'Organisations above 250 employees or $10M annual revenue require a paid subscription.'
+        Write-Detail 'Nothing is being installed, so no acceptance is asked for.'
     }
 
-    # --- Docker present: disclose, then validate --------------------------
-    Write-Detail "docker CLI: $($engine.Path)$(if ($engine.ClientVersion) { " (client $($engine.ClientVersion))" })"
-
-    $null = Show-DeltaServerSkuCaveat -WindowsInfo $windows
-    if ($windows.IsServerSku) {
-        $result.Caveats['serverSku'] = $true
-    }
-    Write-Step 'Docker Desktop licensing'
-    Write-Detail 'Docker Desktop is already installed, so its licence terms are already in force.'
-    Write-Detail 'Organisations above 250 employees or $10M annual revenue require a paid subscription.'
-
+    $result.Stage = 'docker-engine'
     Write-Step 'Validating the Docker engine'
 
     if ($engine.Status -eq 'engine-down') {
@@ -2505,6 +3011,13 @@ function Invoke-DeltaRuntimeStage {
                 elseif ($engine.Detail) { Write-Detail $engine.Detail }
             }
         }
+        # Said explicitly, because "the engine is not usable" is exactly the
+        # message an operator answers by reinstalling Docker. Docker Desktop is
+        # installed; the next run will detect that and will not ask again.
+        Write-Detail ''
+        Write-Detail 'Docker Desktop is installed on this host. An engine that is not up yet is not a'
+        Write-Detail 'missing installation, and rerunning setup.ps1 will not reinstall it or ask you to'
+        Write-Detail 'accept the licence again.'
         $result.Reason = "The Docker engine is not usable (status: $($engine.Status))."
         return $result
     }
