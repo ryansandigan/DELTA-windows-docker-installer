@@ -2032,30 +2032,33 @@ function Show-DeltaServerSkuCaveat {
 
 function Confirm-DeltaDockerLicensing {
     <#
-      C2. Docker Desktop requires a paid subscription for organisations at or
-      above 250 employees or $10M annual revenue. `--accept-license` is
-      passed to the installer only after this returns $true - accepting a
-      licence on the operator's behalf without asking is not this installer's
-      to do.
+      C2. `--accept-license` is passed to Docker's installer only after this
+      returns $true - accepting a licence on the operator's behalf without
+      asking is not this installer's to do.
+
+      The notice states the obligation and links Docker's terms, and stops
+      there. Summarising subscription tiers in the console was worse than
+      useless: the thresholds are Docker's to state and Docker's to change, and
+      an installer that paraphrases them is telling the operator something it
+      cannot keep true. The link is the authority; this is the consent.
+
+      Read-DeltaInlineConfirmation, not Read-DeltaYesNoConfirmation, because the
+      rule and the '==> Docker Desktop' heading come first here rather than
+      wrapping the body. Both share the convention that matters: bare Enter, and
+      anything that is not Y, means no.
     #>
     param()
 
-    Write-Step 'Docker Desktop licensing'
+    Write-Host ''
+    Write-Host ('-' * $Script:DeltaBannerWidth)
+    Write-Step 'Docker Desktop'
+    Write-Host ''
+    Write-Host 'Docker Desktop is required and will be installed.'
+    Write-Host "Installation requires acceptance of Docker's license terms:"
+    Write-Host 'https://docs.docker.com/subscription/desktop-license/'
+    Write-Host ''
 
-    return (Read-DeltaYesNoConfirmation -Body {
-        Write-Host 'Docker Desktop is commercial software.'
-        Write-Host ''
-        Write-Host 'It is free for personal use, education, non-commercial open source and'
-        Write-Host 'small businesses. Organisations with more than 250 employees OR more than'
-        Write-Host '$10 million in annual revenue require a paid Docker subscription.'
-        Write-Host ''
-        Write-Host 'Full terms: https://docs.docker.com/subscription/desktop-license/'
-        Write-Host ''
-        Write-Host 'Continuing installs Docker Desktop and accepts the Docker Subscription'
-        Write-Host 'Service Agreement on behalf of this organisation.'
-        Write-Host ''
-        Write-Host 'Do you accept these terms and want to install Docker Desktop?'
-    })
+    return (Read-DeltaInlineConfirmation -Prompt 'Continue with Docker Desktop installation? [y/N]')
 }
 
 function Save-DeltaRuntimeFacts {
@@ -2967,10 +2970,9 @@ function Invoke-DeltaRuntimeStage {
         if ($windows.IsServerSku) {
             $result.Caveats['serverSku'] = $true
         }
-        Write-Step 'Docker Desktop licensing'
-        Write-Detail 'Docker Desktop is already installed, so its licence terms are already in force.'
-        Write-Detail 'Organisations above 250 employees or $10M annual revenue require a paid subscription.'
-        Write-Detail 'Nothing is being installed, so no acceptance is asked for.'
+        Write-Step 'Docker Desktop'
+        Write-Detail 'Docker Desktop is already installed. Nothing is being installed, so no confirmation'
+        Write-Detail 'is asked for.'
     }
 
     $result.Stage = 'docker-engine'
