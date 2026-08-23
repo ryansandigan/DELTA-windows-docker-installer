@@ -2,6 +2,14 @@
 
 All notable changes to the DELTA Windows Docker Installer will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- A new interactive installation now asks where to install rather than assuming `C:\DELTA` silently: `Use C:\DELTA as the installation directory? [Y/n]`. Enter accepts the default; declining opens a Windows folder-selection dialog — the same picker convention the certificate questions use, so no filesystem path is ever typed at a prompt. Cancelling the dialog returns to the question instead of cancelling the installation, and a directory that fails validation is refused with its reason and asked again.
+- The chosen root is resolved before the prerequisite-restart continuation is registered, so an installation that restarts Windows part-way through resumes into the directory the operator chose.
+- Unchanged in every other case: an explicit `-InstallRoot` is used without asking, `-NonInteractive` never opens a window, an existing installation keeps the root it is installed at, and a host that cannot show a dialog uses the default rather than asking a question it could not accept a second answer to.
+
 ## [1.0.0]
 
 ### Added

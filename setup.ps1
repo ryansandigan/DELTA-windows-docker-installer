@@ -19,6 +19,13 @@
 .PARAMETER InstallRoot
     Installation root to inspect. Defaults to C:\DELTA (A§9.1).
 
+    Supplying it settles the matter: the installer uses it and asks nothing.
+    Without it, a new interactive installation offers C:\DELTA and, if the
+    operator declines, opens a folder selection window to choose another - no
+    path is ever typed at the prompt. A run that is non-interactive, that
+    already has an installation at the default root, or that cannot open a
+    dialog uses the default exactly as before.
+
 .PARAMETER LogDirectory
     Directory for the installer transcript. Defaults to logs\installer next to
     this script. A§21.1 places installer transcripts under the installation
@@ -800,7 +807,12 @@ $Script:DeltaRestartConfirmed = $false
 try {
     $logPath = Start-DeltaLog -Directory $LogDirectory
 
-    Show-Section -Title 'DELTA Windows Docker Installer' -Subtitle "Installation root: $InstallRoot"
+    # The banner no longer states the installation root. On an interactive first
+    # install it is not decided yet, and a banner that announced C:\DELTA before
+    # the operator had been asked would be stating the very thing the question
+    # below exists to settle. Show-DeltaInstallRootChoice states it instead, on
+    # every path, once it is actually known.
+    Show-Section -Title 'DELTA Windows Docker Installer'
 
     if ($logPath) {
         Write-Detail "Transcript: $logPath"
@@ -811,6 +823,22 @@ try {
         $exitCode = $Script:DeltaExitNotElevated
     }
     else {
+        # Resolved here, and here only: after elevation - the writability probe
+        # and everything under the root needs it - and before the first thing
+        # that reads the root. Everything downstream then sees one value. That
+        # includes Show-DeltaInstallationState, which picks install vs manage
+        # mode, and the -InstallRoot that Register-DeltaLogonContinuation is
+        # given for a post-restart resume: the continuation carries the chosen
+        # root across the reboot, and comes back with it supplied explicitly,
+        # which is what stops it asking the question a second time.
+        $rootChoice = Resolve-DeltaInstallRoot `
+            -DefaultRoot $InstallRoot `
+            -WasSupplied:($PSBoundParameters.ContainsKey('InstallRoot')) `
+            -AllowPrompt (-not $NonInteractive)
+
+        Show-DeltaInstallRootChoice -Choice $rootChoice
+        $InstallRoot = $rootChoice.Path
+
         $candidate = Confirm-DeltaInstallRoot -Path $InstallRoot
         if (-not $candidate.IsValid) {
             $exitCode = $Script:DeltaExitInvalidInstallRoot

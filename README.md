@@ -63,6 +63,10 @@ Afterwards, running `.\setup.ps1` again opens the
 backup, SMTP, certificates, domains, logs — rather than installing a second
 time.
 
+And after a Windows restart there is nothing to run at all: DELTA comes back on
+its own, though not the instant the desktop appears — see
+[After a Windows restart](#after-a-windows-restart).
+
 ---
 
 ## Before you start
@@ -99,14 +103,37 @@ administrator account, start any container, or touch Docker directly.
 
 ### What you will be asked
 
-Four things, all at the start, before the installer does anything slow:
+Five things, all at the start, before the installer does anything slow:
 
 | Question | Default if you just press Enter |
 |---|---|
+| **Installation directory** — where DELTA and its data live | `C:\DELTA` |
 | **Hostname or domain** — the name people will use in a browser | `localhost` |
 | **Database password** — for the PostgreSQL database it creates for DELTA | a strong one is generated |
 | **DELTA administrator password** — for signing in as `admin@admin.com` | a generated one, shown once at the end |
 | **HTTPS** — none, your own certificate, or a self-signed one | none (plain HTTP) |
+
+The installation directory is asked first, as a plain yes/no:
+
+```
+Use C:\DELTA as the installation directory? [Y/n]:
+```
+
+**Enter, or Y,** takes `C:\DELTA` — the right answer on most machines, and the
+one the rest of this document assumes. **N** opens a Windows folder-selection
+dialog, the same kind of picker the certificate questions use below: you browse
+to a directory, you do not type a path. Cancelling the dialog puts you back at
+this question with `C:\DELTA` still on offer — it does not cancel the install.
+A directory that cannot hold an installation (a network share, a removable or
+mapped drive, somewhere this account cannot write) is refused with the reason,
+and you are asked again.
+
+You are only asked on a *new* installation. Passing `-InstallRoot` answers it
+in advance, a machine that already has DELTA installed keeps the root it is
+installed at, and `-NonInteractive` uses `C:\DELTA` without asking. If Windows
+cannot show a dialog at all — Server Core, for instance — the question is
+skipped rather than asked with no way to answer it, and `-InstallRoot` is how
+you choose somewhere else there.
 
 `localhost` is a deliberate default, not a placeholder. It lets you install
 DELTA on a machine and try it from that machine immediately, without owning a
@@ -145,7 +172,7 @@ still on offer and nothing changed.
 - **Anything about Docker.** Compose project names, internal ports, volumes and
   image digests are the installer's business, not yours.
 
-Everything after those four questions runs unattended: the installer creates the
+Everything after those five questions runs unattended: the installer creates the
 folder layout, generates the configuration, pulls and pins the images, starts
 PostgreSQL, lets DELTA initialise its own schema and verifies that it did,
 replaces the published default administrator credential *before* anything is
@@ -1548,6 +1575,50 @@ installation actually is, and takes a fresh archive when it does.
 
 ## After a Windows restart
 
+**DELTA starts itself — give it a moment.** Once it is installed, a Windows
+restart needs no administrator action in the normal case. It is simply not ready
+the instant the Windows desktop appears: several things have to happen in order
+first, and each one waits for the one before it.
+
+```text
+Windows starts
+  → the startup task runs, 60 seconds after boot
+  → Docker Desktop starts
+  → the Docker engine becomes ready
+  → the DELTA containers start
+  → DELTA becomes accessible
+```
+
+Docker Desktop runs the Docker engine inside its own WSL2 Linux machine, and
+that engine has to be up before it can run any container. So there is a period
+after boot during which DELTA is still starting and will not answer. How long
+depends on the host — disk speed, memory, whatever else starts with Windows, and
+how long Docker Desktop takes to bring WSL2 and the engine up — so no fixed time
+can be promised. The startup script waits up to five minutes for the engine
+before giving up, which is the outside of what it expects to need.
+
+**Wait for that to finish before assuming something is wrong.** Most reports of
+"DELTA is down after a reboot" are a check made too early. To see where things
+stand:
+
+```powershell
+cd C:\DELTA
+docker compose ps
+```
+
+The three services should end up running and healthy. If `docker` itself does
+not answer yet, Docker Desktop has not finished initialising the engine — wait
+and run it again. `C:\DELTA\logs\installer\startup.log` records every boot and
+is the place to look if they never do.
+
+Under normal restart behaviour you do **not** need to run `setup.ps1` again,
+start the containers by hand, or choose **Start DELTA** from the menu. Those are
+for a first install or for recovering from an actual failure; reaching for them
+while Docker Desktop is still coming up achieves nothing.
+
+The rest of this section is how that works, and how to prove it on your own
+machine.
+
 Docker Desktop, as Docker ships it on Windows, starts when somebody **signs in**
 — there is no Docker service that runs at boot. On its own that would mean DELTA
 stays down after an overnight patch reboot until a person signs in to the
@@ -1598,7 +1669,10 @@ Two things worth knowing:
 - **Docker Desktop will have no window or tray icon** after an unattended start,
   because it was started before anyone signed in. Docker and DELTA both work
   normally; if you want the Docker Desktop interface back, stop it and start it
-  from the Start menu.
+  from the Start menu. When somebody *does* sign in after a restart, Docker
+  Desktop's own AutoStart — which the installer enables — brings it up the
+  ordinary way, so briefly seeing the Docker Desktop window during startup is
+  expected and is not an error.
 - **Other containers on this machine are not this installer's business.** The
   task starts DELTA's Compose project and nothing else. Anything else you run in
   Docker comes back only if its own restart policy says so.

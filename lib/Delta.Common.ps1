@@ -395,6 +395,36 @@ function Read-DeltaInlineConfirmation {
     return $confirmed
 }
 
+function Read-DeltaDefaultYesAnswer {
+    <#
+      A [Y/n] answer, where bare Enter means YES, returned as one of 'yes',
+      'no' or 'unrecognised'.
+
+      The exception to this project's "blank means no" rule, and it is worth
+      saying why the rule does not apply. Everywhere else a confirmation guards
+      an ACTION - restart Windows, accept a disclosure - and a blank answer must
+      not perform it. This prompt guards no action: it asks which of two
+      directories to install into, and both answers install. What blank means
+      here is "the default you just showed me", which is what a [Y/n] prompt
+      universally means and what an operator pressing Enter is asking for.
+
+      Anything that is neither yes nor no comes back as 'unrecognised' rather
+      than being folded into one of them, so the caller can ask again instead of
+      acting on an answer the operator did not give.
+    #>
+    param([Parameter(Mandatory)][string]$Prompt)
+
+    $choice = ([string](Read-Host -Prompt $Prompt)).Trim()
+
+    $answer = 'unrecognised'
+    if ($choice -eq '')                    { $answer = 'yes' }
+    elseif ($choice -in @('Y', 'y', 'yes', 'Yes', 'YES')) { $answer = 'yes' }
+    elseif ($choice -in @('N', 'n', 'no', 'No', 'NO'))    { $answer = 'no'  }
+
+    Write-DeltaLogLine -Message "$Prompt -> $answer" -Level 'DETAIL'
+    return $answer
+}
+
 # ---------------------------------------------------------------------------
 # File selection
 #
@@ -515,6 +545,73 @@ function Get-DeltaFileDialogFilter {
 
     $patterns = (($Extensions | ForEach-Object { "*$_" }) -join ';')
     return "$Description ($patterns)|$patterns|All files (*.*)|*.*"
+}
+
+function Select-DeltaFolder {
+    <#
+      Opens a standard Windows folder selection dialog and returns the selected
+      directory's full path, or $null if the operator closed or cancelled it
+      without choosing one.
+
+      The folder-picking sibling of Select-DeltaSslFile, and deliberately the
+      same shape: the same STA refusal, the same Add-Type failure handling, the
+      same read-before-Dispose, the same "$null means the operator chose
+      nothing" contract. The two dialogs have identical hosting requirements -
+      WinForms, an STA thread - so they get identical guards, and
+      Test-DeltaFileDialogSupported answers for both.
+
+      Cancelling is a legitimate answer here, not a failure. The caller decides
+      what a cancellation means; this reports it and nothing else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [string]$InitialPath
+    )
+
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+        Write-DeltaWarning 'A folder selection window cannot be opened from this session: PowerShell is not running on an STA thread.'
+        return $null
+    }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    }
+    catch {
+        Write-DeltaWarning "A folder selection window could not be opened - System.Windows.Forms could not be loaded: $($_.Exception.Message)"
+        return $null
+    }
+
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = $Description
+
+    # The new-folder button stays on: an operator installing to D:\Apps\DELTA
+    # should not have to leave the installer to create the directory first.
+    $dialog.ShowNewFolderButton = $true
+
+    # Seeded only with a directory that actually exists. FolderBrowserDialog
+    # silently ignores a SelectedPath that does not, and the resulting dialog
+    # opens at the desktop root with no explanation.
+    if ($InitialPath -and (Test-Path -LiteralPath $InitialPath -PathType Container)) {
+        $dialog.SelectedPath = $InitialPath
+    }
+
+    # Read before Dispose, and return from the local, for the same reason
+    # Select-DeltaSslFile does.
+    $selected = $null
+    try {
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $selected = $dialog.SelectedPath
+        }
+    }
+    catch {
+        Write-DeltaWarning "A folder selection window could not be opened: $($_.Exception.Message)"
+        return $null
+    }
+    finally {
+        $dialog.Dispose()
+    }
+
+    return $selected
 }
 
 function ConvertTo-DeltaPlainText {
@@ -684,4 +781,178 @@ function Test-DeltaInstallRootCandidate {
 
     $result.IsValid = $true
     return $result
+}
+
+function Resolve-DeltaInstallRoot {
+    <#
+      Decides which directory this run installs into, and reports both the
+      decision and how it was reached.
+
+      The installer used to assume C:\DELTA silently on a new installation. It
+      is still the default and still the recommendation - but an operator whose
+      C: is a small system volume found out where DELTA had gone only after it
+      was there, so the default is now offered rather than taken.
+
+      Five ways this answers, and the first that applies wins:
+
+        supplied         -InstallRoot was passed explicitly. Asking somebody
+                         who already stated the answer is not a confirmation,
+                         it is a second chance to get it wrong - and this is
+                         also the path the post-restart continuation comes back
+                         on, which must not stop for a prompt.
+        non-interactive  -NonInteractive. Never opens a window: an unattended
+                         run has nobody to close a modal dialog, and one that
+                         appeared would hang the run until somebody found the
+                         machine. Keeps the supplied-or-default behaviour
+                         exactly as it was before this function existed.
+        existing         There is already an installation - complete or partial
+                         - at the default root. That root is a fact about this
+                         machine, not a choice left to make, and installing a
+                         second copy elsewhere while the first sits there is
+                         never what was meant.
+        no-dialog        A folder dialog cannot be shown here (Server Core,
+                         a non-STA host). The question is not asked at all
+                         rather than asked and then unanswerable: this
+                         installer does not ask an operator to type a path, so
+                         with no dialog there is no second option to offer.
+                         Says how to choose one anyway - with -InstallRoot.
+        asked            The operator is asked, and answers.
+
+      The asked path loops until it has an answer it can use. Declining the
+      default opens the folder dialog; cancelling the dialog returns to the
+      question rather than cancelling the installation, because a cancelled
+      dialog means "not that one", not "stop". A directory the validator
+      rejects goes back to the question too, with the reason, so the operator
+      is never left holding an unusable choice.
+
+      Every probe is injectable - the prompt, the dialog, the dialog-support
+      test, the state classification - so the whole decision table is
+      exercisable offline on one machine, in the style of the other suites here.
+      Nothing on disk is created or changed: this chooses a path and validates
+      it, and the stage that owns the installation root still creates it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DefaultRoot,
+        [switch]$WasSupplied,
+        [bool]$AllowPrompt = $true,
+        [scriptblock]$Reader,
+        [scriptblock]$FolderPicker,
+        [scriptblock]$DialogProbe,
+        [scriptblock]$StateProbe
+    )
+
+    $result = [PSCustomObject]@{
+        Path     = $DefaultRoot
+        Source   = 'default'
+        Asked    = $false
+        Reason   = $null
+    }
+
+    if ($WasSupplied) {
+        $result.Source = 'supplied'
+        $result.Reason = '-InstallRoot was supplied on the command line.'
+        return $result
+    }
+
+    if (-not $AllowPrompt) {
+        $result.Source = 'non-interactive'
+        $result.Reason = 'This run is non-interactive, so the default installation root is used.'
+        return $result
+    }
+
+    if (-not $Reader)       { $Reader       = { param($prompt) Read-DeltaDefaultYesAnswer -Prompt $prompt } }
+    if (-not $FolderPicker) { $FolderPicker = { param($description, $initial) Select-DeltaFolder -Description $description -InitialPath $initial } }
+    if (-not $DialogProbe)  { $DialogProbe  = { Test-DeltaFileDialogSupported } }
+    if (-not $StateProbe)   { $StateProbe   = { param($path) (Get-DeltaInstallationState -InstallRoot $path).State } }
+
+    $existingState = & $StateProbe $DefaultRoot
+    if ($existingState -and $existingState -ne 'none') {
+        $result.Source = 'existing'
+        $result.Reason = "An installation is already registered at $DefaultRoot (state = $existingState)."
+        return $result
+    }
+
+    if (-not (& $DialogProbe)) {
+        $result.Source = 'no-dialog'
+        $result.Reason = 'A folder selection window cannot be opened from this session, so the default installation root is used.'
+        return $result
+    }
+
+    # A cap, not a policy. The loop's real exit is the operator answering it;
+    # this only stops a session whose input has been redirected from something
+    # that answers nothing usable forever from spinning silently.
+    $maxAttempts = 25
+    $attempt = 0
+
+    while ($attempt -lt $maxAttempts) {
+        $attempt++
+        $answer = & $Reader "Use $DefaultRoot as the installation directory? [Y/n]"
+
+        if ($answer -eq 'yes') {
+            $result.Source = 'default'
+            $result.Asked  = $true
+            $result.Reason = "The operator accepted the default installation root."
+            return $result
+        }
+
+        if ($answer -ne 'no') {
+            Write-DeltaWarning "Answer Y to use $DefaultRoot, or N to choose a different directory."
+            continue
+        }
+
+        $picked = & $FolderPicker 'Select the directory to install DELTA into' $DefaultRoot
+
+        if (-not $picked) {
+            # Back to the question, deliberately. A cancelled dialog is the
+            # operator changing their mind about choosing, not about installing.
+            Write-Detail 'No directory was selected.'
+            continue
+        }
+
+        $candidate = Test-DeltaInstallRootCandidate -Path $picked -TestWritable
+        if (-not $candidate.IsValid) {
+            Write-DeltaWarning "$picked cannot be used as the installation root."
+            Write-Detail $candidate.Reason
+            continue
+        }
+
+        $result.Path   = $picked
+        $result.Source = 'selected'
+        $result.Asked  = $true
+        $result.Reason = 'The operator chose this directory.'
+        return $result
+    }
+
+    $result.Path   = $DefaultRoot
+    $result.Source = 'default'
+    $result.Asked  = $true
+    $result.Reason = "No usable answer after $maxAttempts attempts, so the default installation root is used."
+    Write-DeltaWarning $result.Reason
+    return $result
+}
+
+function Show-DeltaInstallRootChoice {
+    <#
+      States the installation root this run will use, and - when it was not
+      simply the default - why it is that one. Printed for every path through
+      Resolve-DeltaInstallRoot, including the ones that asked nothing, so the
+      chosen root is always on screen and in the transcript before anything is
+      created under it.
+    #>
+    param([Parameter(Mandatory)][object]$Choice)
+
+    Write-Step 'Installation directory'
+
+    switch ($Choice.Source) {
+        'supplied'        { Write-Detail '-InstallRoot was supplied, so this run was not asked to choose.' }
+        'non-interactive' { Write-Detail 'This run is non-interactive, so the default was used without asking.' }
+        'existing'        { Write-Detail $Choice.Reason }
+        'no-dialog'       {
+            Write-DeltaWarning 'A folder selection window cannot be opened from this session.'
+            Write-Detail 'The default installation root is used. To install somewhere else, re-run with'
+            Write-Detail '  .\setup.ps1 -InstallRoot D:\DELTA'
+        }
+    }
+
+    Write-Success "Installation root: $($Choice.Path)"
 }
