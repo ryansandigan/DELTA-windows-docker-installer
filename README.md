@@ -7,8 +7,8 @@ starts the stack in the right order, secures the administrator account, and
 tells you where DELTA is.
 
 You do not need to know anything about Docker to run it, and you never manage a
-Linux machine: Docker Desktop brings its own, and the installer never touches
-it.
+Linux system: the containers run on Docker Desktop's WSL2 backend, which is
+Docker's own and which the installer never touches.
 
 ---
 
@@ -26,40 +26,84 @@ The whole install, in order. Everything here is expanded further down.
 3. **Extract** it to a local folder — say `C:\Installers\DELTA`. A local disk,
    not a network share or a cloud-synced folder.
 
-4. **Open PowerShell as Administrator** in that folder. Elevation is required;
-   the installer checks and stops if it is missing.
+4. **Make sure hardware virtualization is available to Windows.** Docker
+   Desktop's WSL2 backend runs the Docker engine in a WSL2 utility VM, which
+   cannot start without it. The installer checks this and stops with an
+   explanation if it is unavailable.
 
-5. **If PowerShell blocks the script**, allow scripts for this session only:
+   - **On a physical machine:** enable virtualization in BIOS/UEFI — Intel VT-x
+     or AMD-V, usually listed as *Intel Virtualization Technology*, *SVM Mode*
+     or similar.
+   - **If Windows is itself running in a VM:** enable nested virtualization on
+     the parent hypervisor, so the virtualization extensions are exposed to the
+     Windows guest.
+
+   On **Hyper-V**, run this on the Hyper-V host — not inside the DELTA VM — with
+   the VM shut down, replacing `<VMName>` with the actual VM name:
 
    ```powershell
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   Set-VMProcessor -VMName "<VMName>" `
+       -ExposeVirtualizationExtensions $true
    ```
 
-   `-Scope Process` affects this one window. Close it and the machine's policy
-   is exactly as it was.
+   On VMware, VirtualBox, Proxmox, a cloud VM or any other platform, enable that
+   platform's equivalent **nested virtualization** / **expose hardware
+   virtualization to the guest** setting.
 
-6. **Run the installer:**
+5. **Open Windows PowerShell as Administrator.** Start → type
+   `Windows PowerShell` → right-click it → **Run as administrator**. Elevation
+   is required; the installer checks and stops if it is missing.
+
+6. **Run these three lines**, with your own extraction folder in the first one:
 
    ```powershell
+   cd "C:\Installers\DELTA"
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    .\setup.ps1
    ```
+
+   The middle line is not optional housekeeping — without it, most Windows
+   machines answer `.\setup.ps1` with **"running scripts is disabled on this
+   system"**, because blocking `.ps1` files is the default. It is also the
+   smallest possible concession:
+
+   - `-Scope Process` applies to **that one PowerShell window**. Close the
+     window and it is gone.
+   - It does **not** change the execution policy for your account
+     (`CurrentUser`) or for the machine (`LocalMachine`). Check with
+     `Get-ExecutionPolicy -List` before and after if you want to see that for
+     yourself.
+   - The installer never writes an execution-policy change of its own, at any
+     scope, at any point.
+
+   > If your organisation enforces the execution policy by **Group Policy**,
+   > this will not help and nothing else in this installer can override it —
+   > `MachinePolicy` and `UserPolicy` outrank the process scope by design. Ask
+   > whoever administers that policy.
 
 7. **Answer the prompts** — hostname, database password, administrator
    password, HTTPS, and one SMTP question at the end. Enter takes a sensible
    default for every one of them.
 
-8. **Wait for it to finish.** The first run takes a few minutes, most of it
+8. **If it asks to restart Windows, let it.** Docker Desktop and the WSL2
+   platform need a restart before the installation can go on. After you sign
+   back in, DELTA **tries** to pick up where it left off: a window appears and
+   Windows shows a **UAC elevation prompt** — approve it and the installation
+   continues on its own. If it does not manage that, finish it by hand — see
+   [If the restart does not continue by itself](#if-the-restart-does-not-continue-by-itself).
+
+9. **Wait for it to finish.** The first run takes a few minutes, most of it
    pulling images. It verifies the database, the administrator credential and
    the published URL as it goes, and stops rather than reporting success it
    cannot back up.
 
-9. **Record the DELTA administrator password** in the closing summary. It is
-   shown once, stored nowhere, and cannot be recovered.
+10. **Record the DELTA administrator password** in the closing summary. It is
+    shown once, stored nowhere, and cannot be recovered.
 
-10. **Open the DELTA URL** the installer prints.
+11. **Open the DELTA URL** the installer prints.
 
 Afterwards, running `.\setup.ps1` again opens the
-[management menu](#running-setupps1-again--the-management-utility) — update,
+[management utility](#running-setupps1-again--the-management-utility) — update,
 backup, SMTP, certificates, domains, logs — rather than installing a second
 time.
 
@@ -71,14 +115,19 @@ its own, though not the instant the desktop appears — see
 
 ## Before you start
 
-- **Windows Server 2022 / 2025, or Windows 11.** 64-bit, and virtualization
-  enabled in firmware. The installer checks and tells you if something is
-  missing.
+- **Windows Server 2022 / 2025, or Windows 11.** 64-bit.
+- **Hardware virtualization available to Windows.** On a physical host, enabled
+  in BIOS/UEFI. If Windows is running in a VM, nested virtualization must be
+  exposed to it by the parent hypervisor — see step 4 of the
+  [TL;DR](#tldr--installation-guide). The installer checks and tells you if it
+  is missing.
 - **Administrator rights.** Run the script from an elevated PowerShell window.
 - **Docker Desktop.** If it is already installed, the installer uses it. If it
   is not, the installer shows Docker's licensing terms, asks you to accept
-  them, installs Docker Desktop silently, and asks you to restart Windows and
-  run it again.
+  them, installs Docker Desktop silently, and asks to restart Windows. After
+  you sign back in it tries to continue by itself — approve the UAC prompt when
+  it appears — and tells you how to finish by hand if it cannot. See
+  [The restart part-way through](#the-restart-part-way-through).
   > Docker Desktop is not officially supported by Docker on Windows Server.
   > DELTA has been successfully tested with Docker Desktop on Windows Server
   > 2022 and 2025. The installer states this and asks before installing
@@ -109,7 +158,7 @@ Five things, all at the start, before the installer does anything slow:
 | **Installation directory** — where DELTA and its data live | `C:\DELTA` |
 | **Hostname or domain** — the name people will use in a browser | `localhost` |
 | **Database password** — for the PostgreSQL database it creates for DELTA | a strong one is generated |
-| **DELTA administrator password** — for signing in as `admin@admin.com` | a generated one, shown once at the end |
+| **DELTA administrator password** — for signing in as `admin@admin.com` | option 2, a generated one, shown once at the end |
 | **HTTPS** — none, your own certificate, or a self-signed one | none (plain HTTP) |
 
 The installation directory is asked first, as a plain yes/no:
@@ -139,11 +188,40 @@ DELTA on a machine and try it from that machine immediately, without owning a
 DNS name or a certificate. Nothing looks the name up, so a hostname whose DNS
 entry does not exist yet is accepted — you can point DNS at it later.
 
-Both password prompts are masked, and a password you type is asked for twice
-and must match. Choosing "generate" is a perfectly good answer for the database
-password: the database is never published to the network and nothing outside
-this machine can reach it. Type your own if you want to connect with other
-tooling.
+The **database password** is a masked prompt where pressing Enter has one
+generated for you. That is a perfectly good answer: the database is never
+published to the network and nothing outside this machine can reach it. Type
+your own if you want to connect with other tooling — you are asked for it twice
+and the two entries must match.
+
+The **DELTA administrator password** is asked as a choice rather than as a
+prompt with a hidden default, because it is the credential you will actually
+sign in with:
+
+```
+DELTA administrator password
+
+    The password for signing in to DELTA as admin@admin.com. The image ships a
+    publicly known default, so the installer always replaces it before DELTA is
+    reachable.
+
+Choose how to set the password:
+
+  1. Enter a password
+  2. Generate a strong password automatically
+
+Choose 1 or 2 [2]:
+```
+
+**Enter, or 2,** has a strong one generated and shown to you once in the closing
+summary. **1** asks you to type it, masked, twice; the two entries must match,
+and a mismatch is reported and asked again rather than accepted. Nothing else is
+taken as an answer here — a password typed at this question is refused as a
+choice, not accepted as your credential. A password you chose yourself is never
+displayed, because you already know it.
+
+Both prompts are masked, and neither password is ever written to the installer's
+log.
 
 Answering the HTTPS question with **your own certificate** opens two Windows
 file-selection dialogs, one for the certificate and one for the private key —
@@ -220,6 +298,64 @@ password is still printed once at the end of the run, so capture the output.
 
 Run `Get-Help .\setup.ps1 -Full` for the rest.
 
+### The restart part-way through
+
+Docker Desktop's WSL2 backend needs Windows features that only take effect
+after a restart. When the installer finds one missing it enables it, stops
+before touching Docker at all, and offers to restart Windows for you.
+
+Say yes and it registers a **one-time** continuation for your account, then
+restarts. Nothing is scheduled permanently: Windows runs the entry once and
+deletes it, whatever the outcome.
+
+When you sign back in:
+
+1. A console window appears saying **"DELTA setup is continuing after the
+   restart."**
+2. It waits for the desktop to finish signing in. This is not instant — give it
+   up to a minute or so.
+3. **Windows shows a UAC elevation prompt.** You must approve it. The installer
+   cannot continue without administrator rights, and the window in front of you
+   does not have them.
+4. Approving it opens an elevated window and the installation carries on from
+   the state it finds — the same installation folder, the same answers. You are
+   not asked the installation questions again.
+
+**This is an attempt, not a guarantee.** The elevation prompt can be declined,
+and Windows sometimes cancels its own prompt when it is asked for one while the
+desktop is still coming up. Either way you get the same message —
+`The operation was canceled by the user` — because Windows reports both the
+same way. The window then offers to **ask again**; press Enter and the prompt
+comes back. That is worth doing once if you did not decline it yourself.
+
+Nothing is lost if it gives up. The installation resumes from the machine's
+actual state whenever you next run `setup.ps1`, which is exactly what the
+automatic path does.
+
+#### If the restart does not continue by itself
+
+Open **Windows PowerShell as Administrator** — Start → type
+`Windows PowerShell` → right-click → **Run as administrator** — and run, with
+your own installer folder in the first line:
+
+```powershell
+cd "C:\Installers\DELTA"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\setup.ps1
+```
+
+`-Scope Process` applies to that one PowerShell window only and is forgotten
+when you close it; it changes nothing for your account or for the machine. It
+is there because Windows blocks `.ps1` files by default, which is the
+`running scripts is disabled on this system` error.
+
+If you chose an installation folder other than `C:\DELTA`, add it — the
+continuation window prints the exact line to use, including the folder:
+
+```powershell
+.\setup.ps1 -InstallRoot "D:\Program Files\DELTA"
+```
+
 ### Running setup.ps1 again
 
 Once DELTA is installed, `.\setup.ps1` opens the
@@ -290,16 +426,16 @@ DELTA-windows-installer-docker-X.Y.Z\
 
 The two scheduled tasks the installer registers point into `bin\` **by absolute
 path**, so moving or renaming this folder after installing leaves them aimed at
-scripts that are no longer there. Both reconcile themselves, but from different
-places — after moving the folder, run both from its new location:
+scripts that are no longer there. Both reconcile themselves when the menu is
+opened — after moving the folder, run this from its new location:
 
 ```powershell
-.\setup.ps1 -Reconfigure   # re-points the startup task
-.\setup.ps1                # opens the menu, which re-points the rotation task
+.\setup.ps1                # opens the menu, which re-points both tasks
 ```
 
 Each notices that the registered command line no longer matches and replaces
-the task; neither creates a duplicate.
+the task; neither creates a duplicate, and a task that is already correct is
+left exactly as it is.
 
 **The installation:**
 
@@ -341,8 +477,9 @@ replaces it during installation, before DELTA is reachable on any port**, and
 verifies that the replacement actually took effect. If that step fails, the
 installer stops and does not publish the application at all.
 
-Unless you choose to type your own, the installer generates the new password
-and shows it **once**, at the end of the install:
+If you chose option 2 at the administrator-password question — or pressed Enter,
+which is the same answer — the installer generates the new password and shows it
+**once**, at the end of the install:
 
 > Record it then. It is not written to `.env`, not written to the installer's
 > log, and not stored anywhere on the machine. Nothing can recover it — a lost
@@ -431,8 +568,15 @@ Status
   nginx          Running       healthy
   Access                       http://localhost
                                reachable - GET http://localhost/ returned HTTP 200
-  Restart        Configured    startup-task - CONFIGURED but NOT YET PROVEN by a real restart
+  Restart        Configured    automatic startup enabled
 ```
+
+The Restart row is measured, not remembered. Every refresh checks Task Scheduler
+itself — the task must exist, be enabled, carry both of its triggers, and point
+at a script that is still there — so an installation whose startup task has gone
+is reported as `Not set up` however confidently the installation record claims
+otherwise. Once a real unattended restart has been recovered from, the row
+becomes `Verified  automatic startup verified`.
 
 "Reachable" is not a guess: the utility requests the configured address and
 reports what came back. If DELTA is not answering it says so, even when all
@@ -1056,7 +1200,7 @@ as "not covered".
 1. The HTTPS port is settled through the same resolver installation uses, so a
    port something else already holds is reported and refused rather than DELTA
    being recreated onto a port it cannot bind.
-2. The certificate is collected, converted if needed, validated and gated.
+2. The certificate and private key are collected, validated and gated.
 3. The NGINX configuration for HTTPS is generated and **validated with `nginx -t`
    inside the still-running HTTP container** — which can read the new certificate
    and key, because `certs\` is mounted in both shapes. Nothing is recreated
@@ -1348,8 +1492,8 @@ way browsers honour them — `*.example.org` covers `a.example.org` but not
 Adding an uncovered domain is allowed, and NGINX will serve it. Browsers
 reaching DELTA by that hostname will warn until the certificate is replaced.
 
-When the installer generates a **self-signed** certificate, it now covers the
-whole configured domain set rather than the primary alone.
+When the installer generates a **self-signed** certificate, it covers the whole
+configured domain set rather than the primary alone.
 
 #### localhost
 
@@ -1571,6 +1715,7 @@ The archive still exists and is still valid — it was made before any of this.
 Re-run the script once the cause is resolved; it continues from wherever the
 installation actually is, and takes a fresh archive when it does.
 
+---
 
 ## After a Windows restart
 
@@ -1582,18 +1727,19 @@ first, and each one waits for the one before it.
 ```text
 Windows starts
   → the startup task runs, 60 seconds after boot
+    (and again 30 seconds after the installing account signs in)
   → Docker Desktop starts
-  → the Docker engine becomes ready
-  → the DELTA containers start
+  → the Docker engine becomes ready, in Linux-container mode
+  → the DELTA containers start, each waiting for the one before it
   → DELTA becomes accessible
 ```
 
-Docker Desktop runs the Docker engine inside its own WSL2 Linux machine, and
-that engine has to be up before it can run any container. So there is a period
-after boot during which DELTA is still starting and will not answer. How long
-depends on the host — disk speed, memory, whatever else starts with Windows, and
-how long Docker Desktop takes to bring WSL2 and the engine up — so no fixed time
-can be promised. The startup script waits up to five minutes for the engine
+Docker Desktop's WSL2 backend runs the Docker engine inside a WSL2 utility VM,
+and that engine has to be up before it can run any container. So there is a
+period after boot during which DELTA is still starting and will not answer. How
+long depends on the host — disk speed, memory, whatever else starts with
+Windows, and how long Docker Desktop takes to bring the WSL2 backend and the
+engine up — so no fixed time can be promised. The startup script waits up to five minutes for the engine
 before giving up, which is the outside of what it expects to need.
 
 **Wait for that to finish before assuming something is wrong.** Most reports of
@@ -1619,37 +1765,60 @@ The rest of this section is how that works, and how to prove it on your own
 machine.
 
 Docker Desktop, as Docker ships it on Windows, starts when somebody **signs in**
-— there is no Docker service that runs at boot. On its own that would mean DELTA
-stays down after an overnight patch reboot until a person signs in to the
-machine.
+— there is no Docker service that runs the engine at boot. `com.docker.service`,
+where it exists, is Docker's privileged helper for a signed-in user: it starts
+neither Docker Desktop, nor the WSL2 utility VM, nor the Docker engine. On its own
+that would mean DELTA stays down after an overnight patch reboot until a person
+signs in to the machine.
 
-So the installer measures what this machine actually has, and if nothing on it
-starts Docker before a sign-in, it registers **one scheduled task**:
+So the installer registers **one scheduled task** of its own, and does not
+delegate this to any mechanism it cannot verify:
 
 ```
 DELTA (Docker) - <project> - Startup
-   trigger   at Windows startup, 60 seconds after boot
-   runs as   the account that installed DELTA, whether or not it is signed in
-   action    bin\start-delta.ps1 -InstallRoot C:\DELTA
+   triggers  at Windows startup, 60 seconds after boot
+             at logon of the installing account, 30 seconds after sign-in
+   runs as   the account that installed DELTA, logon type S4U — whether or not
+             it is signed in, with no password stored anywhere
+   action    bin\start-delta.ps1 -InstallRoot C:\DELTA -FromStartupTask
 ```
 
-The task runs the script once and exits. It starts Docker, waits for the engine,
-checks the database volume is still there, brings the three containers up in
-order, and confirms DELTA answers. It is not a service and it supervises
-nothing.
+Both triggers, because each covers what the other cannot. Docker Desktop's WSL2
+backend is brought up by a **per-user desktop application** — its Docker-managed
+WSL2 environment is registered under the installing account and
+`com.docker.backend` is a child of that application — so a task running at boot,
+before any session exists, cannot be relied on to start it. The logon trigger recovers the machine
+the moment that account signs in, which on a server administered over RDP is how
+anybody reaches it. Whichever fires first does the work; the other finds the
+stack already up and does nothing, and the task never runs twice at once.
 
-**What the installer will and will not claim.** The summary at the end of an
-install tells you which mechanism is configured, and whether a *real* restart
-has ever confirmed it. Until one has, it says "configured but not yet proven" —
-it will not tell you DELTA comes back on its own until that has been
-demonstrated on your machine.
+The task runs the script once and exits. It starts Docker, waits for the engine,
+verifies Linux-container mode, checks the database volume is still there, brings
+the three containers up in order, and confirms DELTA answers. It prompts for
+nothing — there is nobody to answer at boot — and if Docker is in
+Windows-container mode it reports that and stops rather than switching engines
+unasked. It is not a service and it supervises nothing.
+
+**What the installer will and will not claim.** The status row tells you whether
+the mechanism is registered on this host *now*, and separately whether a real
+unattended restart has ever been recovered from. Until one has, it reads
+`Configured  automatic startup enabled` — the mechanism is in place and has not
+yet demonstrated anything. `Verified  automatic startup verified` appears only
+after the task has genuinely brought a down engine and a down stack back up by
+itself. Running the task by hand on a machine where Docker is already up records
+nothing, because it demonstrated nothing.
 
 To confirm it yourself, the only test that counts:
 
 1. Restart Windows.
-2. **Do not sign in.**
-3. From another machine, request `http://<your-host>/`. It should answer 200
-   within a couple of minutes of boot.
+2. **Do not sign in.** Wait a couple of minutes.
+3. From another machine, request `http://<your-host>/`.
+
+If it answers 200 without anybody signing in, the boot trigger recovered the
+host. If it does not, sign in to the machine as the account that installed DELTA
+and wait a minute: the logon trigger then recovers it, which is the expected
+result on a host where Docker Desktop needs a session to start. Either way the
+status row moves to `Verified` and the log below says which trigger did it.
 
 Then read the log, which records every boot:
 
@@ -1676,13 +1845,12 @@ Two things worth knowing:
   task starts DELTA's Compose project and nothing else. Anything else you run in
   Docker comes back only if its own restart policy says so.
 
-If you would rather DELTA did not start by itself, disable or delete that one
-scheduled task — nothing else depends on it. Opening the management utility does
-not put it back; `.\setup.ps1 -Reconfigure` does, because the installer treats
-"nothing starts Docker at boot" as something to fix.
-
-The management utility shows the same distinction on its status line: it says
-*configured but not yet proven* until a real restart has confirmed it.
+**If you would rather DELTA did not start by itself**, disable or delete that one
+scheduled task — nothing else depends on it. Be aware that it does not stay that
+way: both the installer and the management utility treat a missing, disabled or
+out-of-date startup task as something to repair, so the next time `setup.ps1` is
+run for any reason it is registered again and re-enabled. There is no switch that
+keeps the installation in place with automatic startup permanently off.
 
 ---
 
@@ -1745,9 +1913,10 @@ Stated plainly so it is not mistaken for a gap:
 - **It does not roll back an update.** DELTA's schema migrations are
   forward-only, so recovery from a bad migration is a restore from the backup
   the update took first — which is why that backup cannot be skipped.
-- **It does not install or manage a Linux distribution.** Docker Desktop's own
-  WSL distribution is Docker's; the installer only talks to `docker`,
-  `docker compose` and `docker desktop`.
+- **It does not install or manage a Linux distribution.** No Ubuntu, no
+  general-purpose distribution, nothing for you to log into or patch. The
+  Docker-managed WSL2 environment behind the engine is Docker's; the installer
+  only talks to `docker`, `docker compose` and `docker desktop`.
 
 ---
 
@@ -1850,6 +2019,16 @@ it does can reach this repository or GitHub:
 .\tools\Test-Release.ps1
 ```
 
+`tools\Test-ReleaseWorkflow.ps1` covers `.github\workflows\release.yml` itself.
+Each step's `run:` block is extracted from the workflow file, its `${{ ... }}`
+expressions are substituted the way GitHub Actions would, and the result runs
+against disposable fixtures — so a test fails when the workflow's real text
+breaks, not when a copy of it does. Nothing is tagged, pushed or published:
+
+```powershell
+.\tools\Test-ReleaseWorkflow.ps1
+```
+
 `tools\Test-VirtualizationPrerequisite.ps1` covers the hardware-virtualization
 prerequisite: physical hosts, guest VMs on five hypervisors, locally fixable
 feature gaps, and the case that motivated it — a Hyper-V guest reporting
@@ -1911,3 +2090,147 @@ count, so it does not become flaky on a loaded machine:
 ```powershell
 .\tools\Test-ActivityIndicator.ps1
 ```
+
+`tools\Test-InstallRootSelection.ps1` covers the installation-directory question:
+that Enter and `Y` accept `C:\DELTA`, that declining opens the folder dialog and
+installs into what it returns, that cancelling the dialog returns to the question
+rather than cancelling the install or silently falling through to the default,
+that `-InstallRoot` asks nothing, that `-NonInteractive` never opens a window,
+and that the chosen root survives the prerequisite restart:
+
+```powershell
+.\tools\Test-InstallRootSelection.ps1
+```
+
+`tools\Test-RebootContinuation.ps1` covers the resume after the prerequisite
+restart. It reads the real `Register-DeltaLogonContinuation` out of `setup.ps1`
+with the PowerShell parser, decodes the script that function registers, and then
+actually runs it with every host call replaced by a recorder — so the assertions
+are about behaviour, not about the shape of the source. It asserts that the
+entry is a self-deleting `RunOnce` value under `HKCU`, that both the launcher
+and the relaunched `setup.ps1` get `-NoProfile -ExecutionPolicy Bypass`, that
+neither `setup.ps1` nor the generated script ever writes a `LocalMachine`,
+`CurrentUser`, `MachinePolicy` or `UserPolicy` execution policy, that an
+unelevated logon gets exactly one `-Verb RunAs` and an already-elevated one gets
+none, that the script waits for the desktop shell instead of sleeping a fixed
+interval, that a cancelled UAC prompt is offered again only when the operator
+asks and never on its own, and that the fallback text it prints is a runnable
+three-line sequence carrying the real installer folder and the real
+`-InstallRoot`. Installer paths and installation roots containing spaces — and
+an apostrophe — are exercised throughout, and the generated script is required
+to parse. Nothing is written to the real `RunOnce` key and no process is
+started:
+
+```powershell
+.\tools\Test-RebootContinuation.ps1
+```
+
+> This suite cannot show a UAC prompt and cannot restart Windows. A green run
+> says the continuation is built correctly; it does not say the resume works on
+> your machine. See
+> [Validating the restart by hand](#validating-the-restart-by-hand).
+
+`tools\Test-UnattendedStartup.ps1` covers automatic startup after a Windows
+restart and the `Restart` status row. It asserts that a mechanism which cannot
+start the engine — `com.docker.service` — never satisfies the measurement and
+never suppresses DELTA's own task, that the registered task carries both its
+triggers and runs the startup script non-interactively as the installing
+account, that a task which has gone or would fail is never reported as
+`Configured` however confidently the installation record claims otherwise, and
+that `Verified` requires a real unattended recovery. Task Scheduler is replaced
+by an in-memory stand-in, so nothing is registered, replaced or removed on the
+host, and the NGINX rotation task is pinned as untouched:
+
+```powershell
+.\tools\Test-UnattendedStartup.ps1
+```
+
+`tools\Test-AdministratorPasswordChoice.ps1` covers the question a new
+installation asks about the DELTA administrator credential. It asserts that the
+choice is displayed in full with option 2 as the default, that Enter selects
+generation and nothing else does so implicitly, and that an answer which is
+neither 1 nor 2 is refused and asked again — including a password typed at the
+menu by mistake, which must never be accepted as the credential. For option 1 it
+asserts the two masked entries, the match requirement, the retry after a
+mismatch, and that a mismatch never continues with either value or with a
+generated one; for option 2, that the installer's own CSPRNG generator is called
+at the length this credential has always used. It also proves that neither a
+typed nor a generated password reaches the terminal or the transcript, that an
+installation whose administrator is already secured is not asked at all, and
+that nothing animates while any of the three questions is on screen. Read-Host
+is replaced per case with a stand-in replaying scripted answers, so nothing is
+typed and nothing on this host changes:
+
+```powershell
+.\tools\Test-AdministratorPasswordChoice.ps1
+```
+
+### Validating the restart by hand
+
+No test in this repository restarts Windows, signs a user in, or shows a UAC
+prompt, and none can. The resume after the prerequisite restart is therefore
+**not** verified by a green test run — it is verified by doing it, on a machine
+that has not had Docker Desktop or the WSL2 platform installed yet. Windows 11
+is the case worth doing, because that is where the auto-cancelled elevation was
+first seen.
+
+**The happy path**
+
+1. On a clean Windows 11 machine, extract the installer to a folder — include a
+   space in the path (`C:\Program Files\DELTA Installer`) if you want to check
+   the quoting at the same time.
+2. Open Windows PowerShell as Administrator, `cd` to it, run
+   `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, then
+   `.\setup.ps1`.
+3. Let it reach the prerequisite restart and answer **Y** to
+   `Restart Windows now?`.
+4. Before it goes down, confirm the entry was written:
+
+   ```powershell
+   Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name DELTASetupContinue
+   ```
+
+5. Let Windows restart and sign in as the **same account**.
+6. **Expected:** a console window titled *DELTA setup - continuing after
+   restart* appears and says it is continuing. It then pauses — this is the
+   wait for the desktop shell, and it is allowed to take up to about 90 seconds.
+7. **Expected:** exactly **one** UAC prompt, for `Windows PowerShell`. Approve
+   it.
+8. **Expected:** an elevated window opens, `Checking privileges` reports
+   `Running elevated.`, and the installer continues without re-asking the
+   installation questions or the Docker licence. If you used a custom
+   installation folder, confirm the banner names that folder and not `C:\DELTA`.
+9. Confirm the entry removed itself:
+
+   ```powershell
+   Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name DELTASetupContinue -ErrorAction SilentlyContinue
+   ```
+
+   This should return nothing.
+
+**The cancel path**
+
+Do this on a second run, or re-arm it by answering **Y** to a restart again.
+
+1. At step 7 above, click **No** on the UAC prompt.
+2. **Expected:** the window reports
+   `This command cannot be run due to the error: The operation was canceled by the user.`,
+   explains that Windows cancels its own prompt sometimes, and asks
+   `Ask for elevation again? [Y/n]`.
+3. Press **Enter**. **Expected:** the UAC prompt returns. Approve it this time
+   and the installation continues as above.
+4. Repeat, and this time answer **n**. **Expected:** the window prints the
+   three-line manual sequence with your real installer folder in the `cd` line,
+   the `Set-ExecutionPolicy -Scope Process` line, and `.\setup.ps1` (with
+   `-InstallRoot` if your folder is not `C:\DELTA`) — then waits on
+   *Press Enter to close this window.*
+5. Copy those three lines into an elevated Windows PowerShell and confirm they
+   work as printed.
+
+**What must not happen, on either path**
+
+- More than one UAC prompt for a single approval.
+- A prompt that returns on its own after being declined.
+- The continuation firing again at a later logon.
+- `Get-ExecutionPolicy -List` differing before the install and after it. Record
+  it first and compare — `CurrentUser` and `LocalMachine` must be unchanged.

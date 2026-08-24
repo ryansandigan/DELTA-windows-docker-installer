@@ -1294,57 +1294,47 @@ function Read-DeltaHostName {
     }
 }
 
-function Read-DeltaInstallPassword {
+function Read-DeltaTypedPasswordEntry {
     <#
-      A credential the administrator may either choose or delegate.
+      Option 1 of the question below: the operator types the credential.
 
-      Bare Enter means "generate a strong one", which is what makes this a
-      convenience rather than an interrogation: the installer creates both the
-      PostgreSQL cluster and the DELTA administrator account, so it does not
-      need to be *told* either password - it offers the choice to an operator
-      who wants one they can use elsewhere.
+      Entered twice, masked both times, and the two entries must match. Nothing
+      is echoed and nothing typed here reaches the transcript - the accepted
+      value is registered as a secret before it is returned, so even output this
+      installer did not format itself is redacted on its way to the log.
 
-      A typed password is entered twice and must match. Nothing is echoed, and
-      the value is returned as a SecureString so it is converted to plain text
-      only at the single point it is used.
+      Returns $null when the operator enters nothing at all. That is not a
+      fallback to generation - it is "I did not mean to be here", and the caller
+      puts the choice back on screen so that generating stays something the
+      operator picks rather than something that happens to them. Every other
+      way out of this loop is a password the operator typed twice.
 
-      Returns the SecureString plus whether it was generated, because the
-      completion summary has to show a generated credential exactly once and
-      must never show one the operator chose and already knows.
+      The two validity rules are the ones this installer has always applied to a
+      chosen credential: a minimum length, and a refusal of the one shape .env
+      cannot represent. They are checked before the confirmation is asked for,
+      so a password that was never going to be accepted is not typed twice.
+
+      The prompts are parameters because the administrator credential and the
+      database password ask the same question about different secrets, and the
+      masked-entry rules above are the part that must not be written twice. The
+      defaults are the administrator's, so its call site reads as it always did.
     #>
     param(
-        [Parameter(Mandatory)][string]$Title,
-        [Parameter(Mandatory)][string]$Prompt,
-        [string[]]$Explanation = @(),
-        [int]$GeneratedLength = 24,
+        [string]$Prompt = 'Administrator password',
+        [string]$ConfirmPrompt = 'Confirm administrator password',
         [int]$MinimumLength = 8
     )
 
-    Write-Host ''
-    Write-Host $Title
-    foreach ($line in $Explanation) { Write-Detail $line }
-    Write-Detail 'Press Enter to have a strong one generated for you.'
-    Write-Host ''
-
     while ($true) {
-        $first = Read-Host -Prompt "$Prompt [Enter = generate]" -AsSecureString
+        $first = Read-Host -Prompt $Prompt -AsSecureString
         $plainFirst = ConvertTo-DeltaPlainText -SecureString $first
         try {
             if ($plainFirst.Length -eq 0) {
-                $generated = New-DeltaPassword -Length $GeneratedLength
-                try {
-                    Register-DeltaSecretValue -Value $generated
-                    Write-Detail 'A strong password will be generated.'
-                    return [PSCustomObject]@{
-                        Password     = (ConvertTo-SecureString -String $generated -AsPlainText -Force)
-                        WasGenerated = $true
-                    }
-                }
-                finally { $generated = $null }
+                Write-Detail 'Nothing was entered, so no password has been set.'
+                return $null
             }
-
             if ($plainFirst.Length -lt $MinimumLength) {
-                Write-DeltaWarning "Use at least $MinimumLength characters, or press Enter to have one generated."
+                Write-DeltaWarning "Use at least $MinimumLength characters."
                 continue
             }
             # The one shape .env cannot represent, refused while it can still
@@ -1354,7 +1344,7 @@ function Read-DeltaInstallPassword {
                 continue
             }
 
-            $second = Read-Host -Prompt 'Confirm' -AsSecureString
+            $second = Read-Host -Prompt $ConfirmPrompt -AsSecureString
             $plainSecond = ConvertTo-DeltaPlainText -SecureString $second
             try {
                 if ($plainFirst -cne $plainSecond) {
@@ -1369,6 +1359,180 @@ function Read-DeltaInstallPassword {
         }
         finally { $plainFirst = $null }
     }
+}
+
+function Read-DeltaPasswordChoice {
+    <#
+      How a credential this installer creates gets decided during a new
+      installation: an explicit question with two answers, rather than a
+      password prompt whose empty answer meant something.
+
+      Both prompts this installer asks used to end `[Enter = generate]`.
+      Generation was the likeliest outcome and the easiest one to reach by
+      accident, and an operator who pressed Enter to get past a prompt they had
+      not read did not necessarily know they had just chosen a credential. The
+      choice is the same; what changed is that it is now asked as one:
+
+        1. Enter a password
+        2. Generate a strong password automatically
+
+      Option 2 is the default because it is the better answer for almost every
+      installation and the safe answer when somebody presses Enter - the same
+      reason the reset flow in Delta.Manage.ps1 defaults to generating. Nothing
+      but 1, 2 or Enter is accepted: at a question about which METHOD to use, an
+      unrecognised answer is a misunderstanding to correct, never a password to
+      silently accept.
+
+      The question, its two options, the default and the rules for what is
+      accepted are the same for every credential and live here once. Only the
+      heading, the explanation, the prompts and the generated length differ, and
+      those are the parameters. Read-DeltaAdministratorPassword and
+      Read-DeltaPostgresPassword below are the two call sites; they exist so
+      each credential's wording is stated in one obvious place rather than
+      assembled at the point of use.
+
+      Returns the SecureString plus whether it was generated, because the
+      completion summary shows a generated credential once and must never show
+      one the operator chose and already knows.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string[]]$Explanation,
+        [Parameter(Mandatory)][string]$EntryPrompt,
+        [Parameter(Mandatory)][string]$ConfirmPrompt,
+        [Parameter(Mandatory)][string[]]$GeneratedMessage,
+        [Parameter(Mandatory)][string]$LogLabel,
+        [int]$GeneratedLength = 20,
+        [int]$MinimumLength = 8
+    )
+
+    # Nothing animates over a question. Suspended rather than stopped, and
+    # released in the finally, so an operation that was in progress when this
+    # was reached carries on saying so afterwards. Suspension is counted, so
+    # the Write-Detail calls below cannot bring an animation back while the
+    # question is still on screen.
+    Suspend-DeltaActivity
+    try {
+        Write-Host ''
+        Write-Host $Title
+        Write-Host ''
+        foreach ($line in $Explanation) { Write-Detail $line }
+        Write-Host ''
+        Write-Host 'Choose how to set the password:'
+        Write-Host ''
+        Write-Host '  1. Enter a password'
+        Write-Host '  2. Generate a strong password automatically'
+        Write-Host ''
+
+        while ($true) {
+            $choice = ([string](Read-Host -Prompt 'Choose 1 or 2 [2]')).Trim()
+
+            if ($choice -eq '1') {
+                $typed = Read-DeltaTypedPasswordEntry -Prompt $EntryPrompt `
+                    -ConfirmPrompt $ConfirmPrompt -MinimumLength $MinimumLength
+                if ($typed) {
+                    Write-DeltaLogLine -Message "${LogLabel}: entered by the operator." -Level 'DETAIL'
+                    return $typed
+                }
+                # Nothing was entered. Ask the question again rather than
+                # deciding on the operator's behalf.
+                continue
+            }
+
+            if ($choice -eq '' -or $choice -eq '2') {
+                # The same CSPRNG generator every other secret in this
+                # installation comes from, at the length this credential has
+                # always been generated at.
+                $generated = New-DeltaPassword -Length $GeneratedLength
+                try {
+                    Register-DeltaSecretValue -Value $generated
+                    foreach ($line in $GeneratedMessage) { Write-Detail $line }
+                    Write-DeltaLogLine -Message "${LogLabel}: generated by the installer." -Level 'DETAIL'
+                    return [PSCustomObject]@{
+                        Password     = (ConvertTo-SecureString -String $generated -AsPlainText -Force)
+                        WasGenerated = $true
+                    }
+                }
+                finally { $generated = $null }
+            }
+
+            # The answer is deliberately NOT quoted back. This question stands
+            # where a password prompt used to, so the likeliest wrong answer an
+            # operator gives it is the password they meant to set - and echoing
+            # that would put it on the screen and in the transcript, which is
+            # the one thing this whole flow exists to avoid. What was typed is
+            # not information the operator needs; what the valid answers are, is.
+            Write-DeltaWarning 'That is not one of the choices. Enter 1 to type a password, or 2 - or just Enter - to have one generated.'
+        }
+    }
+    finally { Resume-DeltaActivity }
+}
+
+function Read-DeltaAdministratorPassword {
+    <#
+      The DELTA administrator credential: the one an operator signs in with.
+      Everything about how it is asked is Read-DeltaPasswordChoice's; this is
+      the wording, and the length this credential has always been generated at.
+    #>
+    param(
+        [int]$GeneratedLength = 20,
+        [int]$MinimumLength = 8
+    )
+
+    return (Read-DeltaPasswordChoice `
+        -Title 'DELTA administrator password' `
+        -Explanation @(
+            'The password for signing in to DELTA as admin@admin.com. The image ships a'
+            'publicly known default, so the installer always replaces it before DELTA is'
+            'reachable.'
+        ) `
+        -EntryPrompt 'Administrator password' `
+        -ConfirmPrompt 'Confirm administrator password' `
+        -GeneratedMessage @(
+            'A strong administrator password will be generated. It is shown once when'
+            'the installation finishes.'
+        ) `
+        -LogLabel 'Administrator password' `
+        -GeneratedLength $GeneratedLength `
+        -MinimumLength $MinimumLength)
+}
+
+function Read-DeltaPostgresPassword {
+    <#
+      The PostgreSQL password for the database this installer creates.
+
+      Asked the same way as the administrator credential above, for the same
+      reason: the old prompt was `Database password [Enter = generate]`, and an
+      empty answer is not a decision an operator can be assumed to have made
+      deliberately. Nothing else about this credential changed - the installer
+      still creates the cluster itself and does not need to be told the
+      password, so generating remains the default and the right answer for
+      almost every installation.
+
+      Unlike the administrator credential, a generated database password is
+      never displayed: the completion summary has no line for it, and nothing
+      reads it back. So the generated message says what will happen and stops
+      there rather than promising a value that is coming.
+    #>
+    param(
+        [int]$GeneratedLength = 32,
+        [int]$MinimumLength = 8
+    )
+
+    return (Read-DeltaPasswordChoice `
+        -Title 'Database password' `
+        -Explanation @(
+            'The installer creates the PostgreSQL database for DELTA and protects it'
+            'with this password. The database is not published to the network.'
+        ) `
+        -EntryPrompt 'Database password' `
+        -ConfirmPrompt 'Confirm database password' `
+        -GeneratedMessage @(
+            'A strong database password will be generated.'
+        ) `
+        -LogLabel 'Database password' `
+        -GeneratedLength $GeneratedLength `
+        -MinimumLength $MinimumLength)
 }
 
 function Read-DeltaFreshInstallSettings {
@@ -1443,26 +1607,23 @@ function Read-DeltaFreshInstallSettings {
     }
 
     if ($needsPostgres) {
-        $answer = Read-DeltaInstallPassword -Title 'Database password' `
-            -Prompt 'Database password' `
-            -Explanation @(
-                'The installer creates the PostgreSQL database for DELTA and sets this password'
-                'on it. Nothing outside this machine can reach that database - it is never'
-                'published to the network - so a generated password is a perfectly good answer.'
-                'Choose your own if you want to connect with other tooling.'
-            ) -GeneratedLength 32
+        # Asked as an explicit choice rather than as a password prompt with a
+        # meaningful empty answer, the same way the administrator credential is
+        # below. The condition guarding it is unchanged: a cluster that already
+        # has a password is never asked again, because changing it here would
+        # not change what PostgreSQL expects (A§7.5).
+        $answer = Read-DeltaPostgresPassword -GeneratedLength 32
         $result.PostgresPassword = $answer.Password
         $result.AskedPostgresPassword = $true
     }
 
     if (-not $alreadyBootstrapped) {
-        $answer = Read-DeltaInstallPassword -Title 'DELTA administrator password' `
-            -Prompt 'Administrator password' `
-            -Explanation @(
-                'The password for signing in to DELTA as admin@admin.com. The image ships a'
-                'publicly known default, so the installer always replaces it before DELTA is'
-                'reachable. A generated one is shown once at the end.'
-            ) -GeneratedLength 20
+        # Asked as an explicit choice rather than as a password prompt with a
+        # meaningful empty answer. The condition guarding it is unchanged: an
+        # installation whose administrator has already been secured is never
+        # asked again, so a rerun, an update and a -Reconfigure stay quiet and
+        # keep the credential somebody is already using.
+        $answer = Read-DeltaAdministratorPassword -GeneratedLength 20
         $result.AdminPassword = $answer.Password
         $result.AdminPasswordWasGenerated = $answer.WasGenerated
         $result.AskedAdminPassword = $true

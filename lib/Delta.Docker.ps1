@@ -3168,11 +3168,42 @@ $Script:DeltaDockerServiceName = 'com.docker.service'
 # as stale and re-pointed by Invoke-DeltaStartupConfiguration below.
 $Script:DeltaStartupScriptName = 'bin\start-delta.ps1'
 
-# The trigger fires at boot, and then waits. The delay is not a guess about
-# how long Docker takes - start-delta.ps1 waits for the engine itself - it is
-# to keep the task out of the way of the storm of service starts that a
+# The boot trigger fires at boot, and then waits. The delay is not a guess
+# about how long Docker takes - start-delta.ps1 waits for the engine itself -
+# it is to keep the task out of the way of the storm of service starts that a
 # Windows boot already is.
 $Script:DeltaStartupTaskDelay = 'PT60S'
+
+# The task carries a SECOND trigger, at logon of the installing account, and
+# this is not belt-and-braces - it is the only trigger that is guaranteed to
+# be able to start Docker Desktop on this class of host.
+#
+# Measured, and it is the whole reason DELTA did not come back after a real
+# restart: Docker Desktop with the WSL2 backend is a per-user desktop
+# application. Its WSL distributions (docker-desktop, docker-desktop-data) are
+# registered under the installing user's HKCU with their virtual disks under
+# that user's profile, and the engine is brought up by "Docker Desktop.exe"
+# running in that user's session - com.docker.backend is a child of it.
+# `docker desktop start` does not start an engine by itself; it asks that
+# application to. A task running at boot under S4U has a token for the user
+# but no session for the application to attach to, so the boot trigger alone
+# can only recover a host where something else has already brought Docker
+# Desktop up.
+#
+# So both triggers, on one task, running one idempotent script:
+#
+#   at boot   - recovers unattended where the engine can be started without a
+#               session (a host with Docker's own service configured to, or an
+#               already-signed-in session surviving the restart)
+#   at logon  - recovers the moment the installing account signs in, which on
+#               a Windows Server host administered over RDP is the normal way
+#               anybody touches the machine, and is the point at which Docker
+#               Desktop's own AutoStart is starting the application anyway
+#
+# Whichever fires first does the recovery; the other finds the stack already
+# up and Compose's `up -d` is a no-op. MultipleInstances IgnoreNew stops the
+# two from overlapping if a logon lands inside the boot run.
+$Script:DeltaStartupTaskLogonDelay = 'PT30S'
 
 # A bound on the whole recovery, so a task that is stuck cannot sit in the
 # scheduler forever. Generous: a cold start pulls nothing but does initialise
@@ -3354,8 +3385,24 @@ function Get-DeltaStartupTaskName {
 function Get-DeltaStartupTaskState {
     <#
       The registered startup task for this installation, if there is one,
-      described in the terms that matter: what it runs, as whom, and whether
-      its trigger is one that fires without anybody signing in.
+      described in the terms that matter: what it runs, as whom, and on which
+      triggers.
+
+      Healthy is the single definition of "this host has a working startup
+      mechanism", and everything that asks the question - the measurement, the
+      installer stage, the management status block - asks it here rather than
+      re-deriving it from a different subset of these fields. It is deliberately
+      stricter than Exists:
+
+        - Enabled, because a disabled task is a task that will not run;
+        - both triggers, because each covers a case the other cannot (see
+          $Script:DeltaStartupTaskLogonDelay above);
+        - the script it points at still on disk, because an installer directory
+          that has been moved or renamed leaves a task that fails at boot with
+          nobody there to see it, which is the worst way for this to break.
+
+      Problem says which of those failed, so a caller never has to report
+      "something is wrong" without saying what.
     #>
     param([Parameter(Mandatory)][string]$ProjectName)
 
@@ -3367,8 +3414,13 @@ function Get-DeltaStartupTaskState {
         LogonType   = $null
         RunLevel    = $null
         AtStartup   = $false
+        AtLogon     = $false
         Execute     = $null
         Arguments   = $null
+        ScriptPath  = $null
+        ScriptFound = $false
+        Healthy     = $false
+        Problem     = 'No startup task is registered for this installation.'
         LastRunTime = $null
         LastResult  = $null
         Task        = $null
@@ -3388,11 +3440,19 @@ function Get-DeltaStartupTaskState {
     $result.LogonType = [string]$task.Principal.LogonType
     $result.RunLevel = [string]$task.Principal.RunLevel
     $result.AtStartup = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' }).Count -gt 0
+    $result.AtLogon   = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count -gt 0
 
     $action = @($task.Actions) | Select-Object -First 1
     if ($action) {
         $result.Execute = [string]$action.Execute
         $result.Arguments = [string]$action.Arguments
+        # The -File argument as it was registered, quoted or not. What is
+        # wanted is the path that would actually be run, so a task left behind
+        # by an installer directory that has since moved can be recognised.
+        if ($result.Arguments -match '(?i)-File\s+(?:"([^"]+)"|(\S+))') {
+            $result.ScriptPath = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $result.ScriptFound = (Test-Path -LiteralPath $result.ScriptPath -PathType Leaf)
+        }
     }
 
     $info = Get-ScheduledTaskInfo -TaskName $escaped -ErrorAction SilentlyContinue
@@ -3400,13 +3460,65 @@ function Get-DeltaStartupTaskState {
         $result.LastRunTime = $info.LastRunTime
         $result.LastResult = $info.LastTaskResult
     }
+
+    $result.Problem = if (-not $result.Enabled) {
+        "The startup task '$($result.Name)' exists but is disabled, so it will not run after a restart."
+    }
+    elseif (-not $result.AtStartup) {
+        "The startup task '$($result.Name)' has no at-startup trigger, so it would not run after a restart."
+    }
+    elseif (-not $result.AtLogon) {
+        "The startup task '$($result.Name)' has no at-logon trigger, so it cannot recover a host where Docker Desktop needs a user session to start."
+    }
+    elseif (-not $result.ScriptPath) {
+        "The startup task '$($result.Name)' does not run a script this installer recognises."
+    }
+    elseif (-not $result.ScriptFound) {
+        "The startup task '$($result.Name)' points at '$($result.ScriptPath)', which is not there. It would fail at boot."
+    }
+    else { $null }
+
+    $result.Healthy = (-not $result.Problem)
     return $result
+}
+
+function Get-DeltaStartupTaskArguments {
+    <#
+      The exact powershell.exe command line the startup task runs. One
+      definition, used both to register the task and to decide whether an
+      already-registered one still matches - a second copy of this string
+      would make "unchanged" and "what it should be" drift apart silently.
+
+      -NonInteractive as well as -NoProfile: this path must never stop on a
+      prompt, because at boot and at logon there is nobody to answer one.
+      -FromStartupTask is how start-delta.ps1 knows the run came from the
+      registered mechanism rather than from an operator's hands, which is the
+      only thing that may record a startup as verified.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+
+    return (ConvertTo-DeltaCommandLine -Arguments @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'
+        '-File', $ScriptPath
+        '-InstallRoot', $InstallRoot
+        '-FromStartupTask'
+    ))
 }
 
 function Register-DeltaStartupTask {
     <#
-      Registers the one scheduled task this product owns: at Windows startup,
-      run start-delta.ps1 once, as the account that installed DELTA.
+      Registers the one scheduled task this product owns: run start-delta.ps1
+      once, as the account that installed DELTA, at Windows startup AND at that
+      account's logon.
+
+      Why both triggers is set out at $Script:DeltaStartupTaskLogonDelay above:
+      Docker Desktop's WSL2 engine is started by a per-user desktop
+      application, so a boot-time trigger alone cannot be relied on to bring
+      the engine up, and a host that is only ever reached over RDP would
+      otherwise sit with DELTA down until somebody started it by hand.
 
       Why that account and not SYSTEM, which is what A§16.3 sketched. Measured
       on this host: Docker Desktop's WSL distribution is registered under the
@@ -3424,6 +3536,11 @@ function Register-DeltaStartupTask {
       in, and no password is stored anywhere. This is not autologon - no
       interactive session is created and no credential is saved - and it is not
       a service: the task runs one script, once, and exits.
+
+      Reconciled, not blindly rewritten. An existing task that already matches
+      in every respect this function would set is left exactly as it is and
+      reported as 'unchanged', so re-running the installer or opening the
+      management screen does not churn a working registration.
     #>
     param(
         [Parameter(Mandatory)][string]$ProjectName,
@@ -3450,18 +3567,32 @@ function Register-DeltaStartupTask {
         $result.UserId = $UserId
     }
 
-    $arguments = ConvertTo-DeltaCommandLine -Arguments @(
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'
-        '-File', $ScriptPath
-        '-InstallRoot', $InstallRoot
-    )
+    $arguments = Get-DeltaStartupTaskArguments -ScriptPath $ScriptPath -InstallRoot $InstallRoot
 
     $existing = Get-DeltaStartupTaskState -ProjectName $ProjectName
+    if ($existing.Healthy -and
+        $existing.Execute -eq 'powershell.exe' -and
+        $existing.Arguments -eq $arguments -and
+        $existing.UserId -eq $UserId) {
+        $result.Succeeded = $true
+        $result.Action = 'unchanged'
+        $result.UserId = $existing.UserId
+        return $result
+    }
 
     try {
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $trigger.Delay = $Script:DeltaStartupTaskDelay
+
+        $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+        $bootTrigger.Delay = $Script:DeltaStartupTaskDelay
+
+        # -User on a logon trigger scopes it to this one account. Without it
+        # the trigger fires for every user who signs in, which on a server with
+        # several administrators would start a recovery under an account whose
+        # HKCU has no Docker Desktop WSL registration at all.
+        $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+        $logonTrigger.Delay = $Script:DeltaStartupTaskLogonDelay
+
         $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType S4U -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
@@ -3470,9 +3601,9 @@ function Register-DeltaStartupTask {
             -ExecutionTimeLimit $Script:DeltaStartupTaskTimeLimit `
             -MultipleInstances IgnoreNew
 
-        $null = Register-ScheduledTask -TaskName $result.Name -Action $action -Trigger $trigger `
+        $null = Register-ScheduledTask -TaskName $result.Name -Action $action -Trigger @($bootTrigger, $logonTrigger) `
             -Principal $principal -Settings $settings `
-            -Description "Starts Docker and the DELTA Compose project '$ProjectName' after a Windows restart. Registered by the DELTA installer; it runs one script once at boot and exits." `
+            -Description "Starts Docker and the DELTA Compose project '$ProjectName' after a Windows restart, and again when $UserId signs in. Registered by the DELTA installer; it runs one script once and exits." `
             -Force -ErrorAction Stop
     }
     catch {
@@ -3485,8 +3616,11 @@ function Register-DeltaStartupTask {
         $result.Reason = 'The startup task was registered without error but cannot be read back.'
         return $result
     }
-    if (-not $after.AtStartup) {
-        $result.Reason = 'The startup task exists but has no at-startup trigger, so it would not run after a restart.'
+    if (-not $after.Healthy) {
+        # Registered, read back, and still not something that would run. Saying
+        # so here is the difference between this stage reporting a mechanism it
+        # has and one it merely asked for.
+        $result.Reason = $after.Problem
         return $result
     }
 
@@ -3516,6 +3650,149 @@ function Unregister-DeltaStartupTask {
     catch {
         return [PSCustomObject]@{ Name = $name; Removed = $false; Reason = $_.Exception.Message }
     }
+}
+
+function Test-DeltaStartupMechanism {
+    <#
+      Is automatic startup actually in place on this host, right now.
+
+      The installer's record in .delta-install.json says what was configured
+      once. It cannot say what is registered today: a task can be deleted, be
+      disabled by policy, or be left pointing at an installer directory that
+      has since moved, and none of those write anything back to the state file.
+      Reporting the record on its own is how a management screen came to say
+      "Restart  Configured" on a host with no startup task at all.
+
+      So the mechanism is read from Windows and the record is used for one
+      thing only - the claim the record is the only possible source of, which
+      is whether a real restart has already been recovered from. Present comes
+      from the scheduler; Verified needs both.
+
+      State/Detail are the two strings the status row prints, decided here so
+      that the classification and its wording cannot disagree.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [string]$InstallRoot,
+        [object]$Recorded
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('Recorded') -and $InstallRoot) {
+        $state = Read-DeltaInstallState -InstallRoot $InstallRoot
+        if ($state.Exists -and $state.IsValid -and (@($state.Data.PSObject.Properties.Name) -contains 'unattendedStartup')) {
+            $Recorded = $state.Data.unattendedStartup
+        }
+    }
+
+    $task = Get-DeltaStartupTaskState -ProjectName $ProjectName
+
+    $bootTest = $null
+    if ($Recorded -and (@($Recorded.PSObject.Properties.Name) -contains 'bootTest')) {
+        $bootTest = $Recorded.bootTest
+    }
+    # rebootTested is believed only when there is a bootTest record behind it
+    # that says 'reachable'. A stray true with nothing under it is not
+    # evidence, and this is the one field on the screen that claims something
+    # was observed rather than configured.
+    $verifiedRecord = [bool]($bootTest -and ([string]$bootTest.result -eq 'reachable'))
+
+    $result = [PSCustomObject]@{
+        ProjectName = $ProjectName
+        Task        = $task
+        Recorded    = $Recorded
+        BootTest    = $bootTest
+        Present     = [bool]$task.Healthy
+        Verified    = ([bool]$task.Healthy -and $verifiedRecord)
+        Mechanism   = $(if ($Recorded) { [string]$Recorded.mechanism } else { $null })
+        State       = 'Not set up'
+        Detail      = $null
+        Problem     = $task.Problem
+    }
+
+    if ($result.Verified) {
+        $result.State = 'Verified'
+        $result.Detail = 'automatic startup verified'
+    }
+    elseif ($result.Present) {
+        $result.State = 'Configured'
+        $result.Detail = 'automatic startup enabled'
+    }
+    else {
+        $result.State = 'Not set up'
+        # The record is named in the detail when it disagrees with the host,
+        # because "the installer said this was configured and it is not there"
+        # is a different thing for an operator to act on than "this was never
+        # set up".
+        $result.Detail = if ($Recorded -and [bool]$Recorded.configured) {
+            "recorded as configured, but not registered on this host - $($task.Problem)"
+        }
+        else {
+            'DELTA stays down after a restart until somebody starts it'
+        }
+    }
+
+    return $result
+}
+
+function Initialize-DeltaStartupMechanism {
+    <#
+      Makes sure this installation still has its startup task, and repairs it
+      if it does not.
+
+      The exact counterpart of Initialize-DeltaLogRotation, and it exists for
+      the same reason: the installer configures these once, at the end of a
+      full installation, and a host that was installed before this was fixed -
+      or that has had its task removed since - would otherwise never get one
+      back, because rerunning setup.ps1 on a registered installation opens the
+      management utility and never re-runs the installation stages.
+
+      It needs no Docker, changes no configuration, and writes the state file
+      only when something actually changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+
+    $scriptPath = Join-Path -Path $ScriptRoot -ChildPath $Script:DeltaStartupScriptName
+    $registration = Register-DeltaStartupTask -ProjectName $Configuration.ProjectName `
+        -InstallRoot $InstallRoot -ScriptPath $scriptPath
+
+    if (-not $registration.Succeeded) {
+        Write-DeltaWarning "Automatic startup after a Windows restart is not configured: $($registration.Reason)"
+        Write-Detail "You can start DELTA by hand with:  .\$($Script:DeltaStartupScriptName) -InstallRoot $InstallRoot"
+        return $registration
+    }
+
+    if ($registration.Action -eq 'unchanged') {
+        return $registration
+    }
+
+    Write-Detail "Automatic startup $($registration.Action): scheduled task '$($registration.Name)', at Windows startup and at logon of $($registration.UserId)."
+
+    # Only the fields this repair actually establishes are written. The rest of
+    # the node - what the installer measured about AutoStart, the Docker
+    # service, the Compose restart policy, and whatever a real restart has or
+    # has not already demonstrated - is carried through untouched. The state
+    # file merges at the top level only, so a node handed over wholesale would
+    # silently drop every fact this function did not happen to know.
+    $merged = [ordered]@{}
+    $existing = Read-DeltaInstallState -InstallRoot $InstallRoot
+    if ($existing.Exists -and $existing.IsValid -and (@($existing.Data.PSObject.Properties.Name) -contains 'unattendedStartup')) {
+        foreach ($property in $existing.Data.unattendedStartup.PSObject.Properties) {
+            $merged[$property.Name] = $property.Value
+        }
+    }
+    $merged['configured']    = $true
+    $merged['mechanism']     = 'startup-task'
+    $merged['configuredAt']  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $merged['taskName']      = $registration.Name
+    $merged['taskUserId']    = $registration.UserId
+    $merged['startupScript'] = $scriptPath
+
+    $null = Write-DeltaInstallState -InstallRoot $InstallRoot -Properties @{ unattendedStartup = [PSCustomObject]$merged }
+    return $registration
 }
 
 # ---------------------------------------------------------------------------
@@ -3556,8 +3833,24 @@ function Measure-DeltaUnattendedStartCapability {
     $service = Get-DeltaDockerServiceState
     if ($service.Exists) {
         $automatic = ($service.StartType -match '(?i)^auto')
-        & $add $Script:DeltaDockerServiceName $(if ($automatic) { 'boot' } else { 'manual' }) $true 'unknown' `
-            "Windows service present, start type $($service.StartType), currently $($service.Status). Docker documents this service as the privileged helper that lets users switch engines without an elevation prompt; whether it also brings the Linux engine up at boot on this build is not something the installer can determine without a restart."
+        # StartsEngine is 'no', not 'unknown', and that correction is the fix
+        # for a real post-restart failure. com.docker.service is Docker's
+        # privileged helper: it exists so a user can switch engines, manage the
+        # WSL integration and bind privileged ports without an elevation
+        # prompt. It is documented as that and nothing more. It does not launch
+        # "Docker Desktop.exe", it does not start the WSL2 VM, and it does not
+        # create dockerDesktopLinuxEngine - all three belong to the per-user
+        # application. Observed on a Server host after a genuine restart: the
+        # service was Running, com.docker.backend was not, and `docker info`
+        # could not connect to the engine.
+        #
+        # Treating its presence as a mechanism that "might" start the engine is
+        # what let this host be reported as covered while nothing was
+        # registered to bring DELTA back. A mechanism that cannot start the
+        # engine must not be able to satisfy the measurement, so it is
+        # classified by what it does, not by what could not be ruled out.
+        & $add $Script:DeltaDockerServiceName $(if ($automatic) { 'boot' } else { 'manual' }) $true 'no' `
+            "Windows service present, start type $($service.StartType), currently $($service.Status). This is Docker's privileged helper - it lets a signed-in user switch engines and bind privileged ports without an elevation prompt. It does not start Docker Desktop, the WSL2 VM or the Linux engine, so it does not bring DELTA back on its own."
     }
     else {
         & $add $Script:DeltaDockerServiceName 'never' $false 'no' `
@@ -3565,9 +3858,18 @@ function Measure-DeltaUnattendedStartCapability {
     }
 
     $task = Get-DeltaStartupTaskState -ProjectName $ProjectName
-    if ($task.Exists -and $task.AtStartup -and $task.Enabled) {
-        & $add $task.Name 'boot' $true 'unknown' `
-            "Scheduled task, at Windows startup, running as $($task.UserId) ($($task.LogonType)), whether or not that user is signed in."
+    if ($task.Exists) {
+        if ($task.Healthy) {
+            & $add $task.Name 'boot' $true 'yes' `
+                "Scheduled task, at Windows startup and at logon of $($task.UserId) ($($task.LogonType)), whether or not that user is signed in. It starts Docker Desktop, waits for the Linux engine and brings the Compose project up."
+        }
+        else {
+            # Present but not usable is worse than absent, because it is what a
+            # host looks like when somebody believes it is covered. It is
+            # listed as not present so it cannot satisfy the verdict, and the
+            # reason it cannot is carried in the detail.
+            & $add $task.Name 'boot' $false 'no' $task.Problem
+        }
     }
 
     $autoStart = Get-DeltaDockerAutoStartState
@@ -3600,14 +3902,20 @@ function Measure-DeltaUnattendedStartCapability {
 
     $bootCapable = @($mechanisms | Where-Object { $_.When -eq 'boot' -and $_.Present -and $_.StartsEngine -ne 'no' })
 
+    # 'task' is the only verdict that means this host is covered, and only this
+    # installation's own healthy task can produce it. Everything else - nothing
+    # at boot, a task that has gone, a task that would fail - leaves DELTA to
+    # register one, because the alternative is what actually happened on a real
+    # Server host: a third-party mechanism was found at boot, was assumed to
+    # cover the engine, no task was registered, and DELTA did not come back.
     $verdict = 'none'
-    if ($task.Exists -and $task.AtStartup -and $task.Enabled) { $verdict = 'task' }
+    if ($task.Healthy) { $verdict = 'task' }
     elseif ($bootCapable.Count -gt 0) { $verdict = 'unproven' }
 
     $reason = switch ($verdict) {
-        'task'     { "This installation's startup task runs at Windows startup, before any sign-in." }
-        'unproven' { "Something on this host runs at boot ($(($bootCapable | ForEach-Object { $_.Name }) -join ', ')), but whether it starts the Linux engine can only be established by a real restart." }
-        default    { 'Nothing on this host starts Docker before an interactive sign-in: there is no Docker Windows service, and the only mechanisms present fire at sign-in.' }
+        'task'     { "This installation's startup task runs at Windows startup and at logon of $($task.UserId)." }
+        'unproven' { "Something on this host runs at boot ($(($bootCapable | ForEach-Object { $_.Name }) -join ', ')), but whether it starts the Linux engine can only be established by a real restart, so DELTA does not rely on it." }
+        default    { 'Nothing on this host starts Docker before an interactive sign-in: there is no Docker Windows service that starts the engine, and the only mechanisms present fire at sign-in.' }
     }
 
     return [PSCustomObject]@{
@@ -3751,22 +4059,35 @@ function Invoke-DeltaStartupConfiguration {
     # firewall rules are.
     $stale = $false
     if ($measurement.Verdict -eq 'task' -and $measurement.Task) {
-        $arguments = [string]$measurement.Task.Arguments
-        $stale = ($arguments -notlike "*$scriptPath*") -or ($arguments -notlike "*$InstallRoot*")
+        $wanted = Get-DeltaStartupTaskArguments -ScriptPath $scriptPath -InstallRoot $InstallRoot
+        $stale = ([string]$measurement.Task.Arguments -ne $wanted)
     }
 
-    if ($measurement.Verdict -eq 'none' -or $stale) {
+    # The task is registered unless this installation already owns a healthy,
+    # current one. It is NOT skipped because some other mechanism might do the
+    # job: this stage owns exactly one mechanism, and a mechanism it does not
+    # own is not something it may report as configured.
+    if ($measurement.Verdict -ne 'task' -or $stale) {
         Write-Step 'Registering the DELTA startup task'
         if ($stale) {
             Write-Detail 'The registered startup task no longer matches this installer or this installation'
             Write-Detail 'root, so it is being replaced. A task pointing at a script that has moved would'
             Write-Detail 'fail at boot with nobody there to see it.'
         }
+        elseif ($measurement.Task.Exists) {
+            Write-Detail "The registered startup task would not run: $($measurement.Task.Problem)"
+            Write-Detail 'It is being replaced.'
+        }
+        elseif ($measurement.Verdict -eq 'unproven') {
+            Write-Detail 'Something on this host runs at boot, but nothing DELTA owns and nothing that is'
+            Write-Detail 'known to start the Linux engine, so DELTA registers its own scheduled task rather'
+            Write-Detail 'than depending on a mechanism it cannot verify.'
+        }
         else {
             Write-Detail 'Because nothing on this host starts Docker before a sign-in, DELTA registers one'
-            Write-Detail 'scheduled task that runs at Windows startup. It starts Docker, waits for the engine,'
-            Write-Detail 'checks that the database volume is still there, and brings the stack up. It supervises'
-            Write-Detail 'nothing and exits when it is done.'
+            Write-Detail 'scheduled task. It starts Docker, waits for the engine, checks that the database'
+            Write-Detail 'volume is still there, and brings the stack up. It supervises nothing and exits'
+            Write-Detail 'when it is done.'
         }
 
         $registration = Register-DeltaStartupTask -ProjectName $ProjectName -InstallRoot $InstallRoot -ScriptPath $scriptPath
@@ -3775,22 +4096,24 @@ function Invoke-DeltaStartupConfiguration {
         if (-not $registration.Succeeded) {
             Write-DeltaWarning "The startup task could not be registered: $($registration.Reason)"
             Write-Detail 'DELTA is running and unaffected. After the next restart it will stay down until'
-            Write-Detail 'somebody signs in to this machine and Docker Desktop starts.'
+            Write-Detail 'somebody signs in to this machine and starts it.'
             $result.Mechanism = 'none'
             $result.Reason = $registration.Reason
         }
         else {
             Write-Detail "[ ok ]     task $($registration.Action): $($registration.Name)"
-            Write-Detail "[ ok ]     runs as $($registration.UserId), at Windows startup, whether or not that user is signed in"
+            Write-Detail "[ ok ]     runs as $($registration.UserId), at Windows startup and at that account's logon"
             Write-Detail "[ ok ]     runs $scriptPath -InstallRoot $InstallRoot"
             $result.Mechanism = 'startup-task'
             $result.Succeeded = $true
         }
     }
     else {
-        $result.Mechanism = if ($measurement.Verdict -eq 'task') { 'startup-task' } else { 'vendor' }
+        $result.Mechanism = 'startup-task'
         $result.Succeeded = $true
         $result.Task = $measurement.Task
+        Write-Step 'Checking the DELTA startup task'
+        Write-Detail "[ ok ]     task unchanged: $($measurement.Task.Name)"
     }
 
     # --- Layer 4 ----------------------------------------------------------
@@ -3850,6 +4173,8 @@ function Write-DeltaRebootTestResult {
         [Parameter(Mandatory)][ValidateSet('reachable', 'unreachable')][string]$Result,
         [string]$Detail,
         [string]$Mechanism,
+        [ValidateSet('boot', 'logon', 'unknown')][string]$Trigger = 'unknown',
+        [datetime]$BootedAt,
         [datetime]$At = (Get-Date)
     )
 
@@ -3862,10 +4187,16 @@ function Write-DeltaRebootTestResult {
         $startup = [PSCustomObject]@{ configured = $false; mechanism = 'none' }
     }
 
+    # Which trigger recovered the host, and which boot it recovered from, are
+    # recorded alongside the verdict. A "verified" that cannot say what it
+    # verified is not much better than the persisted "configured" this whole
+    # change exists to stop trusting.
     $bootTest = [PSCustomObject]@{
         at        = $At.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         result    = $Result
         mechanism = $(if ($Mechanism) { $Mechanism } else { [string]$startup.mechanism })
+        trigger   = $Trigger
+        bootedAt  = $(if ($PSBoundParameters.ContainsKey('BootedAt')) { $BootedAt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null })
         detail    = $Detail
     }
 

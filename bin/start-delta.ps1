@@ -37,6 +37,14 @@
     Do not try to start Docker; only use it if it is already running. For
     diagnosing the stack half of a recovery on its own.
 
+.PARAMETER FromStartupTask
+    Set by the registered scheduled task, and by nothing else. It means "this
+    run was started by the automatic startup mechanism, not by a person", and
+    it is what allows the outcome to be recorded in .delta-install.json as
+    evidence that automatic startup does or does not work on this host. A hand
+    run proves nothing about what happens at boot, so a hand run must not be
+    able to write that record.
+
 .NOTES
     Exit codes:
       0  DELTA is running and answered over HTTP
@@ -51,7 +59,8 @@
 param(
     [string]$InstallRoot = 'C:\DELTA',
     [int]$EngineTimeoutSeconds = 300,
-    [switch]$SkipEngineStart
+    [switch]$SkipEngineStart,
+    [switch]$FromStartupTask
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,6 +130,7 @@ try {
     try { $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
 
     Show-Section -Title 'DELTA startup' -Subtitle "Installation root: $InstallRoot"
+    Write-Detail "Started by $(if ($FromStartupTask) { 'the registered DELTA startup task' } else { 'hand' })"
     Write-Detail "Running as $([Environment]::UserDomainName)\$([Environment]::UserName), session $((Get-Process -Id $PID).SessionId), elevated=$(Test-IsAdministrator)"
     if ($boot) {
         Write-Detail "Windows last booted $($boot.ToString('yyyy-MM-dd HH:mm:ss')) ($([int]((Get-Date) - $boot).TotalSeconds)s ago)"
@@ -157,6 +167,68 @@ try {
             'engine'        { $Script:DeltaStartupExitNoEngine }
             'precheck'      { $Script:DeltaStartupExitDataMissing }
             default         { $Script:DeltaStartupExitStackFailed }
+        }
+    }
+
+    # Record what the automatic mechanism achieved, but only when the automatic
+    # mechanism is what ran this. This is the only place anything writes that
+    # record, and its whole value is that it describes an unattended recovery
+    # that actually happened rather than one that was configured.
+    #
+    # A failure is recorded as faithfully as a success: an unattended start
+    # that did not work clears any previous claim that it did, because whatever
+    # was true of an earlier boot is no longer true of this host.
+    if ($FromStartupTask) {
+        # Which trigger fired is inferred from how long the machine has been
+        # up, because Task Scheduler does not tell the action which of its
+        # triggers started it. The boot trigger runs a minute after boot, so a
+        # run this close to one came from it; anything later came from the
+        # logon trigger. It is a label on the evidence, not the evidence.
+        $trigger = 'unknown'
+        if ($boot) {
+            $sinceBoot = ((Get-Date) - $boot).TotalMinutes
+            $trigger = if ($sinceBoot -le 15) { 'boot' } else { 'logon' }
+        }
+
+        # A success may be recorded as verification ONLY if this run actually
+        # brought the engine up. That is the whole difference between "the
+        # startup mechanism works" and "the startup mechanism ran on a machine
+        # where there was nothing to do". A Windows restart always stops Docker
+        # Desktop, so a genuine post-restart run finds the engine down and
+        # starts it; a task somebody kicked off by hand on a healthy host finds
+        # it already running and has demonstrated nothing. Without this,
+        # Start-ScheduledTask would be enough to make the screen say Verified,
+        # and this whole change is about not making claims like that.
+        #
+        # A failure is recorded either way. Under-claiming is safe; the failure
+        # is real and the operator needs to see it.
+        if ($start.Succeeded -and -not $start.EngineStarted) {
+            Write-Detail 'The Docker engine was already running, so this run recovered nothing and is not recorded as evidence that automatic startup works.'
+        }
+        else {
+            $detail = if ($start.Succeeded) {
+                "Recovered unattended in $($start.Elapsed)s: started the Docker engine and DELTA answered at $($start.Url)."
+            }
+            else {
+                "Stage $($start.Stage): $($start.Reason)"
+            }
+
+            $record = @{
+                InstallRoot = $InstallRoot
+                Result      = $(if ($start.Succeeded) { 'reachable' } else { 'unreachable' })
+                Detail      = $detail
+                Mechanism   = 'startup-task'
+                Trigger     = $trigger
+            }
+            if ($boot) { $record['BootedAt'] = $boot }
+
+            $null = Write-DeltaRebootTestResult @record
+            if ($start.Succeeded) {
+                Write-Detail "Automatic startup verified: the $trigger trigger started Docker and brought DELTA back. Recorded in the installation state."
+            }
+            else {
+                Write-Detail 'This unattended start failed and has been recorded as such; automatic startup is no longer reported as verified.'
+            }
         }
     }
 }

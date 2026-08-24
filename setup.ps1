@@ -198,6 +198,42 @@ if (-not $LogDirectory) {
 # Stages
 # ---------------------------------------------------------------------------
 
+function Write-DeltaManualRerunCommands {
+    <#
+      The one place that says how to start this installer by hand, so every
+      caller says it the same way and none of them can drift.
+
+      Set-ExecutionPolicy is part of the instruction because Windows blocks
+      .ps1 files by default and an operator who is told only "run .\setup.ps1"
+      meets "running scripts is disabled on this system" instead. -Scope
+      Process is the whole of the concession: it lives in that one PowerShell
+      window and dies with it. LocalMachine and CurrentUser are persistent
+      changes to a machine this installer does not own, and are never used or
+      suggested here.
+
+      -InstallRoot is echoed only when it is not the default, because a manual
+      rerun that quietly reverted to C:\DELTA would resume against a different
+      installation than the one in progress.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [string]$InstallRoot
+    )
+
+    $rerun = if ($InstallRoot -and $InstallRoot -ne 'C:\DELTA') { ".\setup.ps1 -InstallRoot `"$InstallRoot`"" }
+             else { '.\setup.ps1' }
+
+    Write-Detail "  cd `"$ScriptRoot`""
+    Write-Detail '  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass'
+    Write-Detail "  $rerun"
+    Write-Detail ''
+    Write-Detail 'Set-ExecutionPolicy -Scope Process applies to that PowerShell window only.'
+    Write-Detail 'It does not change the execution policy for your account or for this machine,'
+    Write-Detail 'and Windows forgets it when the window closes. It is there because Windows'
+    Write-Detail 'blocks .ps1 files by default - the "running scripts is disabled on this'
+    Write-Detail 'system" error.'
+}
+
 function Test-DeltaElevationRequirement {
     <#
       Elevation is checked once, up front, and reported here; main turns the
@@ -217,7 +253,9 @@ function Test-DeltaElevationRequirement {
     Write-DeltaFailure 'This installer must run as Administrator.'
     Write-Detail ''
     Write-Detail 'Close this window, then start Windows PowerShell with "Run as administrator"'
-    Write-Detail "and run:  cd `"$Script:DeltaScriptRoot`"  then  .\setup.ps1"
+    Write-Detail 'and run:'
+    Write-Detail ''
+    Write-DeltaManualRerunCommands -ScriptRoot $Script:DeltaScriptRoot
     Write-Detail ''
 
     return $false
@@ -421,8 +459,25 @@ function Register-DeltaLogonContinuation {
       The relaunch elevates. RunOnce runs with the user's filtered token, so
       the command opens a visible window that explains itself and then asks for
       elevation - a UAC prompt appearing unexplained after a restart is how an
-      operator learns to click No. If elevation is refused the window says how
-      to continue by hand rather than vanishing.
+      operator learns to click No. setup.ps1 itself never elevates; it checks
+      and refuses. Keeping elevation here, in the one launcher, is what makes
+      the resumed run exactly one UAC flow.
+
+      Three things the generated script does that a bare Start-Process -Verb
+      RunAs at logon does not, each of them a failure seen on Windows 11:
+
+        - It waits for the desktop shell instead of sleeping a fixed five
+          seconds. RunOnce fires while the logon is still in progress, and an
+          elevation requested before the desktop can host the consent UI comes
+          back as ERROR_CANCELLED without anything having been shown.
+        - It skips elevation entirely when the logon session is already
+          elevated (the built-in Administrator account, or UAC turned off).
+          Asking again there would be a second, pointless prompt.
+        - It offers the prompt again instead of dead-ending. Windows reports a
+          declined prompt and an auto-cancelled one with the same error code,
+          so the two cannot be told apart in code - but the operator can tell
+          them apart, so the retry is theirs to ask for and never automatic.
+          Typing N stops, and the manual instructions are printed either way.
     #>
     param(
         [Parameter(Mandatory)][string]$ScriptRoot,
@@ -443,36 +498,132 @@ function Register-DeltaLogonContinuation {
     }
 
     # Quoted the same way the scheduled tasks are, so a path with spaces
-    # survives the trip through the shell.
+    # survives the trip through the shell. -ExecutionPolicy Bypass is on this
+    # command line, not applied to the machine: it lasts exactly as long as the
+    # process it starts, and neither CurrentUser nor LocalMachine is touched.
     $relaunch = ConvertTo-DeltaCommandLine -Arguments @(
         '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass'
         '-File', $setupPath
         '-InstallRoot', $InstallRoot
     )
 
+    # What the operator is told to type if the automatic path gives up. It has
+    # to carry -InstallRoot for a non-default root, or the manual rerun resumes
+    # against the wrong installation - the one thing the continuation exists to
+    # prevent.
+    $manualRerun = if ($InstallRoot -eq 'C:\DELTA') { '.\setup.ps1' }
+                   else { ".\setup.ps1 -InstallRoot `"$InstallRoot`"" }
+
     # Single-quoted PowerShell literals in the generated script; a quote inside
     # a path is doubled rather than allowed to end the string early.
     $q = { param($text) $text -replace "'", "''" }
 
+    # The title is cosmetic and the setter throws on a host with no console
+    # window. Losing the resume over a caption would be absurd.
     $inner = @"
-`$Host.UI.RawUI.WindowTitle = 'DELTA setup - continuing after restart'
+try { `$Host.UI.RawUI.WindowTitle = 'DELTA setup - continuing after restart' } catch { }
 Remove-ItemProperty -LiteralPath '$(& $q $Script:DeltaRunOnceKey)' -Name '$(& $q $Script:DeltaRunOnceName)' -ErrorAction SilentlyContinue
+
+`$scriptRoot = '$(& $q $ScriptRoot)'
+`$relaunch   = '$(& $q $relaunch)'
+
 Write-Host ''
 Write-Host '  DELTA setup is continuing after the restart.'
-Write-Host '  Approve the elevation prompt when it appears.'
 Write-Host ''
-Start-Sleep -Seconds 5
-try {
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -WorkingDirectory '$(& $q $ScriptRoot)' -ArgumentList '$(& $q $relaunch)' -ErrorAction Stop
+
+function Show-DeltaManualRerun {
+    Write-Host ''
+    Write-Host '  To continue by hand:'
+    Write-Host ''
+    Write-Host '    1. Open Windows PowerShell as Administrator.'
+    Write-Host '       Start > type "Windows PowerShell" > right-click it > Run as administrator.'
+    Write-Host ''
+    Write-Host '    2. Run these three lines:'
+    Write-Host ''
+    Write-Host ('         cd "' + `$scriptRoot + '"')
+    Write-Host '         Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass'
+    Write-Host '         $(& $q $manualRerun)'
+    Write-Host ''
+    Write-Host '  The Set-ExecutionPolicy line applies to that one PowerShell window only.'
+    Write-Host '  It does not change the execution policy for your account or for this machine,'
+    Write-Host '  and it is forgotten when the window closes. It is there because Windows blocks'
+    Write-Host '  .ps1 files by default - the "running scripts is disabled on this system" error.'
+    Write-Host ''
 }
-catch {
-    Write-Host '  DELTA setup could not be started automatically:' -ForegroundColor Yellow
-    Write-Host "    `$(`$_.Exception.Message)"
+
+# RunOnce fires while the logon is still in progress. An elevation requested
+# before the desktop can host the consent UI is cancelled by Windows itself,
+# with no prompt shown and the same error code a declined prompt gives - so
+# wait for the shell rather than guess at a delay. A session with no shell at
+# all (a policy-replaced shell, a server with Explorer disabled) is not made
+# to wait the full time for something that is never coming.
+try {
+    `$sessionId = (Get-Process -Id `$PID).SessionId
+    `$deadline  = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt `$deadline) {
+        `$shell = @(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue |
+            Where-Object { `$_.SessionId -eq `$sessionId })
+        if (`$shell.Count -gt 0) { break }
+        Start-Sleep -Seconds 2
+    }
+}
+catch { }
+Start-Sleep -Seconds 3
+
+# Behind a function so the two branches below can each be exercised by
+# Test-RebootContinuation.ps1, which swaps this one definition out. The check
+# is the same one Test-IsAdministrator makes; it is repeated rather than
+# imported because this script runs with -NoProfile and no lib\ loaded.
+function Test-DeltaContinuationElevated {
+    `$identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    `$principal = New-Object Security.Principal.WindowsPrincipal(`$identity)
+    return `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+`$started = `$false
+if (Test-DeltaContinuationElevated) {
+    # Already administrator, so there is nothing to elevate and no prompt to
+    # show. Asking anyway would be a UAC prompt that changes nothing.
+    Write-Host '  This session is already elevated, so no elevation prompt is needed.'
+    try {
+        Start-Process -FilePath 'powershell.exe' -WorkingDirectory `$scriptRoot -ArgumentList `$relaunch -ErrorAction Stop
+        `$started = `$true
+    }
+    catch {
+        Write-Host '  DELTA setup could not be started:' -ForegroundColor Yellow
+        Write-Host "    `$(`$_.Exception.Message)"
+    }
+}
+else {
+    while (-not `$started) {
+        Write-Host '  Approve the elevation prompt when it appears.'
+        Write-Host ''
+        try {
+            Start-Process -FilePath 'powershell.exe' -Verb RunAs -WorkingDirectory `$scriptRoot -ArgumentList `$relaunch -ErrorAction Stop
+            `$started = `$true
+        }
+        catch {
+            Write-Host '  DELTA setup was not started:' -ForegroundColor Yellow
+            Write-Host "    `$(`$_.Exception.Message)"
+            Write-Host ''
+            Write-Host '  Windows reports a declined prompt and a prompt it cancelled itself the'
+            Write-Host '  same way, and it does cancel its own while the desktop is still signing'
+            Write-Host '  in. So this is worth one more try if you did not decline it.'
+            Write-Host ''
+            `$answer = Read-Host '  Ask for elevation again? [Y/n]'
+            if (`$answer -match '^\s*(n|no)\s*`$') { break }
+        }
+    }
+}
+
+if (`$started) {
     Write-Host ''
-    Write-Host '  Continue by hand from an elevated PowerShell:'
-    Write-Host '    cd "$(& $q $ScriptRoot)"'
-    Write-Host '    .\setup.ps1'
+    Write-Host '  DELTA setup is running in the elevated window. This one can be closed.'
     Write-Host ''
+    Start-Sleep -Seconds 5
+}
+else {
+    Show-DeltaManualRerun
     Write-Host '  Press Enter to close this window.'
     `$null = Read-Host
 }
@@ -524,10 +675,15 @@ function Request-DeltaWindowsRestart {
           reboot-required code either way; the restart is a convenience, not a
           different result.
 
-      Nothing is scheduled to run after the restart. The operator signs in and
-      runs setup.ps1 again, which reads the machine's actual state and continues
-      from there - which is the same path a manual restart takes, so there is
-      only one resume story to get right.
+      A confirmed restart registers the one-time logon continuation above, and
+      that is the only thing that ever does. It is a convenience over the
+      manual path, not a second one: it re-runs the same setup.ps1 with the
+      same -InstallRoot, so the machine's actual state still decides what
+      happens next and there is one resume story to get right.
+
+      It is offered as an attempt, never as a promise. The continuation has to
+      ask for elevation, and an elevation request can be declined - so the
+      manual commands are printed here as well, on both paths.
     #>
     param(
         [Parameter(Mandatory)][string]$ScriptRoot,
@@ -535,12 +691,15 @@ function Request-DeltaWindowsRestart {
         [bool]$AllowPrompt = $true
     )
 
-    $rerun = "  cd `"$ScriptRoot`"  then  .\setup.ps1"
+    $rerun = { Write-DeltaManualRerunCommands -ScriptRoot $ScriptRoot -InstallRoot $InstallRoot }
 
     $declined = {
         Write-Detail ''
-        Write-Detail 'Restart this machine, sign in, then run this installer again:'
-        Write-Detail $rerun
+        Write-Detail 'Restart this machine, sign in, then start Windows PowerShell as Administrator'
+        Write-Detail 'and run:'
+        Write-Detail ''
+        & $rerun
+        Write-Detail ''
         Write-Detail 'Nothing else needs to be repeated - the installer picks up where it left off.'
     }
 
@@ -570,19 +729,29 @@ function Request-DeltaWindowsRestart {
     Write-Detail 'Windows will restart in a few seconds.'
     if ($continuation.Succeeded) {
         Write-Detail ''
-        Write-Detail 'DELTA setup will continue AUTOMATICALLY the next time you sign in to this'
-        Write-Detail 'machine as this user. It opens an elevated PowerShell window and picks up from'
-        Write-Detail 'the state it finds - approve the elevation prompt when it appears.'
+        Write-Detail 'DELTA setup will TRY to continue by itself the next time you sign in to this'
+        Write-Detail 'machine as this user. A window opens, explains itself, and asks Windows for'
+        Write-Detail 'administrator rights - approve the elevation prompt when it appears, and the'
+        Write-Detail 'installation picks up from the state it finds.'
         Write-Detail 'It is a one-time arrangement: it runs once and removes itself, whatever happens.'
         Write-Detail ''
-        Write-Detail 'If you would rather do it yourself, close that window and run:'
-        Write-Detail $rerun
+        # Deliberately not promised as automatic. The elevation prompt can be
+        # declined, and Windows itself sometimes cancels it while the desktop
+        # is still signing in - so the window offers to ask again and prints
+        # these same commands if it gives up. An operator who was told this
+        # was automatic reads that as a broken installer.
+        Write-Detail 'If it does not manage it, or you would rather do it yourself, start Windows'
+        Write-Detail 'PowerShell as Administrator and run:'
+        Write-Detail ''
+        & $rerun
     }
     else {
         # Never claim an automatic continuation that was not registered.
         Write-DeltaWarning "Automatic continuation could not be registered: $($continuation.Reason)"
-        Write-Detail 'The restart still happens. After signing in, run:'
-        Write-Detail $rerun
+        Write-Detail 'The restart still happens. After signing in, start Windows PowerShell as'
+        Write-Detail 'Administrator and run:'
+        Write-Detail ''
+        & $rerun
     }
     return $true
 }

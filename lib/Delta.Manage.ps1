@@ -569,6 +569,18 @@ function Start-DeltaInstallation {
         $result.EngineStarted = ($engine.Status -eq 'ready')
     }
 
+    # Linux-container mode is verified, never switched. Switching engines stops
+    # whatever Windows containers the host is running, and this path has no
+    # standing to decide that unattended - Set-DeltaDockerLinuxEngine asks for
+    # consent, and at boot or at logon there is nobody to ask. So it is
+    # reported as its own distinct condition rather than folded into "the
+    # engine did not become available", which would send an operator looking
+    # for a Docker that is in fact running perfectly well.
+    if ($engine.Status -eq 'wrong-mode') {
+        $result.Reason = "Docker is running in $($engine.OSType)-container mode. DELTA's images are linux/amd64, so the stack was not started. Switch Docker Desktop to Linux containers - the installer's Start DELTA menu entry will offer to - and start DELTA again."
+        return $result
+    }
+
     if ($engine.Status -ne 'ready') {
         $result.Reason = "The Docker engine did not become available (state: $($engine.Status)). $(if ($engine.RawError) { $engine.RawError } else { $engine.Detail })"
         return $result
@@ -664,6 +676,7 @@ function Get-DeltaManagementStatus {
         Endpoint      = $null
         Startup       = $null
         StartupTask   = $null
+        StartupHealth = $null
         Backups       = $null
         Domains       = $null
     }
@@ -756,14 +769,21 @@ function Get-DeltaManagementStatus {
         $status.Domains = Get-DeltaDomainModel -InstallRoot $InstallRoot -Configuration $status.Configuration
     }
 
-    # Phase 6's record, displayed and never re-measured here: "configured" and
-    # "proven by a real restart" are different claims and stay different.
+    # Automatic startup is re-measured on every refresh, not read out of the
+    # installer's record. The record says what was configured once; Windows
+    # says what is registered now, and only the second of those is what happens
+    # at the next restart. Trusting the record alone is what let this screen
+    # report "Restart  Configured" on a host whose startup task did not exist.
+    #
+    # The record still supplies exactly one fact, because it is the only thing
+    # that can: whether a real restart has already been recovered from.
     $stateRead = Read-DeltaInstallState -InstallRoot $InstallRoot
     if ($stateRead.Exists -and $stateRead.IsValid -and (@($stateRead.Data.PSObject.Properties.Name) -contains 'unattendedStartup')) {
         $status.Startup = $stateRead.Data.unattendedStartup
     }
     if ($status.Configuration) {
-        $status.StartupTask = Get-DeltaStartupTaskState -ProjectName $status.Configuration.ProjectName
+        $status.StartupHealth = Test-DeltaStartupMechanism -ProjectName $status.Configuration.ProjectName -Recorded $status.Startup
+        $status.StartupTask = $status.StartupHealth.Task
     }
 
     # Filesystem only - no second Compose query, which would undo the one-query
@@ -872,20 +892,15 @@ function Show-DeltaManagementStatus {
         Write-DeltaStatusRow -Label 'Access' -State 'Unknown' -Detail "$($Status.InstallRoot)\.env could not be read" -Colour 'Yellow'
     }
 
-    # Phase 6's distinction, preserved exactly: configured is not proven.
-    if ($Status.Startup) {
-        $mechanism = [string]$Status.Startup.mechanism
-        if ([bool]$Status.Startup.rebootTested) {
-            Write-DeltaStatusRow -Label 'Restart' -State 'Proven' -Detail "returns unattended via $mechanism; measured by a real restart"
-        }
-        elseif ([bool]$Status.Startup.configured) {
-            Write-DeltaStatusRow -Label 'Restart' -State 'Configured' -Detail "$mechanism - CONFIGURED but NOT YET PROVEN by a real restart"
-        }
-        else {
-            Write-DeltaStatusRow -Label 'Restart' -State 'Not set up' -Detail 'DELTA stays down after a restart until somebody signs in' -Colour 'Yellow'
-        }
-        if ($Status.StartupTask -and $Status.Startup.mechanism -eq 'startup-task' -and -not $Status.StartupTask.Exists) {
-            Write-DeltaStatusRow -Label '' -State '' -Detail "the recorded startup task '$($Status.Startup.taskName)' no longer exists" -Colour 'Yellow'
+    # Phase 6's distinction, preserved exactly and now enforced against the
+    # host rather than against the record: enabled is not verified, and a
+    # mechanism that is not registered is neither.
+    if ($Status.StartupHealth) {
+        $colour = if ($Status.StartupHealth.Present) { $null } else { 'Yellow' }
+        Write-DeltaStatusRow -Label 'Restart' -State $Status.StartupHealth.State -Detail $Status.StartupHealth.Detail -Colour $colour
+
+        if (-not $Status.StartupHealth.Present) {
+            Write-DeltaStatusRow -Label '' -State '' -Detail 'it is registered again the next time this screen is opened; if that keeps failing, reinstall over this installation' -Colour 'Yellow'
         }
     }
 
@@ -3264,11 +3279,30 @@ function Invoke-DeltaManagementMode {
     $null = Initialize-DeltaDockerPath
 
     $rotationInitialised = $false
+    $startupInitialised = $false
 
     while ($true) {
         $status = Get-DeltaManagementStatus -InstallRoot $InstallRoot
 
         Show-Section -Title 'DELTA Docker Management' -Subtitle $InstallRoot
+
+        # Once per session, and before the status is drawn: make sure the
+        # startup mechanism this installation needs is registered and current.
+        # It needs no Docker and changes nothing else, and it is what gives an
+        # installation whose task was never registered - or has since been
+        # removed - a way back without a reinstall. Doing it before the status
+        # row is drawn means the row reports the state the operator is leaving
+        # the machine in, not the one it was in a moment ago.
+        if (-not $startupInitialised -and $status.Configuration) {
+            $startupInitialised = $true
+            $repair = Initialize-DeltaStartupMechanism -InstallRoot $InstallRoot -ScriptRoot $ScriptRoot -Configuration $status.Configuration
+            if ($repair.Succeeded -and $repair.Action -ne 'unchanged') {
+                $status.StartupHealth = Test-DeltaStartupMechanism -ProjectName $status.Configuration.ProjectName -InstallRoot $InstallRoot
+                $status.StartupTask = $status.StartupHealth.Task
+                $status.Startup = $status.StartupHealth.Recorded
+            }
+        }
+
         Show-DeltaManagementStatus -Status $status
 
         if (-not $status.Configuration) {
