@@ -470,9 +470,10 @@ function Register-DeltaLogonContinuation {
       Arranges for setup.ps1 to run itself again at the operator's next
       interactive logon, once, after an installer-managed restart.
 
-      Registered ONLY when the operator explicitly chose the restart at the
-      prompt below. A declined restart, a non-interactive run and a reboot the
-      operator performs themselves all leave the machine with nothing scheduled.
+      Registered ONLY when the operator explicitly chose the restart below -
+      OK on the restart dialog, or Y at its console fallback. A declined
+      restart, a non-interactive run and a reboot the operator performs
+      themselves all leave the machine with nothing scheduled.
 
       Three separate things stop this becoming a logon loop:
 
@@ -481,7 +482,8 @@ function Register-DeltaLogonContinuation {
         - The command deletes the value itself, first, before doing anything
           else - so a Windows that behaved differently, or an entry somehow
           written twice, still only fires once.
-        - Nothing is re-registered except by another explicit Y at the prompt.
+        - Nothing is re-registered except by another explicit approval of the
+          restart. The continuation itself never registers anything.
 
       No step-specific resume state is written anywhere. The continuation runs
       the same setup.ps1 with the same -InstallRoot, and the installer's own
@@ -496,9 +498,11 @@ function Register-DeltaLogonContinuation {
       The relaunch elevates. RunOnce runs with the user's filtered token, so
       the command opens a visible window that explains itself and then asks for
       elevation - a UAC prompt appearing unexplained after a restart is how an
-      operator learns to click No. setup.ps1 itself never elevates; it checks
-      and refuses. Keeping elevation here, in the one launcher, is what makes
-      the resumed run exactly one UAC flow.
+      operator learns to click No. It was also explained before the machine
+      went down, in the restart dialog, which is where the operator agreed to
+      all of this; nothing here asks them to agree a second time. setup.ps1
+      itself never elevates; it checks and refuses. Keeping elevation here, in
+      the one launcher, is what makes the resumed run exactly one UAC flow.
 
       Three things the generated script does that a bare Start-Process -Verb
       RunAs at logon does not, each of them a failure seen on Windows 11:
@@ -567,6 +571,9 @@ Remove-ItemProperty -LiteralPath '$(& $q $Script:DeltaRunOnceKey)' -Name '$(& $q
 Write-Host ''
 Write-Host '  DELTA setup is continuing after the restart.'
 Write-Host ''
+Write-Host '  Windows is still finishing its sign-in, so this can take a short while.'
+Write-Host '  Please wait - do not start setup.ps1 yourself while this window is open.'
+Write-Host ''
 
 function Show-DeltaManualRerun {
     Write-Host ''
@@ -617,121 +624,12 @@ function Test-DeltaContinuationElevated {
     return `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# The one place a Windows dialog is raised. Returns the button as lowercase
-# text, or `$null when no dialog could be shown at all - which is the whole
-# contract: `$null means "fall back to the console", and every caller below
-# does exactly that. A machine that cannot show a dialog must still be
-# resumable, so nothing here is allowed to be fatal.
-#
-# Also swapped out by Test-RebootContinuation.ps1, which is what lets OK,
-# Cancel and no-GUI-at-all be exercised without a desktop.
-function Show-DeltaContinuationDialog {
-    param(
-        [Parameter(Mandatory)][string]`$Text,
-        [string]`$Caption = 'DELTA Setup - Continue Installation',
-        [ValidateSet('OKCancel', 'OK', 'YesNo')][string]`$Buttons = 'OKCancel',
-        [ValidateSet('Information', 'Warning')][string]`$Icon = 'Information'
-    )
-
-    # Checked BEFORE anything is shown, because these two failures do not
-    # throw - they hang. MessageBox on an MTA thread blocks indefinitely
-    # instead of returning, and so a catch-all around it would never fire;
-    # measured, not assumed. RunOnce runs powershell.exe, which is STA by
-    # default, so this is a guard rather than a routine path - but a resume
-    # that hangs with no window on screen is the one outcome worse than no
-    # dialog at all.
-    try {
-        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { return `$null }
-        if (-not [Environment]::UserInteractive) { return `$null }
-    }
-    catch { return `$null }
-
-    `$anchor = `$null
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-
-        # An owner window that is TopMost, because this dialog appears while
-        # the desktop is still settling after a sign-in and an unowned message
-        # box can open behind Explorer. A dialog nobody sees would be worse
-        # than the console text it replaces.
-        `$anchor = New-Object System.Windows.Forms.Form
-        `$anchor.TopMost       = `$true
-        `$anchor.ShowInTaskbar = `$false
-        `$anchor.StartPosition = 'CenterScreen'
-        `$null = `$anchor.Handle
-
-        # Cast, not [Type]::`$variable - dynamic static-member access on an enum
-        # is not something Windows PowerShell 5.1 can be relied on to resolve.
-        `$result = [System.Windows.Forms.MessageBox]::Show(
-            `$anchor, `$Text, `$Caption,
-            ([System.Windows.Forms.MessageBoxButtons]`$Buttons),
-            ([System.Windows.Forms.MessageBoxIcon]`$Icon))
-
-        return ([string]`$result).ToLowerInvariant()
-    }
-    catch {
-        return `$null
-    }
-    finally {
-        if (`$anchor) { try { `$anchor.Dispose() } catch { } }
-    }
-}
-
-`$elevated = Test-DeltaContinuationElevated
-
-# Two different sentences, because promising a UAC prompt to a session that
-# will not get one is the kind of small lie that makes an operator sit waiting
-# for a window that is never coming.
-`$introText = if (`$elevated) {
-    @(
-        'DELTA setup is ready to continue after the restart.'
-        ''
-        'Click OK to continue the installation.'
-        ''
-        'The DELTA installer will continue in a PowerShell window.'
-        'Please be patient and do not close it until setup finishes'
-        'or asks you for input.'
-    ) -join [Environment]::NewLine
-}
-else {
-    @(
-        'DELTA setup is ready to continue after the restart.'
-        ''
-        'Click OK to continue. Windows will ask for'
-        'administrator permission (UAC).'
-        ''
-        'After you approve it, the DELTA installer will continue'
-        'automatically in a PowerShell window.'
-        ''
-        'Please be patient while setup continues.'
-        'Do not close the PowerShell window until DELTA setup'
-        'finishes or asks you for input.'
-    ) -join [Environment]::NewLine
-}
-
-# `$null - no dialog on this machine - is not a refusal. It means the operator
-# was never asked, so the console path runs exactly as it did before dialogs
-# existed here.
-`$choice    = Show-DeltaContinuationDialog -Text `$introText -Buttons 'OKCancel'
-`$hasDialog = (`$null -ne `$choice)
-`$cancelled = (`$choice -eq 'cancel')
-
+# Nothing here asks the operator whether to continue. That decision was made
+# before the machine went down, at the restart dialog, and asking again after
+# the sign-in would be a second confirmation for one choice. The only thing
+# that can still need a human after this point is the Windows UAC prompt.
 `$started = `$false
-if (`$cancelled) {
-    # Nothing is elevated, nothing is registered, nothing is restarted, and the
-    # partial installation is left exactly as it is. The RunOnce value was
-    # already consumed at the top of this script, so nothing fires again on its
-    # own either.
-    `$null = Show-DeltaContinuationDialog -Buttons 'OK' -Caption 'DELTA Setup' -Text (@(
-        'DELTA installation is still incomplete.'
-        ''
-        'You can continue later by running setup.ps1 again'
-        'as Administrator.'
-    ) -join [Environment]::NewLine)
-
-    Write-Host '  Continuation cancelled. Nothing was changed on this machine.'
-}
-elseif (`$elevated) {
+if (Test-DeltaContinuationElevated) {
     # Already administrator, so there is nothing to elevate and no prompt to
     # show. Asking anyway would be a UAC prompt that changes nothing.
     Write-Host '  This session is already elevated, so no elevation prompt is needed.'
@@ -764,27 +662,8 @@ else {
             # Deliberate, and asked once per attempt. Never automatic: Windows
             # cannot tell this script whether the operator declined, so a retry
             # it did not ask for would be a UAC prompt that keeps coming back.
-            `$retryText = @(
-                'DELTA setup did not start.'
-                ''
-                'Windows did not confirm administrator permission. That happens'
-                'when the prompt is declined, and also when Windows cancels its'
-                'own prompt while the desktop is still signing in.'
-                ''
-                'Ask Windows for administrator permission again?'
-            ) -join [Environment]::NewLine
-
-            `$again = if (`$hasDialog) {
-                Show-DeltaContinuationDialog -Text `$retryText -Buttons 'YesNo' -Icon 'Warning' -Caption 'DELTA Setup - Continue Installation'
-            }
-            else { `$null }
-
-            if (`$null -eq `$again) {
-                # No dialog, or the dialog stopped working part-way through.
-                `$answer = Read-Host '  Ask for elevation again? [Y/n]'
-                if (`$answer -match '^\s*(n|no)\s*`$') { break }
-            }
-            elseif (`$again -ne 'yes') { break }
+            `$answer = Read-Host '  Ask for elevation again? [Y/n]'
+            if (`$answer -match '^\s*(n|no)\s*`$') { break }
         }
     }
 }
@@ -839,6 +718,42 @@ else {
     return $result
 }
 
+$Script:DeltaRestartDialogCaption = 'DELTA Setup - Windows Restart Required'
+
+function Get-DeltaRestartDialogText {
+    <#
+      What the operator has to know BEFORE the machine goes down, in one place
+      so the dialog and its console fallback cannot say different things.
+
+      It is longer than a question needs to be, deliberately. Everything an
+      operator would otherwise have to discover after the restart - that they
+      must sign back in as the same account, that the continuation is not
+      instant, that waiting is the correct response to an empty screen, and
+      that a UAC prompt has to be approved - is stated here, while there is
+      still somebody at the keyboard to read it. After the restart the
+      installer asks nothing and only Windows does: this text is the entire
+      briefing for what follows.
+    #>
+
+    return (@(
+        'Windows must restart before DELTA installation can continue.'
+        ''
+        'Save your work before continuing.'
+        ''
+        'Click OK to restart Windows now.'
+        ''
+        'After Windows restarts, sign back in using the same Windows'
+        'account. DELTA setup will continue automatically.'
+        ''
+        'It may take a short while for the setup window to appear while'
+        'Windows finishes starting. Please wait patiently and do not'
+        'start setup.ps1 again.'
+        ''
+        'Windows may ask for administrator permission (UAC).'
+        'Approve the UAC prompt to continue the installation.'
+    ) -join [Environment]::NewLine)
+}
+
 function Request-DeltaWindowsRestart {
     <#
       Offers to restart Windows when a prerequisite has asked for one, and
@@ -851,18 +766,34 @@ function Request-DeltaWindowsRestart {
       with a proper closing line instead of being cut off mid-write by a
       shutdown.
 
+      The question is asked in a Windows dialog, because it is the one question
+      in this installer whose answer depends on the operator having read a
+      paragraph first. A [y/N] under half a screen of console text is answered
+      without reading it; a modal dialog is not. What the dialog says is
+      Get-DeltaRestartDialogText above, and it is the whole briefing for what
+      happens after the sign-in - because after the sign-in this installer asks
+      nothing at all.
+
       Three rules it cannot be talked out of:
 
-        - Nothing restarts without a typed Y. Bare Enter is no, as everywhere
-          else in this installer, so an operator who hurried past the prompt
-          keeps their machine up.
-        - -NonInteractive never restarts. An unattended run has nobody to judge
-          whether this machine can go down right now, and rebooting a server on
-          its own authority is not a decision an installer gets to make. It
-          prints the manual instructions and exits with the same code.
+        - Nothing restarts without an explicit approval: OK on the dialog, or
+          a typed Y at the console fallback. Bare Enter is no there, as
+          everywhere else in this installer, so an operator who hurried past
+          the prompt keeps their machine up.
+        - -NonInteractive never restarts, and never opens a window. An
+          unattended run has nobody to judge whether this machine can go down
+          right now, and rebooting a server on its own authority is not a
+          decision an installer gets to make. It prints the manual
+          instructions and exits with the same code.
         - Declining changes nothing about the outcome. The exit code is the
           reboot-required code either way; the restart is a convenience, not a
           different result.
+
+      The dialog is best-effort and never a gate. A machine that cannot show
+      one - Server Core, a session with no desktop - gets exactly the console
+      question it got before dialogs existed here, with the same explanation
+      printed above it, and the same typed-Y semantics. A GUI failure must
+      never be the thing that stops an operator continuing.
 
       A confirmed restart registers the one-time logon continuation above, and
       that is the only thing that ever does. It is a convenience over the
@@ -871,7 +802,7 @@ function Request-DeltaWindowsRestart {
       happens next and there is one resume story to get right.
 
       It is offered as an attempt, never as a promise. The continuation has to
-      ask for elevation, and an elevation request can be declined - so the
+      ask Windows for elevation, and a UAC prompt can be declined - so the
       manual commands are printed here as well, on both paths.
     #>
     param(
@@ -900,18 +831,40 @@ function Request-DeltaWindowsRestart {
     }
 
     Write-Detail ''
-    Write-Detail 'This installer can restart Windows for you now, and carry on by itself when you'
-    Write-Detail 'sign back in.'
     Write-Detail 'Restarting closes every open application on this machine, so save your work first.'
     Write-Detail 'Nothing about the installation is lost either way.'
     Write-Host ''
 
-    if (-not (Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]')) {
+    # $null is not an answer. It means no dialog could be shown on this
+    # machine, so the operator was never asked - and the console asks instead,
+    # exactly as it did before this dialog existed.
+    $choice = Show-DeltaMessageDialog `
+        -Text (Get-DeltaRestartDialogText) `
+        -Caption $Script:DeltaRestartDialogCaption `
+        -Buttons 'OKCancel' `
+        -Icon 'Warning'
+
+    if ($null -eq $choice) {
+        # The same words the dialog would have shown, because the operator
+        # needs them just as much on a machine that cannot draw a window.
+        foreach ($line in ((Get-DeltaRestartDialogText) -split "`r?`n")) { Write-Detail $line }
+        Write-Host ''
+        $confirmed = Read-DeltaInlineConfirmation -Prompt 'Restart Windows now? [y/N]'
+    }
+    else {
+        # Recorded because the transcript is read after the machine has been
+        # down, when nothing on screen says which button was clicked.
+        Write-Detail "Restart dialog answered: $choice."
+        $confirmed = ($choice -eq 'ok')
+    }
+
+    if (-not $confirmed) {
         & $declined
         return $false
     }
 
-    # Registered only here, after an explicit Y, and only for a prompted run.
+    # Registered only here, after an explicit approval, and only for a prompted
+    # run.
     $continuation = Register-DeltaLogonContinuation -ScriptRoot $ScriptRoot -InstallRoot $InstallRoot
 
     Write-Detail ''
@@ -919,8 +872,10 @@ function Request-DeltaWindowsRestart {
     if ($continuation.Succeeded) {
         Write-Detail ''
         Write-Detail 'DELTA setup will TRY to continue by itself the next time you sign in to this'
-        Write-Detail 'machine as this user. A window opens, explains itself, and asks Windows for'
-        Write-Detail 'administrator rights - approve the elevation prompt when it appears, and the'
+        Write-Detail 'machine as this user. It is not instant - Windows has to finish signing in'
+        Write-Detail 'first - so give it a short while before assuming nothing is happening, and do'
+        Write-Detail 'not start setup.ps1 yourself in the meantime.'
+        Write-Detail 'Windows may ask for administrator permission (UAC); approve it, and the'
         Write-Detail 'installation picks up from the state it finds.'
         Write-Detail 'It is a one-time arrangement: it runs once and removes itself, whatever happens.'
         Write-Detail ''

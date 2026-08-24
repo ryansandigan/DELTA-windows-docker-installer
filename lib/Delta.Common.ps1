@@ -1388,6 +1388,95 @@ function Select-DeltaFolder {
     finally { Resume-DeltaActivity }
 }
 
+# ---------------------------------------------------------------------------
+# Message dialogs
+#
+# Exactly one question in this installer is asked in a Windows dialog rather
+# than at the console: whether to restart Windows now. It is asked that way
+# because the operator has to READ something before answering - what the
+# machine will do after the restart, how long it may take, and that a UAC
+# prompt has to be approved - and half a screen of console text above a [y/N]
+# prompt is precisely what an operator hurrying through an installation
+# scrolls past. Nothing else here gained a dialog.
+# ---------------------------------------------------------------------------
+
+function Show-DeltaMessageDialog {
+    <#
+      Shows a standard Windows message box and returns the button that was
+      clicked, lowercased - 'ok', 'cancel', 'yes', 'no' - or $null when no
+      dialog could be shown at all.
+
+      $null is the whole contract, and it is not an answer: it means the
+      operator was never asked, and every caller falls back to the console
+      question it would otherwise have asked. A machine that cannot open a
+      window - Server Core, a session with no desktop - must still be able to
+      answer, so nothing here is fatal and nothing here is allowed to hang.
+
+      The two hosting failures are refused BEFORE anything is shown, because
+      neither of them throws. MessageBox on an MTA thread blocks indefinitely
+      rather than returning - measured, the same failure Select-DeltaSslFile
+      refuses above - so a catch around it would never fire. A session that is
+      not user-interactive has nowhere to put a window. powershell.exe is STA
+      and interactive on every path that reaches this, so both are guards
+      rather than routine, but a question that hangs with nothing on screen is
+      worse than no question at all.
+
+      Standard buttons only. A message box's captions come from Windows and
+      are localised by Windows; relabelling them would mean building a form,
+      and a hand-built form is a dialog an operator has never seen before.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Caption,
+        [ValidateSet('OK', 'OKCancel', 'YesNo')][string]$Buttons = 'OKCancel',
+        [ValidateSet('Information', 'Warning', 'Error')][string]$Icon = 'Information'
+    )
+
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+            return $null
+        }
+        if (-not [Environment]::UserInteractive) { return $null }
+    }
+    catch { return $null }
+
+    # A modal dialog is a prompt with a window around it, and gets the same
+    # treatment as the typed ones: nothing animates while it waits.
+    Suspend-DeltaActivity
+    $anchor = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+        # An owner window that is TopMost, because an unowned message box can
+        # open behind the window that raised it. A dialog nobody sees would be
+        # worse than the console question it replaces.
+        $anchor = New-Object System.Windows.Forms.Form
+        $anchor.TopMost       = $true
+        $anchor.ShowInTaskbar = $false
+        $anchor.StartPosition = 'CenterScreen'
+        $null = $anchor.Handle
+
+        # Cast, not [Type]::$variable - dynamic static-member access on an enum
+        # is not something Windows PowerShell 5.1 can be relied on to resolve.
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            $anchor, $Text, $Caption,
+            ([System.Windows.Forms.MessageBoxButtons]$Buttons),
+            ([System.Windows.Forms.MessageBoxIcon]$Icon))
+
+        $answer = ([string]$result).ToLowerInvariant()
+        Write-DeltaLogLine -Message "$Caption -> $answer" -Level 'DETAIL'
+        return $answer
+    }
+    catch {
+        Write-DeltaLogLine -Message "A Windows dialog could not be shown ($Caption): $($_.Exception.Message)" -Level 'DETAIL'
+        return $null
+    }
+    finally {
+        if ($anchor) { try { $anchor.Dispose() } catch { } }
+        Resume-DeltaActivity
+    }
+}
+
 function ConvertTo-DeltaPlainText {
     <#
       SecureString to plain text, at the point it is genuinely needed. Uses

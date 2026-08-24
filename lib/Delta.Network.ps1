@@ -435,6 +435,12 @@ function Invoke-DeltaOpenSsl {
       installer accepts are a PEM certificate and an unencrypted PEM key, and
       neither needs a password to read - so there is no password channel to get
       wrong.
+
+      The command is normalised to LF endings before it reaches sh. The scripts
+      below are here-strings in a .ps1 file, so their line endings are whatever
+      git, an editor or the release packager last left on disk - and a CR is a
+      literal character to this image's dash, not whitespace. See
+      ConvertTo-DeltaShellScript for what that costs when it is not done.
     #>
     param(
         [Parameter(Mandatory)][string]$Image,
@@ -444,6 +450,8 @@ function Invoke-DeltaOpenSsl {
         [int]$TimeoutSeconds = 180
     )
 
+    $script = ConvertTo-DeltaShellScript -Script $Command
+
     # Starting a container is never instant, and on the first certificate
     # operation of an installation the image may not be local yet - which turns
     # a "checking your certificate" pause into a silent minute. -WhenIdle, so
@@ -452,7 +460,7 @@ function Invoke-DeltaOpenSsl {
     $mount = if ($Writable) { "${MountPath}:/work" } else { "${MountPath}:/work:ro" }
     return (Invoke-DeltaActivity -Message 'Running OpenSSL in a container' -WhenIdle -ScriptBlock {
         Invoke-DeltaDockerCommand -Arguments @(
-            'run', '--rm', '--network', 'none', '-v', $mount, '--entrypoint', 'sh', $Image, '-c', $Command
+            'run', '--rm', '--network', 'none', '-v', $mount, '--entrypoint', 'sh', $Image, '-c', $script
         ) -TimeoutSeconds $TimeoutSeconds
     })
 }

@@ -148,10 +148,14 @@ more detail later in this document.
    installer uses it and asks nothing about it.
 
 8. **If it asks to restart Windows, let it.** Docker Desktop and the WSL2
-   platform need a restart before the installation can go on. After you sign
-   back in, DELTA **tries** to pick up where it left off:
+   platform need a restart before the installation can go on. A
+   **DELTA Setup - Windows Restart Required** dialog appears and explains what
+   will happen; read it, save your work, and click **OK**. Then:
 
-   - a **DELTA Setup** dialog appears — click **OK**;
+   - sign back in using the **same** Windows account;
+   - wait — the continuation is not instant, and can take up to a minute or so
+     while Windows finishes starting. Do not run `setup.ps1` yourself in the
+     meantime;
    - approve the Windows administrator permission (UAC) prompt if one appears;
    - the installer resumes in a PowerShell window.
 
@@ -380,49 +384,83 @@ Run `Get-Help .\setup.ps1 -Full` for the rest.
 
 Docker Desktop's WSL2 backend needs Windows features that only take effect
 after a restart. When the installer finds one missing it enables it, stops
-before touching Docker at all, and offers to restart Windows for you.
+before touching Docker at all, and asks whether to restart Windows for you.
 
-Say yes and it registers a **one-time** continuation for your account, then
-restarts. Nothing is scheduled permanently: Windows runs the entry once and
-deletes it, whatever the outcome.
+That question is asked in a Windows dialog rather than at the terminal, because
+it is the one question in this installer whose answer depends on your having
+read a paragraph first — and because the paragraph is your only chance to be
+told what happens *after* the machine goes down, while there is still somebody
+at the keyboard to read it. It is also the only thing DELTA asks about the
+restart: **after you sign back in, DELTA asks nothing at all.**
 
-When you sign back in:
+#### 1. The restart dialog
+
+**DELTA Setup - Windows Restart Required**, with **OK** and **Cancel**:
+
+> Windows must restart before DELTA installation can continue.
+>
+> Save your work before continuing.
+>
+> Click OK to restart Windows now.
+>
+> After Windows restarts, sign back in using the same Windows account. DELTA
+> setup will continue automatically.
+>
+> It may take a short while for the setup window to appear while Windows
+> finishes starting. Please wait patiently and do not start setup.ps1 again.
+>
+> Windows may ask for administrator permission (UAC). Approve the UAC prompt to
+> continue the installation.
+
+**OK** registers a **one-time** continuation for your account and restarts.
+Nothing is scheduled permanently: Windows runs the entry once and deletes it,
+whatever the outcome.
+
+**Cancel** restarts nothing and schedules nothing. The installation stops
+exactly where it is with the reboot-required exit code, and the commands to
+continue by hand are printed in the console — restart the machine yourself when
+it suits you, and run `setup.ps1` again.
+
+#### 2. What happens after you sign back in
+
+Sign in using the **same Windows account** — the continuation belongs to that
+account and fires for nobody else.
 
 1. A console window appears saying **"DELTA setup is continuing after the
    restart."**
-2. It waits for the desktop to finish signing in. This is not instant — give it
-   up to a minute or so.
-3. A **DELTA Setup - Continue Installation** dialog appears, asking whether to
-   go on. Click **OK**. This is a dialog rather than another line of console
-   text on purpose: the PowerShell window is where the installer's own output
-   goes, and anything that needs *you* is a Windows dialog you cannot miss
-   under a screen of scrolling text.
-4. **Windows shows a UAC elevation prompt.** You must approve it. The installer
+2. It waits for the desktop to finish signing in. **This is not instant** —
+   give it up to about a minute. A screen that looks idle is the normal case
+   here, not a failure. **Do not start `setup.ps1` yourself while that window
+   is open**: the continuation is still coming.
+3. **Windows shows a UAC elevation prompt.** You must approve it. The installer
    cannot continue without administrator rights, and the window in front of you
-   does not have them. (If you signed in to an account that is already running
-   elevated, there is no prompt, and the dialog does not claim there will be
-   one.)
-5. The installation carries on in a PowerShell window, from the state it finds
+   does not have them. This is Windows' own prompt, and it is the only
+   confirmation you are asked for after the restart. (If you signed in to an
+   account that is already running elevated, there is no prompt at all and the
+   installer simply starts.)
+4. The installation carries on in a PowerShell window, from the state it finds
    — the same installation folder, the same answers. You are not asked the
    installation questions again. **Leave that window open** until setup
    finishes or asks you something.
-
-Clicking **Cancel** on the dialog is safe and changes nothing: nothing is
-elevated, nothing is restarted, and the partial installation is left exactly as
-it is. You are told so, and the commands to continue later are printed in the
-console window behind it.
 
 **This is an attempt, not a guarantee.** The elevation prompt can be declined,
 and Windows sometimes cancels its own prompt when it is asked for one while the
 desktop is still coming up. Either way you get the same message —
 `The operation was canceled by the user` — because Windows reports both the
-same way. You are then asked, once, whether to **ask Windows again**; say yes
-and the prompt comes back. That is worth doing once if you did not decline it
-yourself. It never asks again on its own.
+same way. The console window then asks, once, `Ask for elevation again? [Y/n]`;
+answer `Y` and the prompt comes back. That is worth doing once if you did not
+decline it yourself. It never asks again on its own.
 
 Nothing is lost if it gives up. The installation resumes from the machine's
 actual state whenever you next run `setup.ps1`, which is exactly what the
 automatic path does.
+
+> **On a machine that cannot show a dialog** — Server Core, or a session with
+> no desktop — the restart question falls back to the console:
+> `Restart Windows now? [y/N]`, with the same explanation printed above it. A
+> typed `Y` restarts; `N` and bare Enter do not. `-NonInteractive` shows
+> neither the dialog nor the question, restarts nothing, and prints the manual
+> instructions instead.
 
 #### If the restart does not continue by itself
 
@@ -2202,24 +2240,53 @@ and that the chosen root survives the prerequisite restart:
 .\tools\Test-InstallRootSelection.ps1
 ```
 
-`tools\Test-RebootContinuation.ps1` covers the resume after the prerequisite
-restart. It reads the real `Register-DeltaLogonContinuation` out of `setup.ps1`
-with the PowerShell parser, decodes the script that function registers, and then
-actually runs it with every host call replaced by a recorder — so the assertions
-are about behaviour, not about the shape of the source. It asserts that the
-entry is a self-deleting `RunOnce` value under `HKCU`, that both the launcher
-and the relaunched `setup.ps1` get `-NoProfile -ExecutionPolicy Bypass`, that
-neither `setup.ps1` nor the generated script ever writes a `LocalMachine`,
-`CurrentUser`, `MachinePolicy` or `UserPolicy` execution policy, that an
-unelevated logon gets exactly one `-Verb RunAs` and an already-elevated one gets
-none, that the script waits for the desktop shell instead of sleeping a fixed
-interval, that a cancelled UAC prompt is offered again only when the operator
-asks and never on its own, and that the fallback text it prints is a runnable
-three-line sequence carrying the real installer folder and the real
-`-InstallRoot`. Installer paths and installation roots containing spaces — and
-an apostrophe — are exercised throughout, and the generated script is required
-to parse. Nothing is written to the real `RunOnce` key and no process is
-started:
+`tools\Test-RebootContinuation.ps1` covers both halves of the prerequisite
+restart: the dialog that asks for it, and the resume that follows it. It reads
+the real `Request-DeltaWindowsRestart`, `Get-DeltaRestartDialogText` and
+`Register-DeltaLogonContinuation` out of `setup.ps1` with the PowerShell parser,
+decodes the script the registration produces, and then actually runs it with
+every host call replaced by a recorder — so the assertions are about behaviour,
+not about the shape of the source.
+
+For the pre-restart question it asserts that an interactive reboot-required run
+raises exactly one `OKCancel` dialog titled **DELTA Setup - Windows Restart
+Required**, that the terminal `Restart Windows now? [y/N]` is not used when the
+dialog works, that the dialog states every one of the six things it has to state
+before the machine goes down, that **OK** confirms the restart and arms the
+continuation exactly once with the resolved `-InstallRoot`, that **Cancel** arms
+nothing and prints the manual commands, that a machine which cannot show a
+dialog gets the original console question with the same explanation above it and
+keeps typed-`Y` semantics — `n`, `N`, `no`, bare Enter and even `yes` all decline
+— and that `-NonInteractive` shows neither the dialog nor the question and
+registers nothing. The real `Show-DeltaMessageDialog` is also run on an MTA
+thread, where `MessageBox` blocks instead of throwing, to prove it returns
+`$null` rather than hanging the installation.
+
+For the resume it asserts that the entry is a self-deleting `RunOnce` value
+under `HKCU`, that both the launcher and the relaunched `setup.ps1` get
+`-NoProfile -ExecutionPolicy Bypass`, that neither `setup.ps1` nor the generated
+script ever writes a `LocalMachine`, `CurrentUser`, `MachinePolicy` or
+`UserPolicy` execution policy, that an unelevated logon gets exactly one
+`-Verb RunAs` and an already-elevated one gets none, that the script waits for
+the desktop shell instead of sleeping a fixed interval, that a cancelled UAC
+prompt is offered again only when the operator asks and never on its own, that
+the continuation registers nothing and can therefore not loop, and that the
+fallback text it prints is a runnable three-line sequence carrying the real
+installer folder and the real `-InstallRoot`. It also pins the absence of the
+one thing that must not come back: the continuation loads no Windows Forms,
+calls no `MessageBox`, and defines no dialog of its own, so **no DELTA
+confirmation appears between the sign-in and the UAC prompt**. The harness fails
+any `Add-Type` the continuation attempts, so a reintroduced dialog is a test
+failure rather than a window on a maintainer's desktop.
+
+The `RunOnce` command-length guard is exercised with an installation root long
+enough to exceed what `CreateProcess` accepts — registration must refuse rather
+than write a value Windows will not run — and the tokenizer-based comment
+stripping is exercised against `#` characters inside single- and double-quoted
+strings, which must survive. Installer paths and installation roots containing
+spaces — and an apostrophe — are exercised throughout, and the generated script
+is required to parse. Nothing is written to the real `RunOnce` key and no process
+is started:
 
 ```powershell
 .\tools\Test-RebootContinuation.ps1
@@ -2229,6 +2296,37 @@ started:
 > says the continuation is built correctly; it does not say the resume works on
 > your machine. See
 > [Validating the restart by hand](#validating-the-restart-by-hand).
+
+`tools\Test-CertificateValidation.ps1` covers certificate/private-key
+validation and the shell payload the OpenSSL container is given. It exists for
+a specific failure: a valid certificate and key were rejected with
+`The certificate and key could not be compared. OpenSSL reported: sh: 1: set:
+Illegal option -`, because the here-string carrying the comparison script had
+been checked out with CRLF endings and a carriage return is an ordinary
+character to the container's `dash`, not whitespace. The suite asserts that
+nothing handed to `sh -c` contains a carriage return whatever this repository's
+files look like on disk, that both OpenSSL scripts are otherwise unchanged,
+that the operator's own paths never reach Docker — both files are copied into
+one throwaway staging directory and only that is mounted, which is why a
+certificate on `D:\` works — and that the container still gets `--rm` and
+`--network none`. It then re-checks the validation itself: a matching pair is
+accepted, a mismatched key is rejected *as a mismatch*, a private key selected
+as the certificate is rejected as an unparseable certificate, an encrypted key
+and an expired certificate are still refused, a certificate near expiry is
+accepted with a warning, and a Docker failure is surfaced rather than letting a
+pair through unchecked. Real RSA material is generated per run and written to
+temporary directories; Docker is replaced by a stand-in that models `dash`'s own
+handling of `set`, so reverting the fix makes this suite fail with the
+operator's exact message:
+
+```powershell
+.\tools\Test-CertificateValidation.ps1
+```
+
+Add `-Live` to additionally run the real OpenSSL container against real
+material. That needs a working Linux engine and the database image already
+present locally; it pulls nothing and starts only `--rm --network none`
+containers.
 
 `tools\Test-UnattendedStartup.ps1` covers automatic startup after a Windows
 restart and the `Restart` status row. It asserts that a mechanism which cannot
@@ -2282,8 +2380,13 @@ first seen.
 2. Open Windows PowerShell as Administrator, `cd` to it, run
    `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, then
    `.\setup.ps1`.
-3. Let it reach the prerequisite restart and answer **Y** to
-   `Restart Windows now?`.
+3. Let it reach the prerequisite restart. **Expected:** a
+   **DELTA Setup - Windows Restart Required** dialog, on top of whatever else
+   is on screen, offering **OK** and **Cancel**, and stating that you must sign
+   back in with the same account, that the continuation may take a short while,
+   that you should wait rather than rerun `setup.ps1`, and that a UAC prompt may
+   need approving. Confirm the terminal did **not** also ask
+   `Restart Windows now? [y/N]`. Click **OK**.
 4. Before it goes down, confirm the entry was written:
 
    ```powershell
@@ -2292,17 +2395,17 @@ first seen.
 
 5. Let Windows restart and sign in as the **same account**.
 6. **Expected:** a console window titled *DELTA setup - continuing after
-   restart* appears and says it is continuing. It then pauses — this is the
-   wait for the desktop shell, and it is allowed to take up to about 90 seconds.
-7. **Expected:** a **DELTA Setup - Continue Installation** dialog, on top of
-   whatever else is on screen, offering **OK** and **Cancel**. Click **OK**.
-8. **Expected:** exactly **one** UAC prompt, for `Windows PowerShell`. Approve
+   restart* appears, says it is continuing, and asks you to wait. It then
+   pauses — this is the wait for the desktop shell, and it is allowed to take up
+   to about 90 seconds.
+7. **Expected:** **no DELTA dialog of any kind.** The next thing that appears is
+   Windows' own UAC prompt — exactly **one**, for `Windows PowerShell`. Approve
    it.
-9. **Expected:** an elevated window opens, `Checking privileges` reports
+8. **Expected:** an elevated window opens, `Checking privileges` reports
    `Running elevated.`, and the installer continues without re-asking the
    installation questions or the Docker licence. If you used a custom
    installation folder, confirm the banner names that folder and not `C:\DELTA`.
-10. Confirm the entry removed itself:
+9. Confirm the entry removed itself:
 
    ```powershell
    Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name DELTASetupContinue -ErrorAction SilentlyContinue
@@ -2310,41 +2413,55 @@ first seen.
 
    This should return nothing.
 
-**The cancel path**
+**Cancelling the restart**
 
-Do this on a second run, or re-arm it by answering **Y** to a restart again.
+Reach step 3 again and click **Cancel**.
 
-1. At step 8 above, click **No** on the UAC prompt.
+1. **Expected:** Windows does **not** restart, and the run ends with the
+   reboot-required exit code (`5`).
+2. **Expected:** nothing was armed — the `Get-ItemProperty` check in step 4
+   returns nothing.
+3. **Expected:** the console prints the three-line manual sequence with your
+   real installer folder in the `cd` line, the `Set-ExecutionPolicy -Scope
+   Process` line, and `.\setup.ps1` (with `-InstallRoot` if your folder is not
+   `C:\DELTA`).
+4. Restart the machine yourself, run those three lines, and confirm the
+   installation resumes normally.
+
+**A declined UAC prompt**
+
+Re-arm the continuation by reaching step 3 again and clicking **OK**.
+
+1. At step 7 above, click **No** on the UAC prompt.
 2. **Expected:** the console reports
    `This command cannot be run due to the error: The operation was canceled by the user.`,
-   and a dialog explains that Windows cancels its own prompt sometimes and asks
-   **Ask Windows for administrator permission again?**
-3. Click **Yes**. **Expected:** the UAC prompt returns. Approve it this time
-   and the installation continues as above.
-4. Repeat, and this time click **No**. **Expected:** the console window prints
-   the three-line manual sequence with your real installer folder in the `cd`
-   line, the `Set-ExecutionPolicy -Scope Process` line, and `.\setup.ps1` (with
-   `-InstallRoot` if your folder is not `C:\DELTA`) — then waits on
+   explains that Windows sometimes cancels its own prompt while the desktop is
+   still signing in, and asks `Ask for elevation again? [Y/n]`.
+3. Answer **Y**. **Expected:** the UAC prompt returns. Approve it this time and
+   the installation continues as above.
+4. Repeat, and this time answer **n**. **Expected:** the console window prints
+   the three-line manual sequence and then waits on
    *Press Enter to close this window.*
 5. Copy those three lines into an elevated Windows PowerShell and confirm they
    work as printed.
 
-**The Cancel path**
+**The console fallback**
 
-Re-arm the continuation, and at step 7 click **Cancel** instead of OK.
+Worth doing once on a session that cannot show a dialog — Server Core, or
+`powershell.exe -MTA`.
 
-1. **Expected:** no UAC prompt at all, and a second dialog saying
-   *DELTA installation is still incomplete.*
-2. **Expected:** the console window behind it prints the same three-line manual
-   sequence, and the RunOnce entry is gone (step 10's check returns nothing).
-3. **Expected:** nothing on the machine changed — no container started, no
-   restart, and the partial installation untouched.
-4. Run the three printed lines and confirm the installation resumes normally.
+1. **Expected:** no dialog, and the terminal asks `Restart Windows now? [y/N]`
+   with the same explanation printed above it.
+2. **Expected:** bare Enter and `n` both decline and arm nothing; a typed `Y`
+   restarts and arms the continuation exactly as the dialog's **OK** does.
 
-**What must not happen, on either path**
+**What must not happen, on any path**
 
+- Any DELTA dialog after the sign-in. The UAC prompt is the only thing that may
+  ask you for anything once the machine has come back.
 - More than one UAC prompt for a single approval.
 - A prompt that returns on its own after being declined.
 - The continuation firing again at a later logon.
+- A restart with no explicit **OK** or typed `Y` behind it.
 - `Get-ExecutionPolicy -List` differing before the install and after it. Record
   it first and compare — `CurrentUser` and `LocalMachine` must be unchanged.

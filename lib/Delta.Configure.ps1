@@ -411,6 +411,12 @@ done
 if [ -n "$(printenv SMTP_PASS 2>/dev/null || true)" ]; then echo "SMTP_PASS=<set>"; else echo "SMTP_PASS=<unset>"; fi
 '@
 
+    # LF endings, whatever this file's are on disk. A CR is a literal character
+    # to the container's sh, not whitespace, so a here-string checked out with
+    # CRLF makes `do` into `do<CR>` and the loop above a syntax error. See
+    # ConvertTo-DeltaShellScript.
+    $script = ConvertTo-DeltaShellScript -Script $script
+
     $capture = Invoke-DeltaActivity -Message 'Reading the delta container environment' -WhenIdle -ScriptBlock {
         Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @(
             'exec', '-T', 'delta', 'sh', '-c', $script

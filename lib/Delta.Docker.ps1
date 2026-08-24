@@ -141,6 +141,42 @@ function ConvertTo-DeltaCommandLine {
     return ($parts -join ' ')
 }
 
+function ConvertTo-DeltaShellScript {
+    <#
+      Normalises a script that is about to be handed to a POSIX shell inside a
+      container, so every line ends with LF and nothing else.
+
+      Every multi-line shell payload in this installer is written as a
+      PowerShell here-string in a .ps1 file, and a .ps1 file's line endings are
+      not this project's to decide. Git checks these files out with CRLF on
+      Windows (core.autocrlf, and there is no .gitattributes), editors rewrite
+      them either way, and tools\build-release.ps1 copies whatever is on disk
+      into the package. So the same source line can arrive at the shell as LF
+      on one machine and CRLF on the next, and nothing in the repository can be
+      inspected to tell which.
+
+      A CR that survives into the payload is not whitespace to a POSIX shell.
+      It is an ordinary character, and it lands in the last word of every line.
+      Measured against postgis/postgis:17-3.5, whose /bin/sh is dash - and that
+      image is this installer's openssl (see Delta.Network.ps1):
+
+          printf 'set -e\r\n' | sh
+          sh: 1: set: Illegal option -^M
+
+      `set` is a special builtin, so dash abandons the whole script there and
+      exits 2. The caller gets no stdout at all and one baffling line about an
+      option it never passed. Stripping CR here, at the one point a script
+      crosses into a shell, makes that outcome impossible however the file
+      reached the disk.
+
+      Lone CRs are folded too: a classic-Mac line ending is no more usable to
+      sh than a CRLF is.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Script)
+
+    return ($Script -replace "`r`n", "`n" -replace "`r", "`n")
+}
+
 function Invoke-DeltaProcessCapture {
     <#
       Runs a process to completion and returns its exit code, stdout and
