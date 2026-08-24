@@ -750,7 +750,186 @@ Assert-That 'the mount argument is quoted whole' `
     ($spacedMountLine -match ('"' + [regex]::Escape($Script:SpacedDir) + ':/work:ro"'))
 
 # ===========================================================================
-# 6. The real engine (-Live only)
+# 6. The managed key's Windows ACL, and what a container can do with it
+#
+# The failure these were written for:
+#
+#     nginx: [emerg] cannot load certificate key "/etc/nginx/certs/delta.key":
+#     BIO_new_file() failed (... Permission denied ...)
+#
+# with the key plainly present and non-empty on the host, and with even
+# container root refused. Inside the container the file showed as:
+#
+#     ----------  0000  root root  delta.key
+#
+# Docker Desktop's WSL2 backend reaches a Windows drive over 9p, and the 9p
+# server runs on the Windows side as the LOGGED-ON USER - not SYSTEM, and with
+# no ACL-bypass privilege. WSL synthesises each file's Linux mode from that
+# account's effective access, so a key hardened to Administrators + SYSTEM is
+# projected as 0000 whenever that account's token holds BUILTIN\Administrators
+# as deny-only, which is every ordinary administrator under UAC. Signed in as
+# the built-in Administrator with Admin Approval Mode off - the usual Windows
+# Server posture - the same ACL works, which is why the Server installations
+# never showed it.
+#
+# The fix names the one account that is never deny-only, and gives it Read.
+# ===========================================================================
+
+# icacls output is one file heading plus indented ACE lines; the trailing two
+# summary lines are noise. Parsed rather than string-matched wholesale so an
+# assertion can be about a specific principal's specific rights.
+function Get-AclEntries {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $lines = @(& icacls.exe $Path 2>&1)
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if ($text -match '^\s*$' -or $text -match 'Successfully processed') { continue }
+        # The first line carries the path before the first ACE.
+        $text = $text -replace ('^' + [regex]::Escape($Path) + '\s*'), ''
+        if ($text -match '^\s*([^:]+):\(([^)]*)\)\s*$') {
+            $null = $entries.Add([PSCustomObject]@{
+                Principal = $Matches[1].Trim()
+                Rights    = $Matches[2].Trim()
+            })
+        }
+    }
+    return $entries
+}
+
+$Script:CurrentUserSid  = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+$Script:CurrentUserName = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Translate([Security.Principal.NTAccount]).Value
+
+Start-TestCase 'The Docker read account is the installing user, named by SID'
+
+$dockerSid = Get-DeltaDockerFileReadSid
+Assert-That  'a principal is identified'        ($null -ne $dockerSid)
+Assert-Equal 'it is the current user, as a SID' "*$Script:CurrentUserSid" $dockerSid
+Assert-That  'given to icacls in *S-1- form, so no name has to resolve' `
+    ($dockerSid -match '^\*S-1-[\d-]+$')
+
+Start-TestCase 'Install-DeltaCertificate stages a key the Docker account can read'
+
+$aclRoot = Join-Path $Script:WorkRoot 'install-root'
+$null = New-Item -ItemType Directory -Path $aclRoot -Force
+
+$staged = Install-DeltaCertificate -InstallRoot $aclRoot `
+    -CertificatePath $Script:Pair.CertificatePath -KeyPath $Script:Pair.KeyPath
+
+Assert-That 'the key is staged'         (Test-Path -LiteralPath $staged.KeyPath -PathType Leaf)
+Assert-That 'the certificate is staged' (Test-Path -LiteralPath $staged.CertificatePath -PathType Leaf)
+Assert-Equal 'NGINX is pointed at the container path' '/etc/nginx/certs/delta.key' $staged.ContainerKeyPath
+
+$keyAcl = Get-AclEntries -Path $staged.KeyPath
+$userAce = @($keyAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName })
+
+Assert-Equal 'the Docker account has exactly one entry' 1 $userAce.Count
+Assert-Equal 'and it is Read, nothing more'             'R' $userAce[0].Rights
+Assert-That  'SYSTEM keeps full control' `
+    (@($keyAcl | Where-Object { $_.Principal -match 'SYSTEM$' -and $_.Rights -eq 'F' }).Count -eq 1)
+Assert-That  'Administrators keeps full control' `
+    (@($keyAcl | Where-Object { $_.Principal -match 'Administrators$' -and $_.Rights -eq 'F' }).Count -eq 1)
+
+Start-TestCase 'No broad principal is introduced'
+
+foreach ($broad in @('Everyone', 'Users', 'Authenticated Users')) {
+    Assert-Equal "no ACE for $broad" 0 `
+        (@($keyAcl | Where-Object { $_.Principal -match ([regex]::Escape($broad) + '$') }).Count)
+}
+# Belt and braces, against the source rather than one run's output: the words
+# the requirement forbids must not appear as grants anywhere in the hardening.
+$Script:ConfigText = Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'lib\Delta.Config.ps1') -Raw
+Assert-That 'the hardening never grants Everyone'  ($Script:ConfigText -notmatch '(?i)/grant[^\r\n]*Everyone')
+Assert-That 'nor BUILTIN\Users'                    ($Script:ConfigText -notmatch '(?i)/grant[^\r\n]*BUILTIN\\Users')
+Assert-That 'nor Authenticated Users'              ($Script:ConfigText -notmatch '(?i)/grant[^\r\n]*Authenticated Users')
+Assert-That 'and still strips them with /remove:g' ($Script:ConfigText -match '(?i)icacls\.exe \$Path /remove:g \$principal')
+foreach ($broad in @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users')) {
+    Assert-That "$broad is still on the strip list" `
+        ($Script:ConfigText -match ('(?s)\$broadPrincipals\s*=\s*@\([^)]*' + [regex]::Escape("'$broad'")))
+}
+
+Start-TestCase 'The certificate itself is left readable and unhardened'
+
+# delta.crt is public material. It was never hardened, and it must stay that
+# way - the operator's own evidence had it as -rwxrwxrwx while the key was 0000.
+$certAcl = Get-AclEntries -Path $staged.CertificatePath
+Assert-That 'the certificate has no restrictive rewrite' `
+    (@($certAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName -and $_.Rights -eq 'R' }).Count -eq 0)
+Assert-That 'and it is still readable by this process' `
+    ((Get-Content -LiteralPath $staged.CertificatePath -Raw).Length -gt 0)
+
+Start-TestCase 'A rerun repairs the exact ACL the operator reported'
+
+# The reported starting state, reproduced precisely: Administrators + SYSTEM
+# and nothing else. /inheritance:r drops the INHERITED entries only, so the
+# explicit one this installer just wrote has to be removed by name as well -
+# which is also a fair model of a key staged before the fix existed.
+$brokenKey = $staged.KeyPath
+$null = & icacls.exe $brokenKey /inheritance:r /C 2>&1
+$null = & icacls.exe $brokenKey /remove:g "*$Script:CurrentUserSid" /C 2>&1
+$null = & icacls.exe $brokenKey /grant 'NT AUTHORITY\SYSTEM:(F)' /C 2>&1
+$null = & icacls.exe $brokenKey /grant 'BUILTIN\Administrators:(F)' /C 2>&1
+
+$brokenAcl = Get-AclEntries -Path $brokenKey
+Assert-Equal 'the broken state has no entry for the Docker account' 0 `
+    (@($brokenAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName }).Count)
+Assert-Equal 'only the two the operator saw' 2 $brokenAcl.Count
+
+# Rerunning the installer runs Install-DeltaCertificate again, on every path
+# that reaches TLS - that is what makes this a repair and not a reinstall.
+$repaired = Install-DeltaCertificate -InstallRoot $aclRoot `
+    -CertificatePath $Script:Pair.CertificatePath -KeyPath $Script:Pair.KeyPath
+$repairedAcl = Get-AclEntries -Path $repaired.KeyPath
+$repairedAce = @($repairedAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName })
+
+Assert-Equal 'the rerun restores the Docker read entry' 1 $repairedAce.Count
+Assert-Equal 'still Read, not widened by the repair'    'R' $repairedAce[0].Rights
+Assert-That  'and the hardening is still in place' `
+    ((@($repairedAcl | Where-Object { $_.Principal -match 'SYSTEM$' }).Count -eq 1) -and
+     (@($repairedAcl | Where-Object { $_.Principal -match 'Everyone$' }).Count -eq 0))
+
+Start-TestCase 'Without the switch, nothing gains the extra entry'
+
+# .env, its backups and the key backups in certs\ are never opened by a
+# container, so they keep the narrower ACL. This is the least-privilege half of
+# the fix and it is the one a future refactor is most likely to erode.
+$plainSecret = Join-Path $Script:WorkRoot 'plain-secret.env'
+Set-Content -LiteralPath $plainSecret -Value 'SECRET=1' -Encoding Ascii
+$null = & icacls.exe $plainSecret /inheritance:r /C 2>&1
+$null = & icacls.exe $plainSecret /grant 'BUILTIN\Administrators:(F)' /C 2>&1
+Protect-DeltaSecretFile -Path $plainSecret
+
+$plainAcl = Get-AclEntries -Path $plainSecret
+Assert-Equal 'no Docker read entry is added by default' 0 `
+    (@($plainAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName }).Count)
+Assert-That  'and it is still hardened' `
+    ((@($plainAcl | Where-Object { $_.Principal -match 'SYSTEM$' }).Count -eq 1) -and
+     (@($plainAcl | Where-Object { $_.Principal -match 'Administrators$' }).Count -eq 1))
+
+Start-TestCase 'The key backup beside the key stays narrow'
+
+# Backup-DeltaCertificateMaterial writes delta.key.bak-<stamp> INTO certs\,
+# which is the mounted directory. It is not NGINX's key and must not acquire
+# the read entry just because it shares a directory with one.
+Assert-That 'the backup is protected without -AllowDockerRead' `
+    ((Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'lib\Delta.Configure.ps1') -Raw) -match
+     '(?s)Copy-Item -LiteralPath \$current\.KeyPath -Destination \$result\.KeyBackup -Force\s*\r?\n\s*Protect-DeltaSecretFile -Path \$result\.KeyBackup\s*\r?\n')
+
+Start-TestCase 'A restored key is readable again after a rollback'
+
+Assert-That 'Restore-DeltaCertificateMaterial re-applies the Docker read entry' `
+    ((Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'lib\Delta.Configure.ps1') -Raw) -match
+     'Protect-DeltaSecretFile -Path \$current\.KeyPath -AllowDockerRead')
+
+Start-TestCase 'Compose still mounts certs read-only'
+
+$composeTemplate = Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'templates\docker-compose.yml.template') -Raw
+Assert-That 'the certs mount carries :ro' ($composeTemplate -match '\./certs:/etc/nginx/certs:ro')
+Assert-That 'and nothing mounts certs writable' ($composeTemplate -notmatch '\./certs:/etc/nginx/certs\s*$')
+
+# ===========================================================================
+# 7. The real engine (-Live only)
 # ===========================================================================
 
 if ($Live) {
@@ -788,6 +967,36 @@ if ($Live) {
             Assert-That 'and what it generated validates as a pair' $liveGeneratedCheck.IsValid
         }
     }
+
+    Start-TestCase 'Live: the staged key through the real certs bind mount'
+
+    # The whole point, end to end: the managed key, its real ACL, and the mount
+    # Compose actually declares. Nothing here prints a byte of the key - the
+    # container reports its size and its mode, and that is all that leaves it.
+    $liveCertsDir = Split-Path -Parent $staged.KeyPath
+    $expectedBytes = (Get-Item -LiteralPath $staged.KeyPath).Length
+
+    $probe = 'cd /etc/nginx/certs; ' +
+             'for f in delta.crt delta.key; do ' +
+             'echo $f mode=$(stat -c %a $f) bytes=$(dd if=$f bs=1 2>/dev/null | wc -c); done; ' +
+             'echo -n write=; (echo x >> delta.key) 2>/dev/null && echo ALLOWED || echo REFUSED'
+
+    $mountProbe = Invoke-DeltaDockerCommand -Arguments @(
+        'run', '--rm', '--network', 'none',
+        '-v', "${liveCertsDir}:/etc/nginx/certs:ro",
+        '--entrypoint', 'sh', $LiveImage, '-c', $probe) -TimeoutSeconds 300
+
+    $probeOut = ($mountProbe.StdOut + "`n" + $mountProbe.StdErr)
+
+    Assert-Equal 'the probe container ran' 0 $mountProbe.ExitCode
+    Assert-That  'the certificate is readable in the container' `
+        ($probeOut -match 'delta\.crt mode=\d+ bytes=[1-9]\d*')
+    Assert-That  "the private key is readable in the container ($expectedBytes bytes on the host)" `
+        ($probeOut -match "delta\.key mode=\d+ bytes=$expectedBytes")
+    Assert-That  'the key is NOT mode 0000 - the reported failure' `
+        ($probeOut -notmatch 'delta\.key mode=0 ')
+    Assert-That  'and the container cannot write to it through the :ro mount' `
+        ($probeOut -match 'write=REFUSED')
 }
 
 # --- teardown ---------------------------------------------------------------

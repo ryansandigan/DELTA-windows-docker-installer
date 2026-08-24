@@ -387,6 +387,65 @@ function Backup-DeltaEnvFile {
     return $backupPath
 }
 
+function Get-DeltaDockerFileReadSid {
+    <#
+      The SID of the Windows account Docker Desktop reads host files as, in the
+      *S-1-... form icacls takes, or $null when there is nothing worth granting.
+
+      Why an account has to be named at all. Measured on Docker Desktop's WSL2
+      backend: a Windows drive reaches the docker-desktop distro over 9p, as
+
+          C:\ on /mnt/host/c type 9p (rw,...,aname=drvfs;path=C:\;...,metadata,...)
+
+      and the 9p SERVER sits on the Windows side, inside wsl.exe / wslhost.exe,
+      owned by the logged-on user - not SYSTEM, and holding no ACL-bypass
+      privilege. With `metadata` on that mount WSL synthesises each file's Linux
+      mode from that account's EFFECTIVE Windows access. Measured, same host,
+      same bind mount, one file per ACL:
+
+          inherited                              -> 777
+          Administrators:(F) SYSTEM:(F)          -> 777   (see below)
+          SYSTEM:(F) only                        -> 000
+          <this user>:(R) only                   -> 444
+
+      SYSTEM-only projecting as 000 is the proof that the reader is neither
+      SYSTEM nor privileged; <user>:(R) projecting as 444 is the proof that it
+      is the logged-on account. A file that account cannot open arrives in the
+      container as mode 0000, and container-side root cannot help - the refusal
+      is on the Windows side of the 9p link, before Linux permissions apply.
+
+      Which makes Administrators:(F) a coin toss rather than a grant. It works
+      only while the account's token carries BUILTIN\Administrators ENABLED -
+      true when signed in as the built-in Administrator with Admin Approval
+      Mode off, which is the normal Windows Server posture, and false for an
+      ordinary administrator under UAC on Windows 11, where the unelevated
+      token Docker Desktop runs with holds that group as deny-only. A deny-only
+      SID can never grant access, so the same ACL that reads 777 on one machine
+      reads 0000 on the other. A user SID is never deny-only, which is why this
+      returns one.
+
+      setup.ps1 runs elevated, but elevation does not change the user SID - only
+      the groups and the integrity level - so the SID taken here is the same one
+      Docker Desktop's unelevated processes carry. It is also the account this
+      installer already binds an installation to: the HKCU RunOnce continuation
+      and the S4U startup task both name it.
+
+      $null when running as SYSTEM: that account already has its own full
+      control ACE, and Docker Desktop is never running as it.
+    #>
+
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity.IsSystem) { return $null }
+        # The SID, not the name. icacls takes *S-1-... directly, which sidesteps
+        # account-name resolution and localisation entirely.
+        return '*' + $identity.User.Value
+    }
+    catch {
+        return $null
+    }
+}
+
 function Protect-DeltaSecretFile {
     <#
       Restricts $Path to Administrators + SYSTEM with inheritance disabled
@@ -398,18 +457,44 @@ function Protect-DeltaSecretFile {
       this is idempotent); Administrators and SYSTEM are then re-granted
       explicitly rather than assumed to have survived.
 
+      -AllowDockerRead adds ONE more access control entry: READ, for the single
+      account Docker Desktop reads host files as. It exists for the private key
+      in certs\, which NGINX opens from inside a container through a bind mount
+      and which is otherwise projected into that container as mode 0000. See
+      Get-DeltaDockerFileReadSid for the measurement behind it.
+
+      It is read and nothing else, deliberately. The container must open this
+      file; it must never change it. That is not left to `:ro` on the mount -
+      the host ACL itself refuses the write, so a Compose file edited later
+      cannot turn the key into something a container can overwrite.
+
+      The switch is not the default. Every other caller here protects something
+      no container ever opens - .env, its backups, the key backups in certs\ -
+      and those keep the narrower ACL they already had.
+
       Non-fatal by design: this hardens an existing file, it is not a
       precondition for a working installation, and aborting because icacls
       could not adjust an ACL would trade a working deployment for a
       permissions nicety. The failure is reported loudly instead.
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$AllowDockerRead
+    )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
 
     $broadPrincipals = @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users')
+
+    $grants = @('BUILTIN\Administrators:(F)', 'NT AUTHORITY\SYSTEM:(F)')
+
+    $dockerGrant = $null
+    if ($AllowDockerRead) {
+        $dockerSid = Get-DeltaDockerFileReadSid
+        if ($dockerSid) { $dockerGrant = "${dockerSid}:(R)" }
+    }
 
     try {
         $output = & icacls.exe $Path /inheritance:d /C 2>&1
@@ -421,10 +506,31 @@ function Protect-DeltaSecretFile {
             $null = & icacls.exe $Path /remove:g $principal /C 2>&1
         }
 
-        foreach ($grant in @('BUILTIN\Administrators:(F)', 'NT AUTHORITY\SYSTEM:(F)')) {
+        # Granted after the removals, so an account that is also a member of one
+        # of the broad principals still ends up with its explicit entry. Re-run
+        # safe: icacls /grant replaces that principal's entry rather than adding
+        # a second one, which is what lets a rerun repair a key staged by an
+        # earlier version of this installer.
+        foreach ($grant in $grants) {
             $output = & icacls.exe $Path /grant $grant /C 2>&1
             if ($LASTEXITCODE -ne 0) {
                 throw "icacls /grant $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        # /grant:r, not /grant, and only for this one entry. icacls /grant ADDS
+        # to whatever that principal already holds, so on an installation root
+        # under a user profile - where the account may already carry an
+        # inherited Full Control that /inheritance:d has just materialised -
+        # a plain /grant would leave it holding Full Control over a private key
+        # and quietly call that the fix. :r replaces the entry outright, so what
+        # this account ends up with is Read, on every host, whatever it had
+        # before. The two grants above keep /grant: their rights are unchanged
+        # from what this installer has always applied.
+        if ($dockerGrant) {
+            $output = & icacls.exe $Path /grant:r $dockerGrant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant:r $dockerGrant failed: $(($output | Out-String).Trim())"
             }
         }
     }

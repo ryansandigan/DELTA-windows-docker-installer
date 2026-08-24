@@ -1092,9 +1092,20 @@ function Install-DeltaCertificate {
     <#
       Copies validated material into <InstallRoot>\certs\ under the fixed names
       the generated NGINX configuration expects, and restricts the private key
-      to Administrators and SYSTEM - the same ACL .env carries, because it is
-      the same class of secret (A§24). The directory is mounted read-only into
-      NGINX.
+      to Administrators, SYSTEM, and read for the account Docker Desktop reads
+      host files as (A§24). The directory is mounted read-only into NGINX.
+
+      That third entry is the difference between this key and .env, which is
+      otherwise the same class of secret and carries the same ACL. NGINX opens
+      this one from inside a container, across a bind mount, and a file the
+      Docker host account cannot read is projected into that container as mode
+      0000 - `cannot load certificate key ... Permission denied`, with the file
+      plainly present and non-empty on the host. It is read only: the container
+      must open the key and must never be able to change it.
+      Protect-DeltaSecretFile's -AllowDockerRead carries the measurement.
+
+      Applied on every run, so a rerun repairs a key staged by an earlier
+      version of this installer without the operator having to touch an ACL.
 
       A no-op when the source is already the staged file, so a rerun that
       re-validates what is already in place does not copy a file onto itself.
@@ -1120,7 +1131,7 @@ function Install-DeltaCertificate {
         Copy-Item -LiteralPath $KeyPath -Destination $targetKey -Force
     }
 
-    Protect-DeltaSecretFile -Path $targetKey
+    Protect-DeltaSecretFile -Path $targetKey -AllowDockerRead
 
     return [PSCustomObject]@{
         CertificatePath = $targetCertificate

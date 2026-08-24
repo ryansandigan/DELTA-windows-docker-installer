@@ -1194,6 +1194,13 @@ function Restore-DeltaCertificateMaterial {
       Puts the backed-up certificate and key back, and re-applies the key's
       ACL. Returns whether both halves were restored - the caller must not
       claim a rollback on a partial result.
+
+      The restored key is the one NGINX opens through the certs\ bind mount, so
+      it gets -AllowDockerRead exactly as Install-DeltaCertificate's does. The
+      backup it was copied from does not: nothing in a container ever reads
+      that, so it keeps the narrower Administrators + SYSTEM ACL. A rollback
+      that restored an unreadable key would leave NGINX unable to start on the
+      material it had just been rolled back to.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -1212,7 +1219,7 @@ function Restore-DeltaCertificateMaterial {
     if ($Backup.KeyBackup -and (Test-Path -LiteralPath $Backup.KeyBackup -PathType Leaf)) {
         try {
             Copy-Item -LiteralPath $Backup.KeyBackup -Destination $current.KeyPath -Force
-            Protect-DeltaSecretFile -Path $current.KeyPath
+            Protect-DeltaSecretFile -Path $current.KeyPath -AllowDockerRead
         }
         catch { $restored = $false }
     }
