@@ -734,6 +734,174 @@ Assert-That  'and the animation drew many more frames than that'    ((Get-FrameC
 
 Remove-Item -LiteralPath $logDirectory -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- the elapsed counter ----------------------------------------------------
+#
+# The line says how long the operation has been running, and keeps saying it
+# while the operation runs. Asserted through the renderer with a synthetic
+# start time rather than by waiting out a real minute, so the formatting is
+# pinned exactly and the suite still finishes in seconds.
+
+Start-TestCase 'Elapsed time is rendered from the start of the operation'
+
+function New-RenderState {
+    param([Parameter(Mandatory)][int]$SecondsAgo, [string]$Message = 'Starting DELTA')
+    return [PSCustomObject]@{
+        Message = $Message
+        Indent  = '    '
+        Frames  = @('-', '\', '|', '/')
+        Started = (Get-Date).AddSeconds(-$SecondsAgo)
+    }
+}
+
+Assert-Equal 'a fresh operation reads zero' '    - Starting DELTA (0s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 0) -Index 0)
+Assert-Equal 'seconds up to a minute'       '    - Starting DELTA (18s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 18) -Index 0)
+Assert-Equal 'the last second before a minute' '    - Starting DELTA (59s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 59) -Index 0)
+Assert-Equal 'a minute exactly'             '    - Starting DELTA (1m 00s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 60) -Index 0)
+Assert-Equal 'minutes and seconds'          '    - Starting DELTA (1m 14s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 74) -Index 0)
+Assert-Equal 'and it keeps counting past an hour' '    - Starting DELTA (75m 30s)' `
+    (Format-DeltaActivityLine -State (New-RenderState -SecondsAgo 4530) -Index 0)
+
+Start-TestCase 'The spinner advances and the message never moves'
+
+$state = New-RenderState -SecondsAgo 5
+$frames = @(0..7 | ForEach-Object { Format-DeltaActivityLine -State $state -Index $_ })
+
+Assert-Equal 'every frame carries the message'  8 (@($frames | Where-Object { $_ -match 'Starting DELTA' }).Count)
+Assert-Equal 'the spinner cycles through four'  4 (@($frames | ForEach-Object { $_.Substring(4, 1) } | Select-Object -Unique).Count)
+Assert-Equal 'and it repeats after four'        $frames[0] $frames[4]
+Assert-That  'consecutive frames differ'        ($frames[0] -cne $frames[1])
+Assert-Equal 'the message starts at the same column in every frame' 1 `
+    (@($frames | ForEach-Object { $_.IndexOf('Starting DELTA') } | Select-Object -Unique).Count)
+
+Start-TestCase 'The reserved width always covers the rendered line'
+
+# The line is padded to $State.Width and erased by that same width. A rendering
+# wider than the reservation would leave characters behind when the line was
+# cleared - and the elapsed counter is the part that grows.
+$sink = New-ActivitySink
+Start-DeltaActivity -Message 'Waiting for delta to become healthy' -Writer $sink.Writer
+$live = Get-DeltaActivityCurrent
+$reserved = $live.Width
+$longest = 0
+foreach ($seconds in @(0, 9, 59, 60, 599, 3599, 5999)) {
+    $probe = [PSCustomObject]@{
+        Message = $live.Message; Indent = $live.Indent; Frames = $live.Frames
+        Started = (Get-Date).AddSeconds(-$seconds)
+    }
+    $length = (Format-DeltaActivityLine -State $probe -Index 0).Length
+    if ($length -gt $longest) { $longest = $length }
+}
+Stop-DeltaActivity
+
+Assert-That "the widest rendering ($longest) fits the reservation ($reserved)" ($longest -le $reserved)
+Assert-That 'and the line was still erased completely' (Test-LineWasCleared -Text (Get-SinkText -Sink $sink))
+Assert-That 'having stayed on one line throughout'     (Test-StayedOnOneLine -Text (Get-SinkText -Sink $sink))
+
+Start-TestCase 'The counter reaches the terminal and advances while the operation runs'
+
+$sink = New-ActivitySink
+$null = Invoke-DeltaActivity -Message 'Pulling container images' -Writer $sink.Writer -ScriptBlock {
+    Start-Sleep -Milliseconds 1200
+}
+$drawn = Get-SinkText -Sink $sink
+
+Assert-That 'the elapsed counter is on the animated line' ($drawn -match 'Pulling container images \(\d+s\)')
+Assert-That 'it started at zero'                          ($drawn -match 'Pulling container images \(0s\)')
+Assert-That 'and it advanced while the operation ran'     ($drawn -match 'Pulling container images \(1s\)')
+Assert-That 'the line was erased at the end'              (Test-LineWasCleared -Text $drawn)
+
+Start-TestCase 'The counter measures the operation, not the time since the last redraw'
+
+# An operation interrupted by a status line has still been running the whole
+# time. If Suspend/Resume restarted the clock, this would read (0s) again.
+$sink = New-ActivitySink
+Start-DeltaActivity -Message 'Waiting for delta' -Writer $sink.Writer
+Start-Sleep -Milliseconds 1200
+Write-Detail 'Waiting for delta (1 s; state running, health starting)' 6>$null
+Start-Sleep -Milliseconds $Script:SettleMs
+$afterStatus = Get-SinkText -Sink $sink
+Stop-DeltaActivity
+
+$counters = @([regex]::Matches($afterStatus, 'Waiting for delta \((\d+)s\)') | ForEach-Object { [int]$_.Groups[1].Value })
+Assert-That  'the counter was drawn more than once'  ($counters.Count -gt 1)
+Assert-That  'it never went backwards'               ((($counters | Sort-Object) -join ',') -ceq ($counters -join ','))
+Assert-Equal 'and it did not restart after the status line' $true ($counters[-1] -ge 1)
+
+Start-TestCase 'The static fallback carries no spinner and no counter'
+
+# A redirected or unattended run gets one plain sentence. A clock in a log file
+# is noise, and a spinner frame in one is worse.
+Set-DeltaActivityMode -Mode 'off'
+$emitted = @(Invoke-DeltaActivity -Message 'Starting DELTA stack' -ScriptBlock {
+    Start-Sleep -Milliseconds 1100
+} 6>&1 | ForEach-Object { [string]$_ })
+Set-DeltaActivityMode -Mode 'auto'
+
+Assert-Equal 'exactly one line'                 1 $emitted.Count
+Assert-Equal 'in the documented static form'    '    Starting DELTA stack...' $emitted[0]
+Assert-That  'with no elapsed counter'          ($emitted[0] -notmatch '\(\d')
+Assert-That  'and no spinner frame'             ($emitted[0] -notmatch '[\\|/]')
+
+Start-TestCase 'The transcript records the sentence, not the clock'
+
+$logDirectory = Join-Path $env:TEMP "delta-activity-elapsed-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+$logPath = Start-DeltaLog -Directory $logDirectory -Name 'elapsed'
+
+$sink = New-ActivitySink
+$null = Invoke-DeltaActivity -Message 'Creating database backup' -Writer $sink.Writer -ScriptBlock {
+    Start-Sleep -Milliseconds 1200
+}
+Stop-DeltaLog -ExitCode 0
+
+$logLines = @(Get-Content -LiteralPath $logPath)
+Assert-Equal 'the operation appears once' 1 (@($logLines | Where-Object { $_ -match 'Creating database backup' }).Count)
+Assert-That  'no elapsed counter reached the transcript' (-not ($logLines | Where-Object { $_ -match 'Creating database backup \(\d' }))
+Assert-That  'no spinner frame reached it either'        (-not ($logLines | Where-Object { $_ -match '[\\|/]\s+Creating database backup' }))
+Assert-That  'but the terminal did get counters'         ((Get-SinkText -Sink $sink) -match 'Creating database backup \(\d+s\)')
+
+Remove-Item -LiteralPath $logDirectory -Recurse -Force -ErrorAction SilentlyContinue
+
+Start-TestCase 'The spinner never emits characters the console cannot render'
+
+# A braille frame on a cp1252 console is a question mark redrawn eight times a
+# second. The frame set is chosen from the output encoding, and the ASCII one
+# has to survive being encoded to a legacy code page unchanged.
+$ascii = [System.Text.Encoding]::GetEncoding(1252)
+foreach ($frame in $Script:DeltaActivityFramesAscii) {
+    $roundTrip = $ascii.GetString($ascii.GetBytes($frame))
+    Assert-Equal "the ASCII frame '$frame' survives a legacy code page" $frame $roundTrip
+}
+Assert-Equal 'the ASCII set has four frames' 4 $Script:DeltaActivityFramesAscii.Count
+Assert-That  'the wide set is only chosen for UTF-8' `
+    (($Script:DeltaActivityFrames -eq $Script:DeltaActivityFramesAscii) -or ([Console]::OutputEncoding.CodePage -eq 65001))
+
+# --- the shared mechanism is the only one -----------------------------------
+
+Start-TestCase 'No module implements an animation loop of its own'
+
+$Script:LibRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'lib'
+$offenders = New-Object 'System.Collections.Generic.List[string]'
+foreach ($file in (Get-ChildItem -LiteralPath $Script:LibRoot -Filter '*.ps1')) {
+    if ($file.Name -eq 'Delta.Common.ps1') { continue }
+    $text = Get-Content -LiteralPath $file.FullName -Raw
+    # A carriage return written to the console from anywhere else is a
+    # same-line update this section does not own.
+    if ($text -match '(?m)Write-Host[^\r\n]*`r') { $null = $offenders.Add("$($file.Name): Write-Host with a carriage return") }
+    if ($text -match '\[Console\]::Out\.Write')  { $null = $offenders.Add("$($file.Name): writes to [Console]::Out directly") }
+}
+Assert-Equal "no module draws its own animation ($($offenders -join '; '))" 0 $offenders.Count
+
+# The renderer is defined once and compiled in both places from that one source.
+Assert-That 'the worker renders from the shared source' `
+    ($Script:DeltaActivityWorker.ToString() -match '\[scriptblock\]::Create\(\$state\.RenderSource\)')
+Assert-That 'and the main thread renders from the same source' `
+    ($Script:DeltaActivityRender.ToString() -ceq $Script:DeltaActivityRenderSource)
+
 # --- teardown ---------------------------------------------------------------
 
 Stop-DeltaActivity

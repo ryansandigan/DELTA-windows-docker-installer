@@ -636,7 +636,9 @@ function Test-DeltaComposeConfiguration {
     )
 
     Write-Step 'Validating the generated Compose file'
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('config') -TimeoutSeconds 120
+    $capture = Invoke-DeltaActivity -Message 'Validating the Compose file' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('config') -TimeoutSeconds 120
+    }
 
     if ($capture.ExitCode -ne 0) {
         Write-DeltaFailure ''
@@ -678,7 +680,9 @@ function Test-DeltaComposeRestartPolicy {
         Reason    = $null
     }
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('config', '--format', 'json') -TimeoutSeconds 120
+    $capture = Invoke-DeltaActivity -Message 'Rendering the Compose model' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('config', '--format', 'json') -TimeoutSeconds 120
+    }
     if ($capture.ExitCode -ne 0 -or -not $capture.StdOut) {
         $result.Reason = "The Compose model could not be rendered: $((($capture.StdErr + ' ' + $capture.StdOut)).Trim())"
         return $result
@@ -762,7 +766,13 @@ function Get-DeltaComposeServiceStatus {
         [Parameter(Mandatory)][string]$ProjectName
     )
 
-    $capture = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('ps', '--all', '--format', 'json') -TimeoutSeconds 120
+    # Usually under a second, and then not: `compose ps` is the first thing to
+    # touch the engine after a cold start or a resume, and it is what the
+    # management screen sits on while it refreshes. -WhenIdle, because it is
+    # also called from inside operations that are already saying what they are.
+    $capture = Invoke-DeltaActivity -Message 'Reading the container status' -WhenIdle -ScriptBlock {
+        Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $ProjectName -Arguments @('ps', '--all', '--format', 'json') -TimeoutSeconds 120
+    }
     $services = New-Object 'System.Collections.Generic.List[object]'
 
     if ($capture.ExitCode -ne 0 -or -not $capture.StdOut) {
@@ -1067,17 +1077,24 @@ function Get-DeltaVolumeState {
 
     $result = [PSCustomObject]@{ Name = $VolumeName; Exists = $false; PgVersion = $null; IsEmpty = $false }
 
-    $inspect = Invoke-DeltaDockerCommand -Arguments @('volume', 'inspect', $VolumeName) -TimeoutSeconds 60
+    # Both halves under one message: this is the A§9.4 precheck that stands
+    # between a registered installation and a brand-new empty cluster, it
+    # starts a container to do it, and it runs before every start.
+    $inspect = Invoke-DeltaActivity -Message 'Checking the database volume' -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @('volume', 'inspect', $VolumeName) -TimeoutSeconds 60
+    }
     if ($inspect.ExitCode -ne 0) { return $result }
     $result.Exists = $true
 
-    $read = Invoke-DeltaDockerCommand -Arguments @(
-        'run', '--rm',
-        '-v', "${VolumeName}:/var/lib/postgresql/data:ro",
-        '--entrypoint', 'sh',
-        $DbImage,
-        '-c', 'cat /var/lib/postgresql/data/PG_VERSION 2>/dev/null || echo __EMPTY__'
-    ) -TimeoutSeconds 180
+    $read = Invoke-DeltaActivity -Message 'Checking the database volume' -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @(
+            'run', '--rm',
+            '-v', "${VolumeName}:/var/lib/postgresql/data:ro",
+            '--entrypoint', 'sh',
+            $DbImage,
+            '-c', 'cat /var/lib/postgresql/data/PG_VERSION 2>/dev/null || echo __EMPTY__'
+        ) -TimeoutSeconds 180
+    }
 
     if ($read.ExitCode -eq 0 -and $read.StdOut) {
         $value = ($read.StdOut -split "`r?`n" | Select-Object -First 1).Trim()

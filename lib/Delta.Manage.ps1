@@ -1594,9 +1594,11 @@ function Invoke-DeltaNginxLogRotation {
     if ($nginx -and $nginx.State -eq 'running') { $nginxRunning = $true }
 
     if ($nginxRunning) {
-        $move = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-            'exec', '-T', 'nginx', 'mv', '/var/log/nginx/access.log', "/var/log/nginx/$rotatedName"
-        ) -TimeoutSeconds 120
+        $move = Invoke-DeltaActivity -Message 'Rotating the NGINX access log' -WhenIdle -ScriptBlock {
+            Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+                'exec', '-T', 'nginx', 'mv', '/var/log/nginx/access.log', "/var/log/nginx/$rotatedName"
+            ) -TimeoutSeconds 120
+        }
         if ($move.ExitCode -ne 0) {
             $result.Reason = "The access log could not be renamed inside the NGINX container: $((($move.StdErr + ' ' + $move.StdOut)).Trim())"
             return $result
@@ -1604,9 +1606,11 @@ function Invoke-DeltaNginxLogRotation {
         $result.Rotated = $true
         $result.RotatedTo = $rotatedPath
 
-        $reopen = Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
-            'exec', '-T', 'nginx', 'nginx', '-s', 'reopen'
-        ) -TimeoutSeconds 120
+        $reopen = Invoke-DeltaActivity -Message 'Reopening the NGINX log files' -WhenIdle -ScriptBlock {
+            Invoke-DeltaCompose -InstallRoot $InstallRoot -ProjectName $Configuration.ProjectName -Arguments @(
+                'exec', '-T', 'nginx', 'nginx', '-s', 'reopen'
+            ) -TimeoutSeconds 120
+        }
         if ($reopen.ExitCode -ne 0) {
             $result.Reason = "The access log was rotated to '$rotatedName', but `nginx -s reopen` failed: $((($reopen.StdErr + ' ' + $reopen.StdOut)).Trim()). NGINX is still serving; it is writing to the rotated file until it is reopened or restarted."
             return $result

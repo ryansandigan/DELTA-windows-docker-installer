@@ -444,10 +444,17 @@ function Invoke-DeltaOpenSsl {
         [int]$TimeoutSeconds = 180
     )
 
+    # Starting a container is never instant, and on the first certificate
+    # operation of an installation the image may not be local yet - which turns
+    # a "checking your certificate" pause into a silent minute. -WhenIdle, so
+    # the callers below that name what they are actually doing keep their own
+    # message and this adds nothing.
     $mount = if ($Writable) { "${MountPath}:/work" } else { "${MountPath}:/work:ro" }
-    return (Invoke-DeltaDockerCommand -Arguments @(
-        'run', '--rm', '--network', 'none', '-v', $mount, '--entrypoint', 'sh', $Image, '-c', $Command
-    ) -TimeoutSeconds $TimeoutSeconds)
+    return (Invoke-DeltaActivity -Message 'Running OpenSSL in a container' -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @(
+            'run', '--rm', '--network', 'none', '-v', $mount, '--entrypoint', 'sh', $Image, '-c', $Command
+        ) -TimeoutSeconds $TimeoutSeconds
+    })
 }
 
 function Test-DeltaPrivateKeyEncrypted {
@@ -552,12 +559,14 @@ function Test-DeltaCertificateMaterial {
         Copy-Item -LiteralPath $CertificatePath -Destination (Join-Path $staging 'cert.pem') -Force
         Copy-Item -LiteralPath $KeyPath -Destination (Join-Path $staging 'key.pem') -Force
 
-        $capture = Invoke-DeltaOpenSsl -Image $OpenSslImage -MountPath $staging -Command @'
+        $capture = Invoke-DeltaActivity -Message 'Checking the certificate and key' -ScriptBlock {
+            Invoke-DeltaOpenSsl -Image $OpenSslImage -MountPath $staging -Command @'
 set -e
 openssl x509 -in /work/cert.pem -noout -pubkey > /work/from-cert.pub 2>/work/cert.err || { echo "CERT_PARSE_FAILED"; cat /work/cert.err; exit 0; }
 openssl pkey -in /work/key.pem -pubout > /work/from-key.pub 2>/work/key.err || { echo "KEY_PARSE_FAILED"; cat /work/key.err; exit 0; }
 if cmp -s /work/from-cert.pub /work/from-key.pub; then echo "PAIR_MATCH"; else echo "PAIR_MISMATCH"; fi
 '@ -Writable
+        }
 
         $output = (($capture.StdOut + "`n" + $capture.StdErr)).Trim()
 
@@ -1038,7 +1047,11 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days $Days -nodes \
 echo GENERATED
 "@
 
-    $capture = Invoke-DeltaOpenSsl -Image $OpenSslImage -MountPath $OutputDirectory -Command $command -Writable
+    # RSA-2048 keygen plus a container start. Seconds at best, and the operator
+    # has just answered a question, so the terminal would otherwise sit idle.
+    $capture = Invoke-DeltaActivity -Message 'Generating the certificate' -ScriptBlock {
+        Invoke-DeltaOpenSsl -Image $OpenSslImage -MountPath $OutputDirectory -Command $command -Writable
+    }
 
     $certificatePath = Join-Path $OutputDirectory $Script:DeltaCertificateFileName
     $keyPath         = Join-Path $OutputDirectory $Script:DeltaCertificateKeyName

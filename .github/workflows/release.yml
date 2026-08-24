@@ -197,13 +197,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           # Names must match tools\build-release.ps1's $Script:PackageName
-          # ("DELTA-windows-installer-docker-<Version>"), $Script:ZipPath and
+          # ("DELTA-windows-docker-installer-<Version>"), $Script:ZipPath and
           # $Script:ChecksumPath. Asserting them here rather than trusting the
           # build's exit code means a packaging change that silently renames
           # an artifact fails the release instead of publishing a release with
           # missing assets.
           $version  = "${{ steps.version.outputs.version }}"
-          $zip      = "release/DELTA-windows-installer-docker-$version.zip"
+          $zip      = "release/DELTA-windows-docker-installer-$version.zip"
           $checksum = "$zip.sha256"
 
           if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
@@ -230,7 +230,7 @@ jobs:
           # missing its assets.
           fail_on_unmatched_files: true
           files: |
-            release/DELTA-windows-installer-docker-${{ steps.version.outputs.version }}.zip
-            release/DELTA-windows-installer-docker-${{ steps.version.outputs.version }}.zip.sha256
+            release/DELTA-windows-docker-installer-${{ steps.version.outputs.version }}.zip
+            release/DELTA-windows-docker-installer-${{ steps.version.outputs.version }}.zip.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

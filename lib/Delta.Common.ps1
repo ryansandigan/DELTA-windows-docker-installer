@@ -356,9 +356,81 @@ function Get-DeltaLogPath {
 # an outer operation that is still in progress looking finished.
 # ---------------------------------------------------------------------------
 
-$Script:DeltaActivityFrames     = @('.', '..', '...')
-$Script:DeltaActivityIntervalMs = 400
+# The spinner. Two sets, because this runs on Windows consoles whose output
+# encoding is very often a legacy code page: a braille glyph written to a cp437
+# or cp1252 console is not a spinner, it is a question mark or a mojibake pair,
+# and a broken glyph redrawn eight times a second is worse than no glyph. The
+# set is chosen once, from what the console can actually represent.
+#
+# The Unicode frames are built from code points rather than written as literals
+# so that this file stays pure ASCII on disk. Windows PowerShell 5.1 decodes a
+# BOM-less .ps1 as the ANSI code page, which would corrupt the literals here
+# long before they ever reached a console.
+$Script:DeltaActivityFramesAscii = @('-', '\', '|', '/')
+$Script:DeltaActivityFramesWide  = @(
+    0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F
+) | ForEach-Object { [string][char]$_ }
+
+function Get-DeltaActivityFrameSet {
+    <#
+      The spinner frames this console can render. UTF-8 gets the braille cycle;
+      anything else - and any console this cannot ask - gets the ASCII one.
+      Fails closed for the same reason Test-DeltaActivitySupported does.
+    #>
+    try {
+        if ([Console]::OutputEncoding.CodePage -eq 65001) { return $Script:DeltaActivityFramesWide }
+    }
+    catch { }
+    return $Script:DeltaActivityFramesAscii
+}
+
+$Script:DeltaActivityFrames = Get-DeltaActivityFrameSet
+
+# Eight frames a second. The old three-dot cycle ran at 400 ms because three
+# frames is all it had; a spinner at that rate reads as a stutter rather than
+# as motion. The elapsed counter needs only 1 Hz and gets redrawn with it.
+$Script:DeltaActivityIntervalMs = 125
 $Script:DeltaActivityIndent     = '    '
+
+# Room reserved on the line for " (<elapsed>)". Fixed rather than measured, so
+# the line's width - and therefore the erase that follows it - does not change
+# as the seconds tick over. Twelve covers "(9999m 59s)" and its leading space.
+$Script:DeltaActivitySuffixWidth = 12
+
+# How one frame of an activity line is rendered, as SOURCE, because it has to
+# run in two places: on the main thread (the first frame, and every redraw
+# after a suspension) and inside the worker runspace, which shares no state
+# with this file beyond what is hung on $state. Keeping it as one string and
+# compiling it in both places is what stops the two renderings drifting - a
+# main-thread frame and a worker frame that disagreed by a character would
+# leave residue on the line every time output interrupted an operation.
+$Script:DeltaActivityRenderSource = @'
+param([Parameter(Mandatory)][object]$State, [int]$Index = 0)
+
+$seconds = [int][Math]::Floor(((Get-Date) - $State.Started).TotalSeconds)
+if ($seconds -lt 0) { $seconds = 0 }
+
+# Seconds up to a minute, then minutes and seconds. No hours: an installer
+# operation that has been running for an hour has a bigger problem than its
+# units, and "94m 12s" is still read correctly at a glance.
+$elapsed = if ($seconds -lt 60) { "${seconds}s" }
+           else { '{0}m {1:00}s' -f [int][Math]::Floor($seconds / 60), ($seconds % 60) }
+
+$spinner = $State.Frames[$Index % $State.Frames.Count]
+return ($State.Indent + $spinner + ' ' + $State.Message + " ($elapsed)")
+'@
+
+$Script:DeltaActivityRender = [scriptblock]::Create($Script:DeltaActivityRenderSource)
+
+function Format-DeltaActivityLine {
+    <#
+      One rendered frame, for the main thread and for tests. The worker
+      compiles the same source in its own runspace; this is the only other
+      caller, and both go through $Script:DeltaActivityRenderSource.
+    #>
+    param([Parameter(Mandatory)][object]$State, [int]$Index = 0)
+    return (& $Script:DeltaActivityRender $State $Index)
+}
 
 # 'auto' decides per activity from the console; 'off' never animates and
 # prints the static line instead. setup.ps1 turns it off for -NonInteractive,
@@ -384,6 +456,10 @@ $Script:DeltaActivitySuspendDepth = 0
 # exist in that runspace - so $state and the TextWriter on it are the whole of
 # its world.
 $Script:DeltaActivityWorker = {
+    # The one renderer, compiled into this runspace from the source the main
+    # thread also uses. Compiled once, outside the loop.
+    $render = [scriptblock]::Create($state.RenderSource)
+
     # Frame 0 was already drawn synchronously by Start-DeltaActivity, so this
     # picks up at frame 1 rather than repeating it.
     $index = 1
@@ -391,11 +467,11 @@ $Script:DeltaActivityWorker = {
         [System.Threading.Monitor]::Enter($state.Sync)
         try {
             if (-not $state.Paused) {
-                $frame = $state.Frames[$index % $state.Frames.Count]
-                # Padded to the widest frame rather than erased first: the line
-                # is rewritten in one write, so there is no instant at which a
-                # blanked line is on screen.
-                $state.Writer.Write("`r" + ($state.Indent + $state.Message + $frame).PadRight($state.Width))
+                # Padded to the full reserved width rather than erased first:
+                # the line is rewritten in one write, so there is no instant at
+                # which a blanked line is on screen, and an elapsed counter
+                # shrinking from "1m 00s" back to nothing leaves no residue.
+                $state.Writer.Write("`r" + (& $render $state $index).PadRight($state.Width))
                 $state.Writer.Flush()
                 $state.Drawn = $state.Width
                 $index++
@@ -540,15 +616,15 @@ function Write-DeltaActivityFrame {
     <#
       Draws one frame of $State's line from column 0. Callers hold $State.Sync.
 
-      Padded to the widest frame rather than erased first: the line is rewritten
-      in a single write, so there is no instant at which a blanked line is on
-      screen, and shrinking '...' back to '.' leaves no stale dots behind.
+      Padded to the full reserved width rather than erased first: the line is
+      rewritten in a single write, so there is no instant at which a blanked
+      line is on screen, and an elapsed counter that has grown and shrunk
+      leaves no stale characters behind.
     #>
     param([Parameter(Mandatory)][object]$State, [int]$Index = 0)
 
     try {
-        $frame = $State.Frames[$Index % $State.Frames.Count]
-        $State.Writer.Write("`r" + ($State.Indent + $State.Message + $frame).PadRight($State.Width))
+        $State.Writer.Write("`r" + (Format-DeltaActivityLine -State $State -Index $Index).PadRight($State.Width))
         $State.Writer.Flush()
         $State.Drawn = $State.Width
     }
@@ -634,12 +710,12 @@ function Start-DeltaActivity {
     # it is still in progress, and it goes back on screen when this one ends.
     Suspend-DeltaActivityState -State (Get-DeltaActivityCurrent)
 
-    $line = $Script:DeltaActivityIndent + $Message
-    $longest = 0
-    foreach ($frame in $Script:DeltaActivityFrames) {
-        if ($frame.Length -gt $longest) { $longest = $frame.Length }
-    }
-    $width = $line.Length + $longest
+    # $line is the STATIC form - indent and message, no spinner, no clock -
+    # because that is what a non-animating run prints and what its transcript
+    # has always read. The animated width adds the spinner, its separating
+    # space, and the reserved room for the elapsed counter.
+    $line  = $Script:DeltaActivityIndent + $Message
+    $width = $line.Length + 2 + $Script:DeltaActivitySuffixWidth
 
     Write-DeltaLogLine -Message "$Message..." -Level 'DETAIL'
 
@@ -657,6 +733,13 @@ function Start-DeltaActivity {
         IntervalMs = $Script:DeltaActivityIntervalMs
         Width      = $width
         Drawn      = 0
+        # When the OPERATION started, not when the animation did. Set before
+        # anything can draw, so the first frame already reads (0s), and left
+        # alone by suspend/resume: an operation interrupted by a status line
+        # has still been running for the whole time, and a counter that reset
+        # every time something was printed would be measuring the wrong thing.
+        Started      = (Get-Date)
+        RenderSource = $Script:DeltaActivityRenderSource
         # Animated $false is a real activity that happens not to draw: a
         # non-interactive run still has operations in progress, still nests
         # them, and still has to pop them in the right order. Making the static

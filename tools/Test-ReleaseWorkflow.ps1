@@ -568,10 +568,10 @@ function Test-PackagingAndArtifacts {
     $build = Invoke-WorkflowStep -StepName $Script:StepBuild -SandboxPath $sandbox -Values $values
     Assert-Equal -Description 'build step succeeds' -Expected 0 -Actual $build.ExitCode
 
-    $zip = Join-Path $sandbox 'release\DELTA-windows-installer-docker-1.0.0.zip'
+    $zip = Join-Path $sandbox 'release\DELTA-windows-docker-installer-1.0.0.zip'
     $sha = "$zip.sha256"
-    Assert-That -Description 'ZIP is named DELTA-windows-installer-docker-1.0.0.zip' -Condition (Test-Path -LiteralPath $zip -PathType Leaf)
-    Assert-That -Description 'checksum is named DELTA-windows-installer-docker-1.0.0.zip.sha256' -Condition (Test-Path -LiteralPath $sha -PathType Leaf)
+    Assert-That -Description 'ZIP is named DELTA-windows-docker-installer-1.0.0.zip' -Condition (Test-Path -LiteralPath $zip -PathType Leaf)
+    Assert-That -Description 'checksum is named DELTA-windows-docker-installer-1.0.0.zip.sha256' -Condition (Test-Path -LiteralPath $sha -PathType Leaf)
 
     $verify = Invoke-WorkflowStep -StepName $Script:StepArtifacts -SandboxPath $sandbox -Values $values
     Assert-Equal -Description 'artifact verification passes' -Expected 0 -Actual $verify.ExitCode
@@ -588,13 +588,13 @@ function Test-PackagingAndArtifacts {
     # Checksum content is the real hash of the real ZIP, in sha256sum layout.
     $checksumLine = (Get-Content -LiteralPath $sha -Raw).Trim()
     $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-    Assert-Equal -Description 'checksum matches the ZIP and names it' -Expected "$actualHash  DELTA-windows-installer-docker-1.0.0.zip" -Actual $checksumLine
+    Assert-Equal -Description 'checksum matches the ZIP and names it' -Expected "$actualHash  DELTA-windows-docker-installer-1.0.0.zip" -Actual $checksumLine
 
     # The packaged installer carries the version that was released.
     $extract = Join-Path $sandbox '_extract'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $extract)
-    $packagedVersionFile = Join-Path $extract 'DELTA-windows-installer-docker-1.0.0\lib\Delta.Version.ps1'
+    $packagedVersionFile = Join-Path $extract 'DELTA-windows-docker-installer-1.0.0\lib\Delta.Version.ps1'
     Assert-That -Description 'package contains lib\Delta.Version.ps1' -Condition (Test-Path -LiteralPath $packagedVersionFile -PathType Leaf)
     if (Test-Path -LiteralPath $packagedVersionFile -PathType Leaf) {
         $packaged = [regex]::Match([System.IO.File]::ReadAllText($packagedVersionFile), "(?m)^\`$Script:DeltaInstallerVersion\s*=\s*'([^']*)'").Groups[1].Value
@@ -605,7 +605,7 @@ function Test-PackagingAndArtifacts {
     # package root: the scheduled tasks the installer registers point at
     # <install root>\bin\, so a package that put them anywhere else would
     # install and then fail at boot, or silently at 03:30.
-    $packageRoot = Join-Path $extract 'DELTA-windows-installer-docker-1.0.0'
+    $packageRoot = Join-Path $extract 'DELTA-windows-docker-installer-1.0.0'
     foreach ($script in @('start-delta.ps1', 'rotate-nginx-logs.ps1')) {
         Assert-That -Description "package contains bin\$script" -Condition (Test-Path -LiteralPath (Join-Path $packageRoot "bin\$script") -PathType Leaf)
         Assert-That -Description "package does not contain $script at its root" -Condition (-not (Test-Path -LiteralPath (Join-Path $packageRoot $script) -PathType Leaf))
@@ -616,15 +616,15 @@ function Test-PackagingAndArtifacts {
     # ZIP missing.
     $noZip = New-SandboxCheckout -Name 'artifact-no-zip' -Version '1.0.0'
     Invoke-WorkflowStep -StepName $Script:StepBuild -SandboxPath $noZip -Values $values | Out-Null
-    Remove-Item -LiteralPath (Join-Path $noZip 'release\DELTA-windows-installer-docker-1.0.0.zip') -Force
+    Remove-Item -LiteralPath (Join-Path $noZip 'release\DELTA-windows-docker-installer-1.0.0.zip') -Force
     $resultNoZip = Invoke-WorkflowStep -StepName $Script:StepArtifacts -SandboxPath $noZip -Values $values
     Assert-That -Description 'missing ZIP fails the job' -Condition ($resultNoZip.ExitCode -ne 0)
-    Assert-That -Description 'missing ZIP is named in the error' -Condition ($resultNoZip.Output -match 'DELTA-windows-installer-docker-1\.0\.0\.zip')
+    Assert-That -Description 'missing ZIP is named in the error' -Condition ($resultNoZip.Output -match 'DELTA-windows-docker-installer-1\.0\.0\.zip')
 
     # Checksum missing.
     $noSha = New-SandboxCheckout -Name 'artifact-no-sha' -Version '1.0.0'
     Invoke-WorkflowStep -StepName $Script:StepBuild -SandboxPath $noSha -Values $values | Out-Null
-    Remove-Item -LiteralPath (Join-Path $noSha 'release\DELTA-windows-installer-docker-1.0.0.zip.sha256') -Force
+    Remove-Item -LiteralPath (Join-Path $noSha 'release\DELTA-windows-docker-installer-1.0.0.zip.sha256') -Force
     $resultNoSha = Invoke-WorkflowStep -StepName $Script:StepArtifacts -SandboxPath $noSha -Values $values
     Assert-That -Description 'missing checksum fails the job' -Condition ($resultNoSha.ExitCode -ne 0)
     Assert-That -Description 'missing checksum is named in the error' -Condition ($resultNoSha.Output -match '\.sha256')
@@ -635,7 +635,7 @@ function Test-PackagingAndArtifacts {
     $resultBad = Invoke-WorkflowStep -StepName $Script:StepBuild -SandboxPath $badBuild -Values $values
     Assert-That -Description 'failed packaging fails the job' -Condition ($resultBad.ExitCode -ne 0)
     Assert-That -Description 'failed packaging names the missing file' -Condition ($resultBad.Output -match 'start-delta\.ps1')
-    Assert-That -Description 'no ZIP is left behind by a failed build' -Condition (-not (Test-Path -LiteralPath (Join-Path $badBuild 'release\DELTA-windows-installer-docker-1.0.0.zip')))
+    Assert-That -Description 'no ZIP is left behind by a failed build' -Condition (-not (Test-Path -LiteralPath (Join-Path $badBuild 'release\DELTA-windows-docker-installer-1.0.0.zip')))
 
     # Defence in depth: even if a failed build were somehow to report
     # success, the artifact check standing between it and publication
@@ -685,8 +685,8 @@ function Test-EndToEndHappyPath {
 
     $filesBlock = Expand-WorkflowExpression -Script (Get-StepScalar -Lines $lines -StepName $Script:StepPublish -Key 'files') -Values $values
     $assets = @($filesBlock -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    Assert-Equal -Description '   asset 1 is the versioned ZIP' -Expected 'release/DELTA-windows-installer-docker-1.0.0.zip' -Actual $assets[0]
-    Assert-Equal -Description '   asset 2 is its .sha256' -Expected 'release/DELTA-windows-installer-docker-1.0.0.zip.sha256' -Actual $assets[1]
+    Assert-Equal -Description '   asset 1 is the versioned ZIP' -Expected 'release/DELTA-windows-docker-installer-1.0.0.zip' -Actual $assets[0]
+    Assert-Equal -Description '   asset 2 is its .sha256' -Expected 'release/DELTA-windows-docker-installer-1.0.0.zip.sha256' -Actual $assets[1]
 }
 
 # ---------------------------------------------------------------------------
@@ -729,7 +729,43 @@ function Test-ContractConsistency {
     Assert-That -Description 'release.yml strips only the leading v' -Condition ($workflow -match "\`$tag\s+-replace\s+'\^v',\s*''")
 
     # Package naming: build-release.ps1 owns it; everyone else must match.
-    $packagePrefix = 'DELTA-windows-installer-docker-'
+    #
+    # The prefix is the REPOSITORY name. That is the whole rule, and it is
+    # asserted below rather than left as a convention, because the convention
+    # is exactly what failed: the package was built as
+    # "DELTA-windows-installer-docker-<Version>" for the whole of 1.0.0 while
+    # the repository was "DELTA-windows-docker-installer". Every consumer of
+    # the name agreed with every other one, so the cross-checks below all
+    # passed - they pinned the four copies to each other and nothing pinned
+    # them to the project.
+    $Script:CanonicalRepositoryName = 'DELTA-windows-docker-installer'
+    $packagePrefix = "$Script:CanonicalRepositoryName-"
+
+    # Checked against the actual remote when there is one. A clone always has
+    # one; an exported tree or a CI checkout without origin does not, and that
+    # is a skip rather than a failure - the literal above still holds the line.
+    $remote = $null
+    try { $remote = (& git -C $Script:ProjectRoot remote get-url origin 2>$null) } catch { }
+    if ($remote) {
+        $remoteName = ([string]$remote).Trim() -replace '\.git$', '' -replace '^.*[/:]', ''
+        Assert-Equal -Description 'the package prefix is the repository name' `
+            -Expected $Script:CanonicalRepositoryName -Actual $remoteName
+    }
+    else {
+        Write-Host '    [SKIP] no git remote here, so the repository name could not be cross-checked' -ForegroundColor DarkGray
+    }
+
+    # And the old name is gone from every file that builds, publishes,
+    # verifies or documents the artifact.
+    foreach ($named in @(
+        @{ Name = 'build-release.ps1'; Text = $builder }
+        @{ Name = 'release.ps1';       Text = $release }
+        @{ Name = 'release.yml';       Text = $workflow }
+        @{ Name = 'README.md';         Text = $readme }
+    )) {
+        Assert-That -Description "$($named.Name) has no DELTA-windows-installer-docker left in it" `
+            -Condition (-not $named.Text.Contains('DELTA-windows-installer-docker'))
+    }
     Assert-That -Description 'build-release.ps1 defines the package name' -Condition ($builder -match ([regex]::Escape("`$Script:PackageName  = `"$packagePrefix`$Version`"")))
     Assert-That -Description 'release.yml verifies that ZIP name' -Condition ($workflow.Contains("release/$packagePrefix`$version.zip"))
     Assert-That -Description 'release.yml uploads that ZIP name' -Condition ($workflow.Contains("release/$packagePrefix`${{ steps.version.outputs.version }}.zip"))

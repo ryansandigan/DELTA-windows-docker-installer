@@ -512,8 +512,8 @@ try {
         Write-Detail "use CHANGELOG.md's '## [$nextVersion]' section as the release body"
         Write-Detail "run tools\build-release.ps1 -Version $nextVersion"
         Write-Detail "publish release $tagName with these assets attached:"
-        Write-Detail "  DELTA-windows-installer-docker-$nextVersion.zip"
-        Write-Detail "  DELTA-windows-installer-docker-$nextVersion.zip.sha256"
+        Write-Detail "  DELTA-windows-docker-installer-$nextVersion.zip"
+        Write-Detail "  DELTA-windows-docker-installer-$nextVersion.zip.sha256"
         Write-Host ''
         Write-Success 'Dry run completed. No changes were made.'
         exit 0

@@ -12,19 +12,55 @@ Docker's own and which the installer never touches.
 
 ---
 
-## TL;DR — installation guide
+## Quick installation guide
 
-The whole install, in order. Everything here is expanded further down.
+Follow these steps for a standard DELTA installation. Each step is explained in
+more detail later in this document.
 
-1. **Download** the installer ZIP, `DELTA-windows-installer-docker-X.Y.Z.zip`.
+> **Before you begin, the machine needs:**
+>
+> - **Windows 11, or Windows Server 2022 / 2025** — 64-bit.
+> - **About 20 GB free** on the system volume.
+> - **Internet access to `ghcr.io` and `docker.io`** for the first run.
+>
+> Hardware virtualization is also required; step 4 covers how to check and
+> enable it. Everything else the installer needs, it installs or checks itself.
+>
+> On Windows Server, note that Docker Desktop is not officially supported there
+> by Docker. DELTA has been tested successfully with it on Windows Server 2022
+> and 2025, and the installer states this and asks before installing anything.
+
+1. **Download** the installer ZIP, `DELTA-windows-docker-installer-X.Y.Z.zip`.
+   These examples assume it landed in your **Downloads** folder, which is where
+   Windows browsers normally put it. If yours is set to save somewhere else,
+   use that path instead — nothing below depends on the location.
 
 2. **Unblock it *before* extracting.** Right-click the ZIP → **Properties** →
    tick **Unblock** if it is shown → **Apply**. Windows marks files that came
    from the internet; clearing the mark on the ZIP saves clearing it on every
    file inside it afterwards.
 
-3. **Extract** it to a local folder — say `C:\Installers\DELTA`. A local disk,
-   not a network share or a cloud-synced folder.
+3. **Extract it** — right-click → **Extract All…** is enough. Extracting it
+   where it is gives you:
+
+   ```text
+   $HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z\
+   ```
+
+   containing `setup.ps1`, `uninstall.ps1`, `bin\`, `lib\` and `templates\`.
+   That is the **installer directory**, and it is an example location, not a
+   requirement: any local directory works. A local disk, though — not a network
+   share and not a cloud-synced folder.
+
+   > **Keep this directory after the install.** `setup.ps1` is also the
+   > management utility you will use afterwards, and the scheduled tasks the
+   > installer registers point at scripts inside its `bin\`. Deleting it breaks
+   > both.
+   >
+   > It is **not** where DELTA gets installed. That is a separate directory,
+   > `C:\DELTA` by default, created by the installer and holding `.env`,
+   > `docker-compose.yml`, `certs\`, `uploads\`, `backups\` and the rest — see
+   > [Where things are](#where-things-are).
 
 4. **Make sure hardware virtualization is available to Windows.** Docker
    Desktop's WSL2 backend runs the Docker engine in a WSL2 utility VM, which
@@ -54,13 +90,18 @@ The whole install, in order. Everything here is expanded further down.
    `Windows PowerShell` → right-click it → **Run as administrator**. Elevation
    is required; the installer checks and stops if it is missing.
 
-6. **Run these three lines**, with your own extraction folder in the first one:
+6. **Run these three lines**, with the installer directory from step 3 in the
+   first one and the real version in place of `X.Y.Z`:
 
    ```powershell
-   cd "C:\Installers\DELTA"
+   cd "$HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z"
    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    .\setup.ps1
    ```
+
+   `$HOME` is PowerShell's own variable for your user profile directory, so
+   that first line works as written for any account — there is no username to
+   substitute. If you extracted somewhere else, `cd` there instead.
 
    The middle line is not optional housekeeping — without it, most Windows
    machines answer `.\setup.ps1` with **"running scripts is disabled on this
@@ -81,16 +122,42 @@ The whole install, in order. Everything here is expanded further down.
    > `MachinePolicy` and `UserPolicy` outrank the process scope by design. Ask
    > whoever administers that policy.
 
+   **A short pause before the first message is normal.** On some machines there
+   is a gap of a few seconds between opening PowerShell — or pressing Enter on
+   `.\setup.ps1` — and DELTA's banner appearing. That gap is PowerShell itself
+   starting up and loading the installer's modules, before any of DELTA's code
+   is running, so the installer cannot draw anything during it. Once the banner
+   is up, every operation that takes noticeable time shows a spinner and an
+   elapsed counter:
+
+   ```text
+       \ Pulling container images (1m 14s)
+   ```
+
+   so from that point on you can always tell the difference between working and
+   stuck. If nothing at all appears after a minute or so, something is wrong —
+   see [When something goes wrong](#when-something-goes-wrong).
+
 7. **Answer the prompts** — hostname, database password, administrator
    password, HTTPS, and one SMTP question at the end. Enter takes a sensible
    default for every one of them.
 
+   If Docker Desktop is not already on the machine, you are shown Docker's
+   licensing terms and asked before anything is installed; accept, and the
+   installer installs it for you. If Docker Desktop is already there, the
+   installer uses it and asks nothing about it.
+
 8. **If it asks to restart Windows, let it.** Docker Desktop and the WSL2
    platform need a restart before the installation can go on. After you sign
-   back in, DELTA **tries** to pick up where it left off: a window appears and
-   Windows shows a **UAC elevation prompt** — approve it and the installation
-   continues on its own. If it does not manage that, finish it by hand — see
-   [If the restart does not continue by itself](#if-the-restart-does-not-continue-by-itself).
+   back in, DELTA **tries** to pick up where it left off:
+
+   - a **DELTA Setup** dialog appears — click **OK**;
+   - approve the Windows administrator permission (UAC) prompt if one appears;
+   - the installer resumes in a PowerShell window.
+
+   Leave that PowerShell window open while setup continues. If the resume does
+   not happen, finish it by hand — both paths are set out in
+   [The restart part-way through](#the-restart-part-way-through).
 
 9. **Wait for it to finish.** The first run takes a few minutes, most of it
    pulling images. It verifies the database, the administrator credential and
@@ -113,41 +180,26 @@ its own, though not the instant the desktop appears — see
 
 ---
 
-## Before you start
-
-- **Windows Server 2022 / 2025, or Windows 11.** 64-bit.
-- **Hardware virtualization available to Windows.** On a physical host, enabled
-  in BIOS/UEFI. If Windows is running in a VM, nested virtualization must be
-  exposed to it by the parent hypervisor — see step 4 of the
-  [TL;DR](#tldr--installation-guide). The installer checks and tells you if it
-  is missing.
-- **Administrator rights.** Run the script from an elevated PowerShell window.
-- **Docker Desktop.** If it is already installed, the installer uses it. If it
-  is not, the installer shows Docker's licensing terms, asks you to accept
-  them, installs Docker Desktop silently, and asks to restart Windows. After
-  you sign back in it tries to continue by itself — approve the UAC prompt when
-  it appears — and tells you how to finish by hand if it cannot. See
-  [The restart part-way through](#the-restart-part-way-through).
-  > Docker Desktop is not officially supported by Docker on Windows Server.
-  > DELTA has been successfully tested with Docker Desktop on Windows Server
-  > 2022 and 2025. The installer states this and asks before installing
-  > anything.
-- **About 20 GB free** on the system volume, and internet access to
-  `ghcr.io` and `docker.io` for the first run.
-
----
-
 ## Installing
 
-From an elevated PowerShell prompt, in the folder containing `setup.ps1`:
+From an elevated PowerShell prompt, in the extracted installer directory — the
+one containing `setup.ps1`, `$HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z`
+in the examples here:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
 
-That is the whole thing. It installs to `C:\DELTA` unless you say otherwise.
-You do not prepare a configuration file, create a database, create an
-administrator account, start any container, or touch Docker directly.
+That is the whole thing. It installs to `C:\DELTA` unless you say otherwise —
+a *different* directory from the one you are running from, and the one that
+ends up holding `.env`, the Compose file, the certificates and the data. You do
+not prepare a configuration file, create a database, create an administrator
+account, start any container, or touch Docker directly.
+
+Expect a few seconds of nothing before the banner appears while PowerShell
+starts and loads the installer's libraries; after that, any operation that
+takes noticeable time shows a spinner and an elapsed counter.
 
 ### What you will be asked
 
@@ -188,15 +240,40 @@ DELTA on a machine and try it from that machine immediately, without owning a
 DNS name or a certificate. Nothing looks the name up, so a hostname whose DNS
 entry does not exist yet is accepted — you can point DNS at it later.
 
-The **database password** is a masked prompt where pressing Enter has one
-generated for you. That is a perfectly good answer: the database is never
-published to the network and nothing outside this machine can reach it. Type
-your own if you want to connect with other tooling — you are asked for it twice
-and the two entries must match.
+The **database password** is asked as a choice, not as a prompt with a hidden
+default:
 
-The **DELTA administrator password** is asked as a choice rather than as a
-prompt with a hidden default, because it is the credential you will actually
-sign in with:
+```
+Database password
+
+    The installer creates the PostgreSQL database for DELTA and protects it
+    with this password. The database is not published to the network.
+
+Choose how to set the password:
+
+  1. Enter a password
+  2. Generate a strong password automatically
+
+Choose 1 or 2 [2]:
+```
+
+**Enter, or 2,** generates one. That is a perfectly good answer: the database is
+never published to the network and nothing outside this machine can reach it.
+**1** asks you to type it, masked, twice; the two entries must match, and a
+mismatch is reported and asked again rather than accepted. Choose 1 if you want
+a password you can also use to connect with other tooling.
+
+Nothing but `1`, `2` or Enter is accepted here. In particular a password typed
+at this question is refused as a choice — it does not become your database
+password, and it is not echoed back while it is being refused.
+
+A generated database password is 32 characters. Unlike the administrator
+credential it is never displayed, because nothing asks you to type it in later:
+the installer writes it to `POSTGRES_PASSWORD` in the installation's `.env`,
+which is where you can read it if you need it.
+
+The **DELTA administrator password** is asked the same way, and for the same
+reason — except that this is the credential you will actually sign in with:
 
 ```
 DELTA administrator password
@@ -220,8 +297,9 @@ taken as an answer here — a password typed at this question is refused as a
 choice, not accepted as your credential. A password you chose yourself is never
 displayed, because you already know it.
 
-Both prompts are masked, and neither password is ever written to the installer's
-log.
+For both credentials, every password entry is masked, and neither password —
+typed or generated — is ever written to the installer's log. The transcript
+records which method you chose and nothing else.
 
 Answering the HTTPS question with **your own certificate** opens two Windows
 file-selection dialogs, one for the certificate and one for the private key —
@@ -314,19 +392,33 @@ When you sign back in:
    restart."**
 2. It waits for the desktop to finish signing in. This is not instant — give it
    up to a minute or so.
-3. **Windows shows a UAC elevation prompt.** You must approve it. The installer
+3. A **DELTA Setup - Continue Installation** dialog appears, asking whether to
+   go on. Click **OK**. This is a dialog rather than another line of console
+   text on purpose: the PowerShell window is where the installer's own output
+   goes, and anything that needs *you* is a Windows dialog you cannot miss
+   under a screen of scrolling text.
+4. **Windows shows a UAC elevation prompt.** You must approve it. The installer
    cannot continue without administrator rights, and the window in front of you
-   does not have them.
-4. Approving it opens an elevated window and the installation carries on from
-   the state it finds — the same installation folder, the same answers. You are
-   not asked the installation questions again.
+   does not have them. (If you signed in to an account that is already running
+   elevated, there is no prompt, and the dialog does not claim there will be
+   one.)
+5. The installation carries on in a PowerShell window, from the state it finds
+   — the same installation folder, the same answers. You are not asked the
+   installation questions again. **Leave that window open** until setup
+   finishes or asks you something.
+
+Clicking **Cancel** on the dialog is safe and changes nothing: nothing is
+elevated, nothing is restarted, and the partial installation is left exactly as
+it is. You are told so, and the commands to continue later are printed in the
+console window behind it.
 
 **This is an attempt, not a guarantee.** The elevation prompt can be declined,
 and Windows sometimes cancels its own prompt when it is asked for one while the
 desktop is still coming up. Either way you get the same message —
 `The operation was canceled by the user` — because Windows reports both the
-same way. The window then offers to **ask again**; press Enter and the prompt
-comes back. That is worth doing once if you did not decline it yourself.
+same way. You are then asked, once, whether to **ask Windows again**; say yes
+and the prompt comes back. That is worth doing once if you did not decline it
+yourself. It never asks again on its own.
 
 Nothing is lost if it gives up. The installation resumes from the machine's
 actual state whenever you next run `setup.ps1`, which is exactly what the
@@ -336,13 +428,19 @@ automatic path does.
 
 Open **Windows PowerShell as Administrator** — Start → type
 `Windows PowerShell` → right-click → **Run as administrator** — and run, with
-your own installer folder in the first line:
+your own installer directory in the first line:
 
 ```powershell
-cd "C:\Installers\DELTA"
+cd "$HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
+
+That first line is the example location from the
+[quick installation guide](#quick-installation-guide) — the directory you
+extracted the ZIP to, the one holding `setup.ps1`, not `C:\DELTA`. You do not
+have to work it out from here: the continuation window prints the exact three
+lines to run, with the real directory already filled in.
 
 `-Scope Process` applies to that one PowerShell window only and is forgotten
 when you close it; it changes nothing for your account or for the machine. It
@@ -410,10 +508,12 @@ Two separate places: the folder you extracted the installer into, and the
 installation it creates.
 
 **The extracted installer** — keep it. `setup.ps1` is also the management
-utility and the uninstaller lives beside it:
+utility and the uninstaller lives beside it. Wherever you extracted the ZIP;
+`$HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z\` in the examples in this
+document:
 
 ```
-DELTA-windows-installer-docker-X.Y.Z\
+DELTA-windows-docker-installer-X.Y.Z\
   setup.ps1                 install, and afterwards the management menu
   uninstall.ps1             remove DELTA (always backs up first)
   bin\                      scripts the scheduled tasks run
@@ -1965,8 +2065,8 @@ Pushing that tag triggers `.github\workflows\release.yml`, which runs on
 5. publishes the GitHub Release for the tag with both attached:
 
 ```
-DELTA-windows-installer-docker-X.Y.Z.zip
-DELTA-windows-installer-docker-X.Y.Z.zip.sha256
+DELTA-windows-docker-installer-X.Y.Z.zip
+DELTA-windows-docker-installer-X.Y.Z.zip.sha256
 ```
 
 Every one of those steps fails the run rather than publishing something
@@ -2002,7 +2102,7 @@ useful for inspecting what a release package would contain:
 ```
 
 It copies an explicit whitelist of production files into
-`release\DELTA-windows-installer-docker-<Version>\`, zips it, and writes a
+`release\DELTA-windows-docker-installer-<Version>\`, zips it, and writes a
 matching `.sha256`. `release\` is deleted and recreated on every run, so a
 rebuild never mixes in leftovers. It downloads nothing and publishes nothing —
 Docker Desktop and the container images are still obtained at install time.
@@ -2194,13 +2294,15 @@ first seen.
 6. **Expected:** a console window titled *DELTA setup - continuing after
    restart* appears and says it is continuing. It then pauses — this is the
    wait for the desktop shell, and it is allowed to take up to about 90 seconds.
-7. **Expected:** exactly **one** UAC prompt, for `Windows PowerShell`. Approve
+7. **Expected:** a **DELTA Setup - Continue Installation** dialog, on top of
+   whatever else is on screen, offering **OK** and **Cancel**. Click **OK**.
+8. **Expected:** exactly **one** UAC prompt, for `Windows PowerShell`. Approve
    it.
-8. **Expected:** an elevated window opens, `Checking privileges` reports
+9. **Expected:** an elevated window opens, `Checking privileges` reports
    `Running elevated.`, and the installer continues without re-asking the
    installation questions or the Docker licence. If you used a custom
    installation folder, confirm the banner names that folder and not `C:\DELTA`.
-9. Confirm the entry removed itself:
+10. Confirm the entry removed itself:
 
    ```powershell
    Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name DELTASetupContinue -ErrorAction SilentlyContinue
@@ -2212,20 +2314,32 @@ first seen.
 
 Do this on a second run, or re-arm it by answering **Y** to a restart again.
 
-1. At step 7 above, click **No** on the UAC prompt.
-2. **Expected:** the window reports
+1. At step 8 above, click **No** on the UAC prompt.
+2. **Expected:** the console reports
    `This command cannot be run due to the error: The operation was canceled by the user.`,
-   explains that Windows cancels its own prompt sometimes, and asks
-   `Ask for elevation again? [Y/n]`.
-3. Press **Enter**. **Expected:** the UAC prompt returns. Approve it this time
+   and a dialog explains that Windows cancels its own prompt sometimes and asks
+   **Ask Windows for administrator permission again?**
+3. Click **Yes**. **Expected:** the UAC prompt returns. Approve it this time
    and the installation continues as above.
-4. Repeat, and this time answer **n**. **Expected:** the window prints the
-   three-line manual sequence with your real installer folder in the `cd` line,
-   the `Set-ExecutionPolicy -Scope Process` line, and `.\setup.ps1` (with
+4. Repeat, and this time click **No**. **Expected:** the console window prints
+   the three-line manual sequence with your real installer folder in the `cd`
+   line, the `Set-ExecutionPolicy -Scope Process` line, and `.\setup.ps1` (with
    `-InstallRoot` if your folder is not `C:\DELTA`) — then waits on
    *Press Enter to close this window.*
 5. Copy those three lines into an elevated Windows PowerShell and confirm they
    work as printed.
+
+**The Cancel path**
+
+Re-arm the continuation, and at step 7 click **Cancel** instead of OK.
+
+1. **Expected:** no UAC prompt at all, and a second dialog saying
+   *DELTA installation is still incomplete.*
+2. **Expected:** the console window behind it prints the same three-line manual
+   sequence, and the RunOnce entry is gone (step 10's check returns nothing).
+3. **Expected:** nothing on the machine changed — no container started, no
+   restart, and the partial installation untouched.
+4. Run the three printed lines and confirm the installation resumes normally.
 
 **What must not happen, on either path**
 

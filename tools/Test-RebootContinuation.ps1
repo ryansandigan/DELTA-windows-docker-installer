@@ -142,6 +142,7 @@ function Get-SetupFunctionText {
     return $found[0].Extent.Text
 }
 
+. ([scriptblock]::Create((Get-SetupFunctionText -Name 'Compress-DeltaContinuationScript')))
 . ([scriptblock]::Create((Get-SetupFunctionText -Name 'Register-DeltaLogonContinuation')))
 
 function New-Continuation {
@@ -205,6 +206,14 @@ function Invoke-ContinuationScript {
       elevation probe - again by parse tree, so the swap cannot silently miss
       and leave the real probe (and the test host's real token) deciding.
 
+      -DialogAnswers does the same for the Windows dialog: a scripted list of
+      button results, one per dialog raised, recorded along with the text each
+      one showed. 'none' stands for a machine that cannot show a dialog at all,
+      which is what makes the console fallback testable on a machine that can.
+      With no list supplied the dialog is unavailable, so every test written
+      before dialogs existed still exercises the console path it was written
+      for.
+
       -Answers feeds Read-Host. -FailStarts makes the first N Start-Process
       calls throw the exact exception Windows raises when a UAC prompt is not
       approved, message and all.
@@ -213,25 +222,58 @@ function Invoke-ContinuationScript {
         [Parameter(Mandatory)][string]$Inner,
         [bool]$Elevated = $false,
         [string[]]$Answers = @(),
+        [string[]]$DialogAnswers = @(),
         [int]$FailStarts = 0
     )
 
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($Inner, [ref]$null, [ref]$null)
-    $probe = @($ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Test-DeltaContinuationElevated'
-    }, $true))
-    if ($probe.Count -ne 1) { throw "The generated script should define Test-DeltaContinuationElevated exactly once; found $($probe.Count)." }
 
-    $extent = $probe[0].Extent
-    $stub   = "function Test-DeltaContinuationElevated { return `$$($Elevated.ToString().ToLowerInvariant()) }"
-    $patched = $Inner.Substring(0, $extent.StartOffset) + $stub + $Inner.Substring($extent.EndOffset)
+    # Both seams are replaced the same way, by parse-tree extent, so a rename
+    # in setup.ps1 fails this loudly rather than leaving the real function in
+    # place - which for the dialog would mean a message box on a test run.
+    $stubs = @{
+        'Test-DeltaContinuationElevated' =
+            "function Test-DeltaContinuationElevated { return `$$($Elevated.ToString().ToLowerInvariant()) }"
+        'Show-DeltaContinuationDialog' = @'
+function Show-DeltaContinuationDialog {
+    param([string]$Text, [string]$Caption, [string]$Buttons = 'OKCancel', [string]$Icon)
+    $null = $log.Dialogs.Add([PSCustomObject]@{ Text = $Text; Caption = $Caption; Buttons = $Buttons })
+    if ($dialogQueue.Count -eq 0) { throw "The continuation raised more dialogs than the test scripted answers for. Last: $Caption" }
+    # A trailing 'none' is sticky: a machine with no dialog support does not
+    # acquire it half way through, so every later call answers the same way.
+    # Scripted button results are consumed one per dialog, so raising more
+    # dialogs than the test allowed for still fails loudly.
+    $answer = if ($dialogQueue.Count -eq 1 -and $dialogQueue.Peek() -eq 'none') { $dialogQueue.Peek() }
+              else { $dialogQueue.Dequeue() }
+    if ($answer -eq 'none') { return $null }
+    return $answer
+}
+'@
+    }
+
+    $targets = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true) | Where-Object { $stubs.ContainsKey($_.Name) })
+
+    foreach ($name in $stubs.Keys) {
+        $count = @($targets | Where-Object { $_.Name -eq $name }).Count
+        if ($count -ne 1) { throw "The generated script should define $name exactly once; found $count." }
+    }
+
+    # Replaced in descending offset order, so the offsets of the extents not
+    # yet replaced are still valid against the text being edited.
+    $patched = $Inner
+    foreach ($node in ($targets | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        $patched = $patched.Substring(0, $node.Extent.StartOffset) +
+                   $stubs[$node.Name] +
+                   $patched.Substring($node.Extent.EndOffset)
+    }
 
     # A scriptblock's ToString() is its body, param block included, which is
     # exactly what AddScript wants.
     $harness = {
-        param($ContinuationScript, $Answers, $FailStarts)
+        param($ContinuationScript, $Answers, $DialogAnswers, $FailStarts)
 
         # A hashtable, not plain variables: the stand-ins below mutate it from
         # a child scope, and a bare assignment there would make a local copy
@@ -239,6 +281,7 @@ function Invoke-ContinuationScript {
         $log = @{
             Starts     = [System.Collections.Generic.List[object]]::new()
             Prompts    = [System.Collections.Generic.List[string]]::new()
+            Dialogs    = [System.Collections.Generic.List[object]]::new()
             Output     = [System.Collections.Generic.List[string]]::new()
             Removals   = [System.Collections.Generic.List[string]]::new()
             ShellPolls = 0
@@ -246,6 +289,13 @@ function Invoke-ContinuationScript {
         }
         $queue = [System.Collections.Generic.Queue[string]]::new()
         foreach ($a in $Answers) { $queue.Enqueue([string]$a) }
+
+        # Nothing scripted means no dialog is available at all - the console
+        # fallback - which is what every test written before this existed
+        # expects to be exercising.
+        $dialogQueue = [System.Collections.Generic.Queue[string]]::new()
+        if (@($DialogAnswers).Count -eq 0) { $dialogQueue.Enqueue('none') }
+        else { foreach ($d in $DialogAnswers) { $dialogQueue.Enqueue([string]$d) } }
 
         function Write-Host {
             param([Parameter(Position = 0)]$Object, $ForegroundColor, [switch]$NoNewline)
@@ -296,7 +346,7 @@ function Invoke-ContinuationScript {
     $ps = [powershell]::Create()
     try {
         $null = $ps.AddScript($harness.ToString()).
-            AddArgument($patched).AddArgument($Answers).AddArgument($FailStarts)
+            AddArgument($patched).AddArgument($Answers).AddArgument($DialogAnswers).AddArgument($FailStarts)
         $out = $ps.Invoke()
 
         # Anything the continuation wrote to the error stream is a defect in
@@ -491,6 +541,205 @@ try {
 }
 catch {
     Assert-That "the continuation retried without asking: $($_.Exception.Message)" $false
+}
+
+# ===========================================================================
+# 5b. The Windows dialog
+#
+# The division the dialog exists to draw: the PowerShell window is where the
+# installer's execution and technical output go, and the dialog is where a
+# request for human action goes. Everything below is about that one request -
+# nothing else in the installer gained a dialog.
+# ===========================================================================
+
+Start-TestCase 'OK on the dialog elevates and starts setup, with one dialog and no console question'
+
+$ok = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false -DialogAnswers @('ok')
+
+Assert-Equal 'exactly one dialog was raised'   1 $ok.Dialogs.Count
+Assert-Equal 'it offers OK and Cancel'         'OKCancel' $ok.Dialogs[0].Buttons
+Assert-Equal 'setup.ps1 was started once'      1 $ok.Starts.Count
+Assert-Equal 'elevated, via the RunAs verb'    'RunAs' $ok.Starts[0].Verb
+Assert-That  'with the persisted installation root' ($ok.Starts[0].ArgumentList -match '(?i)-InstallRoot')
+Assert-Equal 'and nothing was asked at the console' 0 $ok.Prompts.Count
+
+$okText = $ok.Dialogs[0].Text
+Assert-That 'the dialog says setup is ready to continue' ($okText -match 'ready to continue after the restart')
+Assert-That 'it says OK continues'                       ($okText -match 'Click OK to continue')
+Assert-That 'it warns that Windows will ask for permission' ($okText -match '(?s)Windows will ask for\s+administrator permission \(UAC\)')
+Assert-That 'it says setup continues in a PowerShell window' ($okText -match 'PowerShell window')
+Assert-That 'and it asks the operator not to close it'   ($okText -match 'Do not close the PowerShell window')
+
+Start-TestCase 'Cancel is safe: nothing elevates, nothing re-registers, recovery is offered'
+
+$cancel = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false -DialogAnswers @('cancel', 'ok') -Answers @('')
+
+Assert-Equal 'nothing was started'                 0 $cancel.Starts.Count
+Assert-Equal 'so no elevation was ever requested'  0 (@($cancel.Starts | Where-Object { $_.Verb -eq 'RunAs' }).Count)
+Assert-Equal 'a second, informational dialog is shown' 2 $cancel.Dialogs.Count
+Assert-Equal 'with a single OK button'             'OK' $cancel.Dialogs[1].Buttons
+
+$cancelText = $cancel.Dialogs[1].Text
+Assert-That 'it says the installation is incomplete' ($cancelText -match 'DELTA installation is still incomplete')
+Assert-That 'and how to continue later'             ($cancelText -match '(?s)running setup\.ps1 again\s+as Administrator')
+
+# Cancelling is not a failure state. The RunOnce value was consumed before any
+# of this, nothing re-registers it, and the console still carries the manual
+# commands - so the operator is never left without a way back in.
+Assert-That 'the RunOnce value was still consumed'  ($cancel.Removals.Count -ge 1)
+$cancelConsole = ($cancel.Output -join "`n")
+Assert-That 'the console says nothing was changed'  ($cancelConsole -match 'Nothing was changed on this machine')
+Assert-That 'and still prints the manual commands'  ($cancelConsole -match [regex]::Escape('Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass'))
+Assert-That 'including the real installer directory' ($cancelConsole -match [regex]::Escape('cd "' + $Script:SpacedRoot + '"'))
+
+Start-TestCase 'An already-elevated session is told the truth and gets no second UAC'
+
+$elevatedOk = Invoke-ContinuationScript -Inner $c.Inner -Elevated $true -DialogAnswers @('ok')
+
+Assert-Equal 'setup.ps1 was started once' 1 $elevatedOk.Starts.Count
+Assert-Equal 'with no RunAs verb'         $null $elevatedOk.Starts[0].Verb
+Assert-Equal 'and one dialog only'        1 $elevatedOk.Dialogs.Count
+
+# The wording must not promise a prompt that is never coming. This is the
+# assertion that stops the two messages being merged into one later.
+$elevatedText = $elevatedOk.Dialogs[0].Text
+Assert-That 'it does not claim Windows will ask for permission' ($elevatedText -notmatch '(?i)UAC|administrator permission')
+Assert-That 'it still says OK continues the installation'       ($elevatedText -match 'Click OK to continue the installation')
+Assert-That 'and still asks for patience with the window'       ($elevatedText -match 'do not close it until setup finishes')
+
+Start-TestCase 'Cancel from an already-elevated session is equally safe'
+
+$elevatedCancel = Invoke-ContinuationScript -Inner $c.Inner -Elevated $true -DialogAnswers @('cancel', 'ok') -Answers @('')
+Assert-Equal 'nothing was started' 0 $elevatedCancel.Starts.Count
+Assert-That  'and the recovery dialog is the same one' `
+    ($elevatedCancel.Dialogs[1].Text -match 'DELTA installation is still incomplete')
+
+Start-TestCase 'A machine that cannot show a dialog falls back to the console, unchanged'
+
+# 'none' is a machine where System.Windows.Forms will not load. The dialog is
+# skipped entirely and the operator gets exactly the console flow that existed
+# before dialogs did - which is the point: a GUI failure must never be what
+# stops DELTA being resumed.
+$noGui = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false
+
+Assert-Equal 'setup.ps1 was still started'       1 $noGui.Starts.Count
+Assert-Equal 'still elevated'                    'RunAs' $noGui.Starts[0].Verb
+Assert-Equal 'nothing was asked at the console'  0 $noGui.Prompts.Count
+Assert-That  'and the console still explains the prompt' `
+    (@($noGui.Output | Where-Object { $_ -match 'Approve the elevation prompt' }).Count -eq 1)
+
+# A dialog that fails half way through is the same story: still resumable.
+Start-TestCase 'A dialog that stops working mid-flow still leaves a usable console path'
+
+$halfGui = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false `
+    -DialogAnswers @('ok', 'none') -FailStarts 99 -Answers @('n', '')
+
+Assert-Equal 'the elevation was attempted once'   1 $halfGui.Starts.Count
+Assert-That  'the console asked about retrying'   (@($halfGui.Prompts | Where-Object { $_ -match '(?i)elevation again' }).Count -eq 1)
+Assert-That  'and the manual commands were printed' (($halfGui.Output -join "`n") -match [regex]::Escape('Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass'))
+
+Start-TestCase 'A declined UAC offers one deliberate retry through the dialog, and never loops'
+
+$retryGui = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false -DialogAnswers @('ok', 'yes') -FailStarts 1
+
+Assert-Equal 'the first attempt failed and a second was made' 2 $retryGui.Starts.Count
+Assert-Equal 'both were elevation requests'                   2 (@($retryGui.Starts | Where-Object { $_.Verb -eq 'RunAs' }).Count)
+Assert-Equal 'the retry was asked for in a dialog'            2 $retryGui.Dialogs.Count
+Assert-Equal 'as a yes/no question'                           'YesNo' $retryGui.Dialogs[1].Buttons
+Assert-Equal 'and never at the console'                       0 $retryGui.Prompts.Count
+
+$retryText = $retryGui.Dialogs[1].Text
+Assert-That 'the retry dialog says setup did not start'  ($retryText -match 'DELTA setup did not start')
+Assert-That 'and that Windows may have cancelled it'     ($retryText -match 'Windows cancels its')
+Assert-That 'and asks before asking again'               ($retryText -match 'Ask Windows for administrator permission again')
+
+Start-TestCase 'Declining the retry dialog stops - it does not ask again on its own'
+
+$retryNo = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false `
+    -DialogAnswers @('ok', 'no') -FailStarts 99 -Answers @('')
+
+Assert-Equal 'exactly one elevation was attempted' 1 $retryNo.Starts.Count
+Assert-Equal 'the retry was offered exactly once'  1 (@($retryNo.Dialogs | Where-Object { $_.Buttons -eq 'YesNo' }).Count)
+Assert-That  'and the window waits to be read'     ($retryNo.Output -contains '  Press Enter to close this window.')
+
+# The harness throws if more dialogs are raised than scripted, so an automatic
+# re-prompt shows up here as a failure rather than as a hang.
+Start-TestCase 'Repeated failures never produce an unattended UAC loop'
+
+$loopGuard = $null
+try {
+    $loopGuard = Invoke-ContinuationScript -Inner $c.Inner -Elevated $false `
+        -DialogAnswers @('ok', 'yes', 'yes', 'no') -FailStarts 99 -Answers @('')
+    Assert-Equal 'each retry cost one deliberate Yes' 3 $loopGuard.Starts.Count
+}
+catch {
+    Assert-That "the continuation re-prompted without being asked: $($_.Exception.Message)" $false
+}
+
+Start-TestCase 'The dialog is raised only after the desktop is ready'
+
+# The whole reason the wait exists: a consent prompt - and now a dialog -
+# raised before the shell is up is one nobody sees.
+$order = $c.Inner.IndexOf('Get-Process -Name ''explorer''')
+$dialogAt = $c.Inner.IndexOf('Show-DeltaContinuationDialog -Text')
+Assert-That 'the shell wait comes first'  (($order -ge 0) -and ($dialogAt -gt $order))
+
+Assert-That 'the dialog is raised on a TopMost owner so it cannot open behind Explorer' `
+    ($c.Inner -match '(?s)Show-DeltaContinuationDialog.*?TopMost\s*=\s*\$true')
+
+# The title is the function's default rather than something each caller
+# repeats, so it is pinned where it actually lives.
+Assert-That 'the documented title is the dialog default' `
+    ($c.Inner -match [regex]::Escape("`$Caption = 'DELTA Setup - Continue Installation'"))
+Assert-That 'and any dialog failure returns $null rather than throwing' `
+    ($c.Inner -match '(?s)function Show-DeltaContinuationDialog.*?catch \{\s*return \$null\s*\}')
+
+# The two conditions under which a message box does not fail but HANGS, so a
+# catch around it would never fire. Both are refused before anything is shown.
+Assert-That 'a non-STA thread is refused before any dialog is attempted' `
+    ($c.Inner -match "GetApartmentState\(\) -ne 'STA'\) \{ return \`$null \}")
+Assert-That 'and a non-interactive session is refused too' `
+    ($c.Inner -match '(?s)UserInteractive\) \{ return \$null \}')
+
+Start-TestCase 'The real dialog function returns rather than hanging when it cannot be shown'
+
+# Behavioural, against the REAL Show-DeltaContinuationDialog rather than the
+# stub: run it on an MTA thread, where MessageBox blocks indefinitely instead
+# of throwing. It must come back, with $null, so the console path can run.
+$innerAst = [System.Management.Automation.Language.Parser]::ParseInput($c.Inner, [ref]$null, [ref]$null)
+$dialogSource = @($innerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Show-DeltaContinuationDialog'
+}, $true))[0].Extent.Text
+
+$mta = [powershell]::Create()
+$null = $mta.AddScript(@"
+$dialogSource
+return (Show-DeltaContinuationDialog -Text 'DELTA test - this window must never appear' -Buttons 'OKCancel')
+"@)
+$mta.Runspace = [runspacefactory]::CreateRunspace()
+$mta.Runspace.ApartmentState = 'MTA'
+$mta.Runspace.Open()
+
+try {
+    $async = $mta.BeginInvoke()
+    if ($async.AsyncWaitHandle.WaitOne(20000)) {
+        $mtaResult = @($mta.EndInvoke($async))
+        Assert-That 'it returns instead of blocking the resume' $true
+        # $null is the "no dialog here" contract; the console path reads it as
+        # "the operator was never asked" and runs exactly as it always did.
+        Assert-That 'and reports no dialog, so the console takes over' `
+            (($mtaResult.Count -eq 0) -or ($null -eq $mtaResult[0]))
+    }
+    else {
+        $mta.Stop()
+        Assert-That 'it returns instead of blocking the resume' $false
+    }
+}
+finally {
+    try { $mta.Runspace.Close() } catch { }
+    try { $mta.Dispose() } catch { }
 }
 
 # ===========================================================================

@@ -428,6 +428,43 @@ function Unregister-DeltaLogonContinuation {
     }
 }
 
+function Compress-DeltaContinuationScript {
+    <#
+      Removes comments and runs of blank lines from a generated script, so the
+      -EncodedCommand it becomes carries code and nothing else.
+
+      Done with the tokenizer rather than a regex, and by deleting the exact
+      character spans the tokenizer reports as comments: a '#' inside a string
+      literal - '  Start > type "Windows PowerShell" > ...' is one keystroke
+      away from having one - is not a comment, and a regex that treated it as
+      one would silently truncate a line of operator instructions.
+
+      Everything that is not a comment is preserved byte for byte. If the
+      tokenizer reports any error at all the script is returned untouched: a
+      slightly longer command line is a trade worth making against a mangled
+      one.
+    #>
+    param([Parameter(Mandatory)][string]$Script)
+
+    $errors = $null
+    $tokens = [System.Management.Automation.PSParser]::Tokenize($Script, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) { return $Script }
+
+    $text = $Script
+    $comments = @($tokens | Where-Object { $_.Type -eq 'Comment' } | Sort-Object Start -Descending)
+    foreach ($comment in $comments) {
+        $text = $text.Remove($comment.Start, $comment.Length)
+    }
+
+    # A removed comment leaves the line it was on blank. Collapse those, and
+    # any run of blank lines, to a single one - the script stays readable if
+    # anyone ever decodes the registry value to audit it.
+    $text = [regex]::Replace($text, '(?m)^[ \t]+$', '')
+    $text = [regex]::Replace($text, '(\r?\n){3,}', "`r`n`r`n")
+
+    return $text.Trim()
+}
+
 function Register-DeltaLogonContinuation {
     <#
       Arranges for setup.ps1 to run itself again at the operator's next
@@ -580,8 +617,121 @@ function Test-DeltaContinuationElevated {
     return `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The one place a Windows dialog is raised. Returns the button as lowercase
+# text, or `$null when no dialog could be shown at all - which is the whole
+# contract: `$null means "fall back to the console", and every caller below
+# does exactly that. A machine that cannot show a dialog must still be
+# resumable, so nothing here is allowed to be fatal.
+#
+# Also swapped out by Test-RebootContinuation.ps1, which is what lets OK,
+# Cancel and no-GUI-at-all be exercised without a desktop.
+function Show-DeltaContinuationDialog {
+    param(
+        [Parameter(Mandatory)][string]`$Text,
+        [string]`$Caption = 'DELTA Setup - Continue Installation',
+        [ValidateSet('OKCancel', 'OK', 'YesNo')][string]`$Buttons = 'OKCancel',
+        [ValidateSet('Information', 'Warning')][string]`$Icon = 'Information'
+    )
+
+    # Checked BEFORE anything is shown, because these two failures do not
+    # throw - they hang. MessageBox on an MTA thread blocks indefinitely
+    # instead of returning, and so a catch-all around it would never fire;
+    # measured, not assumed. RunOnce runs powershell.exe, which is STA by
+    # default, so this is a guard rather than a routine path - but a resume
+    # that hangs with no window on screen is the one outcome worse than no
+    # dialog at all.
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { return `$null }
+        if (-not [Environment]::UserInteractive) { return `$null }
+    }
+    catch { return `$null }
+
+    `$anchor = `$null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+        # An owner window that is TopMost, because this dialog appears while
+        # the desktop is still settling after a sign-in and an unowned message
+        # box can open behind Explorer. A dialog nobody sees would be worse
+        # than the console text it replaces.
+        `$anchor = New-Object System.Windows.Forms.Form
+        `$anchor.TopMost       = `$true
+        `$anchor.ShowInTaskbar = `$false
+        `$anchor.StartPosition = 'CenterScreen'
+        `$null = `$anchor.Handle
+
+        # Cast, not [Type]::`$variable - dynamic static-member access on an enum
+        # is not something Windows PowerShell 5.1 can be relied on to resolve.
+        `$result = [System.Windows.Forms.MessageBox]::Show(
+            `$anchor, `$Text, `$Caption,
+            ([System.Windows.Forms.MessageBoxButtons]`$Buttons),
+            ([System.Windows.Forms.MessageBoxIcon]`$Icon))
+
+        return ([string]`$result).ToLowerInvariant()
+    }
+    catch {
+        return `$null
+    }
+    finally {
+        if (`$anchor) { try { `$anchor.Dispose() } catch { } }
+    }
+}
+
+`$elevated = Test-DeltaContinuationElevated
+
+# Two different sentences, because promising a UAC prompt to a session that
+# will not get one is the kind of small lie that makes an operator sit waiting
+# for a window that is never coming.
+`$introText = if (`$elevated) {
+    @(
+        'DELTA setup is ready to continue after the restart.'
+        ''
+        'Click OK to continue the installation.'
+        ''
+        'The DELTA installer will continue in a PowerShell window.'
+        'Please be patient and do not close it until setup finishes'
+        'or asks you for input.'
+    ) -join [Environment]::NewLine
+}
+else {
+    @(
+        'DELTA setup is ready to continue after the restart.'
+        ''
+        'Click OK to continue. Windows will ask for'
+        'administrator permission (UAC).'
+        ''
+        'After you approve it, the DELTA installer will continue'
+        'automatically in a PowerShell window.'
+        ''
+        'Please be patient while setup continues.'
+        'Do not close the PowerShell window until DELTA setup'
+        'finishes or asks you for input.'
+    ) -join [Environment]::NewLine
+}
+
+# `$null - no dialog on this machine - is not a refusal. It means the operator
+# was never asked, so the console path runs exactly as it did before dialogs
+# existed here.
+`$choice    = Show-DeltaContinuationDialog -Text `$introText -Buttons 'OKCancel'
+`$hasDialog = (`$null -ne `$choice)
+`$cancelled = (`$choice -eq 'cancel')
+
 `$started = `$false
-if (Test-DeltaContinuationElevated) {
+if (`$cancelled) {
+    # Nothing is elevated, nothing is registered, nothing is restarted, and the
+    # partial installation is left exactly as it is. The RunOnce value was
+    # already consumed at the top of this script, so nothing fires again on its
+    # own either.
+    `$null = Show-DeltaContinuationDialog -Buttons 'OK' -Caption 'DELTA Setup' -Text (@(
+        'DELTA installation is still incomplete.'
+        ''
+        'You can continue later by running setup.ps1 again'
+        'as Administrator.'
+    ) -join [Environment]::NewLine)
+
+    Write-Host '  Continuation cancelled. Nothing was changed on this machine.'
+}
+elseif (`$elevated) {
     # Already administrator, so there is nothing to elevate and no prompt to
     # show. Asking anyway would be a UAC prompt that changes nothing.
     Write-Host '  This session is already elevated, so no elevation prompt is needed.'
@@ -610,8 +760,31 @@ else {
             Write-Host '  same way, and it does cancel its own while the desktop is still signing'
             Write-Host '  in. So this is worth one more try if you did not decline it.'
             Write-Host ''
-            `$answer = Read-Host '  Ask for elevation again? [Y/n]'
-            if (`$answer -match '^\s*(n|no)\s*`$') { break }
+
+            # Deliberate, and asked once per attempt. Never automatic: Windows
+            # cannot tell this script whether the operator declined, so a retry
+            # it did not ask for would be a UAC prompt that keeps coming back.
+            `$retryText = @(
+                'DELTA setup did not start.'
+                ''
+                'Windows did not confirm administrator permission. That happens'
+                'when the prompt is declined, and also when Windows cancels its'
+                'own prompt while the desktop is still signing in.'
+                ''
+                'Ask Windows for administrator permission again?'
+            ) -join [Environment]::NewLine
+
+            `$again = if (`$hasDialog) {
+                Show-DeltaContinuationDialog -Text `$retryText -Buttons 'YesNo' -Icon 'Warning' -Caption 'DELTA Setup - Continue Installation'
+            }
+            else { `$null }
+
+            if (`$null -eq `$again) {
+                # No dialog, or the dialog stopped working part-way through.
+                `$answer = Read-Host '  Ask for elevation again? [Y/n]'
+                if (`$answer -match '^\s*(n|no)\s*`$') { break }
+            }
+            elseif (`$again -ne 'yes') { break }
         }
     }
 }
@@ -632,8 +805,24 @@ else {
     # -EncodedCommand rather than a quoted one-liner: the registry value is
     # handed to CreateProcess as-is, and a path with spaces, quotes or an
     # ampersand in it has too many ways to be misread on the way through.
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+    #
+    # The comments are stripped first. Base64 of UTF-16 is about 2.7 bytes of
+    # command line per byte of script, and CreateProcess stops at 32767 - so
+    # every explanatory line above costs nearly three times its length in a
+    # budget that, if it were ever exceeded, would fail as a machine that
+    # simply does not resume. The comments belong here, in the file a
+    # maintainer actually reads; the encoded blob is machine-generated and
+    # machine-consumed.
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes((Compress-DeltaContinuationScript -Script $inner)))
     $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+
+    # Refused rather than written long. A value CreateProcess will not accept
+    # is a resume that silently never happens, and the caller already knows how
+    # to report a continuation it could not register.
+    if ($command.Length -ge 32000) {
+        $result.Reason = "The continuation command would be $($command.Length) characters, which is beyond what Windows will run from RunOnce."
+        return $result
+    }
 
     try {
         if (-not (Test-Path -LiteralPath $Script:DeltaRunOnceKey)) {

@@ -14,7 +14,7 @@
     release".
 
     Packaging only: copies a fixed whitelist of production files into
-    release\DELTA-windows-installer-docker-<Version>\, zips that
+    release\DELTA-windows-docker-installer-<Version>\, zips that
     directory, and writes a SHA256 checksum for the zip. Nothing that the
     installer obtains at install time is bundled here - Docker Desktop is
     downloaded (or staged by the site into installers\), and the NGINX,
@@ -102,7 +102,7 @@ if ($Version.IndexOfAny($invalidChars) -ge 0) {
     Stop-Release "Version '$Version' contains characters that are not valid in a file name."
 }
 
-$Script:PackageName  = "DELTA-windows-installer-docker-$Version"
+$Script:PackageName  = "DELTA-windows-docker-installer-$Version"
 $Script:ReleaseDir   = Join-Path -Path $Script:ProjectRoot -ChildPath 'release'
 $Script:PackageDir   = Join-Path -Path $Script:ReleaseDir -ChildPath $Script:PackageName
 $Script:ZipPath      = Join-Path -Path $Script:ReleaseDir -ChildPath "$Script:PackageName.zip"

@@ -568,7 +568,12 @@ function Invoke-DeltaWslCommand {
     $previous = $env:WSL_UTF8
     $env:WSL_UTF8 = '1'
     try {
-        return (Invoke-DeltaProcessCapture -FilePath $wsl.Source -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds)
+        # `wsl --status` and `wsl --version` are usually instant and are given a
+        # sixty-second budget precisely because on a half-installed or wedged
+        # WSL they are not. -WhenIdle: `wsl --install` already announces itself.
+        return (Invoke-DeltaActivity -Message 'Querying the Windows Subsystem for Linux' -WhenIdle -ScriptBlock {
+            Invoke-DeltaProcessCapture -FilePath $wsl.Source -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds
+        })
     }
     finally {
         if ($null -eq $previous) { Remove-Item Env:\WSL_UTF8 -ErrorAction SilentlyContinue }
@@ -1783,8 +1788,14 @@ function Get-DeltaDockerEngineState {
         }
     }
 
+    # `docker info` against an engine that is starting, stopped or wedged takes
+    # the whole two minutes to say so, and this is the probe every Docker
+    # decision in the installer rests on. -WhenIdle: the engine wait and the
+    # Docker Desktop start already animate, and this runs inside both.
     $format = '{{.OSType}}|{{.ServerVersion}}|{{.KernelVersion}}|{{.OperatingSystem}}'
-    $info = Invoke-DeltaDockerCommand -Arguments @('info', '--format', $format) -TimeoutSeconds 120
+    $info = Invoke-DeltaActivity -Message 'Querying the Docker engine' -WhenIdle -ScriptBlock {
+        Invoke-DeltaDockerCommand -Arguments @('info', '--format', $format) -TimeoutSeconds 120
+    }
 
     if ($info.ExitCode -ne 0 -or -not $info.StdOut) {
         $raw = (($info.StdErr + "`n" + $info.StdOut)).Trim()
