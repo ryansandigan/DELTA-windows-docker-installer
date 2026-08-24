@@ -1451,6 +1451,17 @@ function New-DeltaCertificateStaging {
       through it includes a private key, and the installer's own tree is where
       this product already keeps such things. Removed by the caller in a
       finally block, whatever happened.
+
+      The self-signed generator mounts this directory INTO a container and
+      writes the certificate and key there, so its ACL has to satisfy two
+      things at once: no local user may read the private key that passes
+      through it, and Docker Desktop must still be able to create files in it.
+      Protect-DeltaSecretDirectory is what reconciles those - Administrators
+      and SYSTEM keep full control, every broad principal goes, and the one
+      account Docker reads and writes host files as gets read/execute and
+      write. Not Read, which cannot create a file, and not Modify, which adds a
+      delete this workflow never performs. The measurements are in that
+      function.
     #>
     param([Parameter(Mandatory)][string]$InstallRoot)
 
@@ -1460,10 +1471,14 @@ function New-DeltaCertificateStaging {
     # Hardened after creation, and a hardening failure must not throw: the
     # caller records the returned path and removes it in a finally block, so
     # throwing between the mkdir and the return orphans the directory inside
-    # certs\ with nobody left holding its name. It inherits certs\'s own
-    # protection either way; the explicit ACL is a tightening, not the only
-    # thing standing between this and the world.
-    try { Protect-DeltaSecretFile -Path $path }
+    # certs\ with nobody left holding its name.
+    #
+    # This used to call Protect-DeltaSecretFile, which begins by returning for
+    # anything that is not a leaf - so it hardened nothing at all, and the
+    # directory kept certs\'s inherited entries including BUILTIN\Users:(RX).
+    # The comment here claimed the explicit ACL was "a tightening"; it was not
+    # applied.
+    try { Protect-DeltaSecretDirectory -Path $path -AllowDockerWrite }
     catch { Write-DeltaWarning "The certificate staging directory could not be ACL-restricted: $($_.Exception.Message)" }
 
     return $path

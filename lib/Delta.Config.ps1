@@ -446,10 +446,104 @@ function Get-DeltaDockerFileReadSid {
     }
 }
 
+function Protect-DeltaSecretDirectory {
+    <#
+      The directory counterpart of Protect-DeltaSecretFile, for a working
+      directory that holds secret material: Administrators + SYSTEM full
+      control, inheritable, and nothing else.
+
+      It exists because Protect-DeltaSecretFile cannot do this. That function
+      begins `if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }`
+      and a directory is not a leaf, so calling it on one has always returned
+      silently without touching the ACL. Measured on a real staging directory:
+      it kept every inherited entry, including BUILTIN\Users:(RX) - which meant
+      a private key sat readable by every local user for the length of a
+      certificate operation, in the one place the code most believed it was
+      protected.
+
+      -AllowDockerWrite grants the account Docker Desktop reads and writes host
+      files as exactly what a container needs to PRODUCE files here, and no
+      more. That is not the same grant the deployed key gets. Measured against
+      a real engine, with the real self-signed workflow, on a DACL modelling a
+      UAC-filtered administrator token:
+
+          SYSTEM only                -> docker: Error response from daemon:
+                                        Access is denied     (the mount fails)
+          + <user>:(R)               -> sh: cannot create /work/openssl.err:
+                                        Permission denied
+          + <user>:(RX,W)            -> works
+          + <user>:(M)               -> works
+
+      So Read is not enough - the previous fix's grant would not have carried
+      here - and Modify is more than is needed: it adds DELETE, which nothing
+      in the workflow uses. `openssl req` creates delta.key, delta.crt and
+      openssl.err and writes them; it removes nothing and renames nothing, and
+      the directory itself is removed afterwards by the host, elevated, through
+      Administrators. (RX,W) is what the workflow actually exercises, so
+      (RX,W) is what it gets.
+
+      (OI)(CI) on every entry, because the files the container creates in here
+      inherit their ACL from this directory: without it a generated private key
+      would land with no entries at all and the host could not copy it out.
+
+      Non-fatal, for the same reason Protect-DeltaSecretFile is: the caller
+      records the returned path and removes it in a finally block, so throwing
+      here would orphan a directory inside certs\ with nobody holding its name.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$AllowDockerWrite
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+
+    $dockerGrant = $null
+    if ($AllowDockerWrite) {
+        $dockerSid = Get-DeltaDockerFileReadSid
+        if ($dockerSid) { $dockerGrant = "${dockerSid}:(OI)(CI)(RX,W)" }
+    }
+
+    try {
+        # :r, not :d - this directory is created fresh by the caller a moment
+        # earlier, so there is nothing inherited worth materialising and every
+        # broad principal goes with it in one step. What is left afterwards is
+        # exactly what is granted below, which is what makes the result
+        # deterministic rather than a function of whatever certs\ happened to
+        # be carrying.
+        $output = & icacls.exe $Path /inheritance:r /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls /inheritance:r failed: $(($output | Out-String).Trim())"
+        }
+
+        foreach ($grant in @('BUILTIN\Administrators:(OI)(CI)(F)', 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)')) {
+            $output = & icacls.exe $Path /grant $grant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        if ($dockerGrant) {
+            $output = & icacls.exe $Path /grant:r $dockerGrant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant:r $dockerGrant failed: $(($output | Out-String).Trim())"
+            }
+        }
+    }
+    catch {
+        Write-DeltaWarning "Could not restrict permissions on '$Path': $($_.Exception.Message)"
+    }
+}
+
 function Protect-DeltaSecretFile {
     <#
       Restricts $Path to Administrators + SYSTEM with inheritance disabled
       (A§24). Adapted from the reference installer's Protect-DeltaSecretFile.
+
+      FILES only - a directory is not a leaf and returns below without being
+      touched. Protect-DeltaSecretDirectory above is the one for those, and it
+      is a different ACL because a container writes into those.
 
       Mechanics, in order: /inheritance:d materialises the inherited ACEs so
       the ones that should survive still exist before anything is removed;

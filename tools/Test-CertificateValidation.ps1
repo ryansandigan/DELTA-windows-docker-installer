@@ -100,6 +100,26 @@ $Script:Failed = 0
 . (Join-Path $Script:ProjectRoot 'lib\Delta.Docker.ps1')
 . (Join-Path $Script:ProjectRoot 'lib\Delta.Network.ps1')
 
+# The two staging helpers are lifted out of lib\Delta.Tls.ps1 by parse tree
+# rather than dot-sourcing that file, which would drag in Stack, Manage,
+# Configure and Domain for two functions. Same technique the reboot suite uses,
+# and it still exercises the code that ships rather than a copy of it.
+$Script:TlsAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $Script:ProjectRoot 'lib\Delta.Tls.ps1'), [ref]$null, [ref]$null)
+
+function Get-TlsFunctionText {
+    param([Parameter(Mandatory)][string]$Name)
+    $found = @($Script:TlsAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+    }, $true))
+    if ($found.Count -ne 1) { throw "lib\Delta.Tls.ps1 should define $Name exactly once; found $($found.Count)." }
+    return $found[0].Extent.Text
+}
+
+. ([scriptblock]::Create((Get-TlsFunctionText -Name 'New-DeltaCertificateStaging')))
+. ([scriptblock]::Create((Get-TlsFunctionText -Name 'Remove-DeltaCertificateStaging')))
+
 # Nothing animates during a test run: the frames would interleave with the
 # assertions and the transcript of a failure would be unreadable.
 Set-DeltaActivityMode -Mode 'off'
@@ -788,10 +808,16 @@ function Get-AclEntries {
         if ($text -match '^\s*$' -or $text -match 'Successfully processed') { continue }
         # The first line carries the path before the first ACE.
         $text = $text -replace ('^' + [regex]::Escape($Path) + '\s*'), ''
-        if ($text -match '^\s*([^:]+):\(([^)]*)\)\s*$') {
+        # An ACE is "<principal>:(flag)(flag)(rights)". A file entry has one
+        # group; a directory entry carries its inheritance flags in the groups
+        # before the last. The final group is always the rights themselves.
+        if ($text -match '^\s*(.+?):((?:\([^)]*\))+)\s*$') {
+            $groups = @([regex]::Matches($Matches[2], '\(([^)]*)\)') | ForEach-Object { $_.Groups[1].Value })
+            $flags = if ($groups.Count -gt 1) { ($groups[0..($groups.Count - 2)]) -join ',' } else { '' }
             $null = $entries.Add([PSCustomObject]@{
                 Principal = $Matches[1].Trim()
-                Rights    = $Matches[2].Trim()
+                Rights    = $groups[-1].Trim()
+                Flags     = $flags
             })
         }
     }
@@ -929,7 +955,136 @@ Assert-That 'the certs mount carries :ro' ($composeTemplate -match '\./certs:/et
 Assert-That 'and nothing mounts certs writable' ($composeTemplate -notmatch '\./certs:/etc/nginx/certs\s*$')
 
 # ===========================================================================
-# 7. The real engine (-Live only)
+# 7. The certificate-management staging directory
+#
+# Different problem from the deployed key above, same collision underneath.
+# certs\.staging-<guid> holds a private key AND is bind-mounted into a
+# container that WRITES the certificate and key into it, so its ACL has to
+# refuse every local user while still letting Docker Desktop create files.
+#
+# What shipped did neither. New-DeltaCertificateStaging called
+# Protect-DeltaSecretFile on a DIRECTORY, and that function's first line is
+#
+#     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+#
+# so it returned without touching anything and the directory kept certs\'s
+# inherited entries - BUILTIN\Users:(RX) among them. The suspected failure
+# therefore never happened: nothing was hardened, so nothing was denied. The
+# real defect was the opposite one, and the trap was that fixing it naively -
+# by pointing the same hardening at directories - breaks Docker outright.
+# ===========================================================================
+
+Start-TestCase 'Protect-DeltaSecretFile still declines to touch a directory'
+
+# Pinned, not incidental. It is why a second function exists, and if this ever
+# starts returning $true the file fix has been changed underneath the
+# directory one.
+$leafOnlyDir = Join-Path $Script:WorkRoot 'leaf-guard'
+$null = New-Item -ItemType Directory -Path $leafOnlyDir -Force
+$null = & icacls.exe @($leafOnlyDir, '/grant', 'BUILTIN\Users:(OI)(CI)(RX)', '/C')
+Protect-DeltaSecretFile -Path $leafOnlyDir
+
+Assert-That 'a directory is not a leaf' (-not (Test-Path -LiteralPath $leafOnlyDir -PathType Leaf))
+Assert-That 'so Protect-DeltaSecretFile leaves its ACL alone' `
+    (@(Get-AclEntries -Path $leafOnlyDir | Where-Object { $_.Principal -match 'Users$' }).Count -ge 1)
+
+Start-TestCase 'New-DeltaCertificateStaging hardens the directory it returns'
+
+$stgRoot = Join-Path $Script:WorkRoot 'staging-root'
+$null = New-Item -ItemType Directory -Path (Join-Path $stgRoot 'certs') -Force
+$stagingDir = New-DeltaCertificateStaging -InstallRoot $stgRoot
+
+Assert-That 'the directory exists'      (Test-Path -LiteralPath $stagingDir -PathType Container)
+Assert-That 'and it lives under certs\' ($stagingDir -match '\\certs\\\.staging-[0-9a-f]{8}$')
+
+$stgAcl = Get-AclEntries -Path $stagingDir
+
+foreach ($broad in @('Users', 'Everyone', 'Authenticated Users', 'CREATOR OWNER')) {
+    Assert-Equal "no ACE for $broad" 0 `
+        (@($stgAcl | Where-Object { $_.Principal -match ([regex]::Escape($broad) + '$') }).Count)
+}
+Assert-That 'SYSTEM keeps inheritable full control' `
+    (@($stgAcl | Where-Object { $_.Principal -match 'SYSTEM$' -and $_.Rights -eq 'F' -and $_.Flags -eq 'OI,CI' }).Count -ge 1)
+Assert-That 'Administrators keeps inheritable full control' `
+    (@($stgAcl | Where-Object { $_.Principal -match 'Administrators$' -and $_.Rights -eq 'F' -and $_.Flags -eq 'OI,CI' }).Count -ge 1)
+
+Start-TestCase 'The Docker account gets write, and only what the workflow uses'
+
+$stgUserAce = @($stgAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName })
+Assert-Equal 'exactly one entry for the Docker account' 1 $stgUserAce.Count
+Assert-Equal 'read/execute plus write'                  'RX,W' $stgUserAce[0].Rights
+Assert-Equal 'inheritable to the files it creates'      'OI,CI' $stgUserAce[0].Flags
+
+# The three shapes this must not be. Read cannot create the file openssl
+# writes; Modify adds a delete the workflow never performs; Full Control adds
+# taking ownership and rewriting the ACL on a directory holding a private key.
+Assert-That 'not Read - measured insufficient, the container cannot create'  ($stgUserAce[0].Rights -ne 'R')
+Assert-That 'not Modify - adds a delete nothing uses'                        ($stgUserAce[0].Rights -ne 'M')
+Assert-That 'not Full Control'                                               ($stgUserAce[0].Rights -ne 'F')
+
+Start-TestCase 'The old staging ACL is no longer what gets written'
+
+# The regression pin. Administrators + SYSTEM and nothing else is precisely
+# the shape that cannot be mounted by Docker under a filtered token - see the
+# live section for the proof - so its absence here is the fix.
+$stgPrincipals = @($stgAcl | ForEach-Object { $_.Principal } | Sort-Object -Unique)
+Assert-That 'the Docker account is present, so it is not the old two-entry ACL' `
+    ($stgPrincipals -contains $Script:CurrentUserName)
+Assert-That 'and the source no longer hardens the directory as a file' `
+    ((Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'lib\Delta.Tls.ps1') -Raw) -match
+     'Protect-DeltaSecretDirectory -Path \$path -AllowDockerWrite')
+
+Start-TestCase 'Hardening the staging directory is idempotent'
+
+Protect-DeltaSecretDirectory -Path $stagingDir -AllowDockerWrite
+Protect-DeltaSecretDirectory -Path $stagingDir -AllowDockerWrite
+$stgAclAgain = Get-AclEntries -Path $stagingDir
+
+Assert-Equal 'the entry count is unchanged' $stgAcl.Count $stgAclAgain.Count
+Assert-Equal 'and the Docker account still has exactly one entry' 1 `
+    (@($stgAclAgain | Where-Object { $_.Principal -eq $Script:CurrentUserName }).Count)
+
+Start-TestCase 'Without -AllowDockerWrite nothing gains write'
+
+$plainDir = Join-Path $Script:WorkRoot 'plain-dir'
+$null = New-Item -ItemType Directory -Path $plainDir -Force
+Protect-DeltaSecretDirectory -Path $plainDir
+$plainDirAcl = Get-AclEntries -Path $plainDir
+
+Assert-Equal 'no Docker account entry' 0 `
+    (@($plainDirAcl | Where-Object { $_.Principal -eq $Script:CurrentUserName }).Count)
+Assert-That  'but it is still hardened' `
+    ((@($plainDirAcl | Where-Object { $_.Principal -match 'SYSTEM$' }).Count -ge 1) -and
+     (@($plainDirAcl | Where-Object { $_.Principal -match 'Users$' }).Count -eq 0))
+
+Start-TestCase 'The deployed key ACL is untouched by any of this'
+
+# The completed fix must not have been widened by the staging work: the
+# deployed key gets Read, the staging directory gets read/execute + write, and
+# the two must not converge.
+$stillDeployed = Install-DeltaCertificate -InstallRoot $stgRoot `
+    -CertificatePath $Script:Pair.CertificatePath -KeyPath $Script:Pair.KeyPath
+$deployedAce = @(Get-AclEntries -Path $stillDeployed.KeyPath |
+    Where-Object { $_.Principal -eq $Script:CurrentUserName })
+
+Assert-Equal 'the deployed key still grants exactly Read' 'R' $deployedAce[0].Rights
+Assert-That  'Install-DeltaCertificate still uses the file hardening' `
+    ((Get-Content -LiteralPath (Join-Path $Script:ProjectRoot 'lib\Delta.Network.ps1') -Raw) -match
+     'Protect-DeltaSecretFile -Path \$targetKey -AllowDockerRead')
+
+Start-TestCase 'Staging cleanup still removes a hardened directory'
+
+Remove-DeltaCertificateStaging -Path $stagingDir
+Assert-That 'the staging directory is gone' (-not (Test-Path -LiteralPath $stagingDir))
+Assert-Equal 'and certs\ is left with none' 0 `
+    (@(Get-ChildItem -LiteralPath (Join-Path $stgRoot 'certs') -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '.staging-*' }).Count)
+
+Remove-DeltaCertificateStaging -Path $null
+Assert-That 'and cleanup still tolerates being handed nothing' $true
+
+# ===========================================================================
+# 8. The real engine (-Live only)
 # ===========================================================================
 
 if ($Live) {
@@ -997,6 +1152,133 @@ if ($Live) {
         ($probeOut -notmatch 'delta\.key mode=0 ')
     Assert-That  'and the container cannot write to it through the :ro mount' `
         ($probeOut -match 'write=REFUSED')
+
+    # -----------------------------------------------------------------------
+    # The staging regression, against the real engine.
+    #
+    # This host is signed in as the built-in Administrator with Admin Approval
+    # Mode off, so its token carries BUILTIN\Administrators ENABLED and the old
+    # staging ACL would appear to work here. Modelling the UAC-filtered token is
+    # what makes the test mean anything: strip the directory to the entries such
+    # a token could actually match - which for Administrators:(F) + SYSTEM:(F)
+    # is SYSTEM alone, because a deny-only group SID grants nothing - and run
+    # the real workflow against it.
+    # -----------------------------------------------------------------------
+
+    function Set-FilteredTokenModelAcl {
+        <#
+          Rewrites $Path's DACL to exactly SYSTEM plus whatever $Grant asks for,
+          removing every entry a filtered administrator token could otherwise
+          match. The result is what Windows would evaluate on a Windows 11
+          machine for the ACL under test.
+        #>
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [AllowNull()][string]$Grant
+        )
+
+        $null = & icacls.exe @($Path, '/inheritance:r', '/C') 2>&1
+        $null = & icacls.exe @($Path, '/grant', 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)', '/C') 2>&1
+        foreach ($principal in @('BUILTIN\Administrators', 'BUILTIN\Users', 'CREATOR OWNER', "*$Script:CurrentUserSid")) {
+            $null = & icacls.exe @($Path, '/remove', $principal, '/C') 2>&1
+        }
+        if ($Grant) { $null = & icacls.exe @($Path, '/grant', $Grant, '/C') 2>&1 }
+    }
+
+    $liveStgRoot = Join-Path $Script:WorkRoot 'live-staging'
+    $null = New-Item -ItemType Directory -Path (Join-Path $liveStgRoot 'certs') -Force
+    $liveModelled = New-Object 'System.Collections.Generic.List[string]'
+
+    $liveCases = [ordered]@{
+        'old ACL (Administrators + SYSTEM, filtered token)' = @{ Grant = $null;                                                   Expect = $false }
+        'the deployed key''s Read grant'                    = @{ Grant = "*$Script:CurrentUserSid`:(OI)(CI)(R)";                  Expect = $false }
+        'the staging grant (RX,W)'                          = @{ Grant = "*$Script:CurrentUserSid`:(OI)(CI)(RX,W)";               Expect = $true  }
+    }
+
+    foreach ($label in $liveCases.Keys) {
+        Start-TestCase "Live: the real self-signed workflow under $label"
+
+        $caseDir = Join-Path (Join-Path $liveStgRoot 'certs') ('.staging-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $caseDir -Force
+        $null = $liveModelled.Add($caseDir)
+        Set-FilteredTokenModelAcl -Path $caseDir -Grant $liveCases[$label].Grant
+
+        $generated = $null
+        try {
+            $generated = New-DeltaSelfSignedCertificate -HostName 'delta.ncscm.gov.jo' `
+                -OutputDirectory $caseDir -OpenSslImage $LiveImage
+        }
+        catch {
+            $generated = [PSCustomObject]@{ Succeeded = $false; Reason = $_.Exception.Message }
+        }
+
+        if ($liveCases[$label].Expect) {
+            Assert-That "the workflow succeeds: $($generated.Reason)" $generated.Succeeded
+
+            if ($generated.Succeeded) {
+                # Not just "a file appeared" - the material has to be a usable
+                # pair, checked by the same real OpenSSL the installer uses.
+                $generatedCheck = Test-DeltaCertificateMaterial `
+                    -CertificatePath $generated.CertificatePath -KeyPath $generated.KeyPath -OpenSslImage $LiveImage
+                Assert-That 'and what it wrote is a valid certificate/key pair' $generatedCheck.IsValid
+                Assert-That 'with the private key non-empty on the host' `
+                    ((Get-Item -LiteralPath $generated.KeyPath).Length -gt 0)
+            }
+        }
+        else {
+            Assert-That 'the workflow is refused, as it would be on Windows 11' (-not $generated.Succeeded)
+            Assert-That "and the refusal names a permission problem: $($generated.Reason)" `
+                ($generated.Reason -match '(?i)access is denied|permission denied')
+        }
+    }
+
+    Start-TestCase 'Live: a hardened staging directory the installer built itself'
+
+    # End to end through the shipped code path rather than a modelled ACL.
+    $realStaging = New-DeltaCertificateStaging -InstallRoot $liveStgRoot
+    $realGenerated = New-DeltaSelfSignedCertificate -HostName 'delta.ncscm.gov.jo' `
+        -OutputDirectory $realStaging -OpenSslImage $LiveImage
+
+    Assert-That "generation into the hardened staging directory succeeds: $($realGenerated.Reason)" `
+        $realGenerated.Succeeded
+
+    if ($realGenerated.Succeeded) {
+        $realCheck = Test-DeltaCertificateMaterial `
+            -CertificatePath $realGenerated.CertificatePath -KeyPath $realGenerated.KeyPath -OpenSslImage $LiveImage
+        Assert-That 'the generated pair validates' $realCheck.IsValid
+
+        $deployed = Install-DeltaCertificate -InstallRoot $liveStgRoot `
+            -CertificatePath $realGenerated.CertificatePath -KeyPath $realGenerated.KeyPath
+        $deployedUserAce = @(Get-AclEntries -Path $deployed.KeyPath |
+            Where-Object { $_.Principal -eq $Script:CurrentUserName })
+        Assert-Equal 'the deployed key comes out with Read, not the staging grant' 'R' $deployedUserAce[0].Rights
+
+        $liveProbe = 'cd /etc/nginx/certs; echo -n key=; dd if=delta.key bs=1 2>/dev/null | wc -c; ' +
+                     'echo -n write=; (echo x >> delta.key) 2>/dev/null && echo ALLOWED || echo REFUSED'
+        $liveRead = Invoke-DeltaDockerCommand -Arguments @(
+            'run', '--rm', '--network', 'none',
+            '-v', "$(Join-Path $liveStgRoot 'certs'):/etc/nginx/certs:ro",
+            '--entrypoint', 'sh', $LiveImage, '-c', $liveProbe) -TimeoutSeconds 300
+
+        $expectedLen = (Get-Item -LiteralPath $deployed.KeyPath).Length
+        Assert-That "NGINX can still read the deployed key ($expectedLen bytes)" `
+            ($liveRead.StdOut -match "key=$expectedLen")
+        Assert-That 'and still cannot write through the :ro mount' `
+            ($liveRead.StdOut -match 'write=REFUSED')
+    }
+
+    Start-TestCase 'Live: staging cleanup succeeds on a hardened directory'
+
+    Remove-DeltaCertificateStaging -Path $realStaging
+    Assert-That 'the staging directory is gone' (-not (Test-Path -LiteralPath $realStaging))
+
+    # The modelled directories had Administrators removed to imitate a filtered
+    # token, so the teardown below cannot delete them until it is put back.
+    foreach ($modelled in $liveModelled) {
+        if (Test-Path -LiteralPath $modelled) {
+            $null = & icacls.exe @($modelled, '/grant', 'BUILTIN\Administrators:(OI)(CI)(F)', '/T', '/C') 2>&1
+        }
+    }
 }
 
 # --- teardown ---------------------------------------------------------------
