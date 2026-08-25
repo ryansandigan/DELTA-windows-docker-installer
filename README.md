@@ -1725,24 +1725,47 @@ has been checked.
 
 1. **It proves this is a DELTA installation it created**, by reading
    `C:\DELTA\.delta-install.json`. A directory without that file is refused.
-2. **It backs up the database** — `pg_dump` inside the database container, then
+2. **It makes the database reachable.** A stopped installation is still an
+   installation, so if the database container is stopped — or is no longer
+   there at all — the uninstaller starts it and waits for PostgreSQL to accept
+   connections. You do not have to start DELTA first. It starts **only** the
+   database: not the DELTA application, whose start is a schema migration, and
+   not NGINX, which would republish a port on a machine you are clearing.
+3. **It backs up the database** — `pg_dump` inside the database container, then
    `pg_restore --list` to prove the dump is readable. Same implementation as
    menu option 2.
-3. **It stops the containers**, so nothing is writing to `uploads\` or `logs\`
+4. **It stops the containers**, so nothing is writing to `uploads\` or `logs\`
    while they are being read. Stopped, not removed: if a later step fails, the
-   installation is completely intact and `setup.ps1` brings it back.
-4. **It archives the whole of `C:\DELTA`** into
-   `C:\DELTA-backups\DELTA-<timestamp>.zip`.
-5. **It verifies the archive** by opening it and confirming what has to be
-   there actually is — including reading the database dump back out of the ZIP
-   and checking it really is a PostgreSQL dump.
-6. **Only then** does it remove the containers, the network, the database
-   volume, the two scheduled tasks, the firewall rules and `C:\DELTA` itself.
+   installation is completely intact and `setup.ps1` brings it back — and a
+   database that step 2 started is stopped again, so an installation that was
+   stopped when you began is stopped when the run aborts.
+5. **It archives the whole of `C:\DELTA`** into
+   `C:\DELTA-backups\DELTA-<timestamp>.zip` — every file under the installation
+   root, recursively, with no list of known directories anywhere in it.
+6. **It verifies the archive** against the inventory that walk produced: every
+   file it saw has to be in the ZIP at the size it was on disk. It also
+   confirms `.env`, `docker-compose.yml`, the installation record and the NGINX
+   configuration by name, confirms `uploads\`, `logs\`, `certs\` and `backups\`
+   are represented whenever the installation has any, and reads the database
+   dump back out of the ZIP to check it really is a PostgreSQL dump.
+7. **Only then** does it remove the containers, the network, the database
+   volume, the two scheduled tasks, the one-time logon continuation, the
+   firewall rules and `C:\DELTA` itself.
+8. **It checks that all of that actually happened**, by asking the machine
+   rather than trusting the commands it just ran: no container, volume or
+   network still carries this installation's Compose project label, no
+   scheduled task and no logon continuation is still registered, the
+   installation root no longer exists, and the archive still does. Anything
+   left is named, and the run is reported `PARTIAL` — never as a success.
 
-**If step 2, 4 or 5 fails, the uninstall stops and nothing is removed.** There
-is no "continue anyway" and no switch that skips the backup — not for
+**If step 2, 3, 5 or 6 fails, the uninstall stops and nothing is removed.**
+There is no "continue anyway" and no switch that skips the backup — not for
 convenience, not for automation. Deleting data you could not back up is the one
 thing this script is built to make impossible.
+
+> **Does DELTA have to be running?** No. Docker has to be running, because the
+> dump runs inside a container; DELTA does not. A stopped installation is
+> backed up and completely removed in one invocation.
 
 ### What is in the archive
 
@@ -1758,11 +1781,18 @@ Everything under the installation root, with nothing excluded:
 | `nginx\conf.d\delta.conf` | the generated NGINX site |
 | `.delta-install.json` | what the installation was — ports, hostname, image digests |
 | `logs\` | application, access and installer logs |
+| anything else under the root | whatever is there, including directories added by a later version of the installer |
 
 Nothing is left out. In this architecture the DELTA application itself lives in
 the Docker image and comes back with `docker pull`, so unlike a from-source
 install there is no dependency tree or build cache in the installation folder to
 skip — every byte of it is either configuration, secrets or data.
+
+The table above is a description, not a definition. The archive is built from a
+recursive walk of the installation root and verified against that same walk, so
+a file or directory that is not in the table is still archived and still
+checked; and the plan printed before the typed `DELETE` lists what is actually
+there, directory by directory, rather than what this document expects.
 
 > `C:\DELTA-backups` is also where the **non-Docker** DELTA uninstaller writes
 > its archives, deliberately: one place to look. Both use
@@ -1806,6 +1836,61 @@ not belong and it refuses:
 .\uninstall.ps1 -InstallRoot C:\Some\Other\Folder
 # No DELTA Docker installation was found. Nothing was changed.
 ```
+
+### If DELTA is not at `C:\DELTA`
+
+`-InstallRoot` defaults to `C:\DELTA`, and the installer has never required
+it. A default is a guess about which installation you mean, so it is now the
+weakest thing the uninstaller will act on. It decides in this order:
+
+| | Evidence | Wins over |
+|---|---|---|
+| 1 | `-InstallRoot` you supplied | everything |
+| 2 | the installation this run is happening **inside** — the uninstaller's own directory, then your working directory | the default |
+| 3 | `C:\DELTA`, if something is registered there | discovery |
+| 4 | the installation root recorded in DELTA's scheduled tasks | — |
+
+Rule 2 matters most when you have more than one installation. Running
+`D:\DELTA\uninstall.ps1`, or running the uninstaller while standing in
+`D:\DELTA`, uninstalls `D:\DELTA` — and if `C:\DELTA` is a *different*
+installation, the uninstaller says so by name before it asks you anything:
+
+```
+Uninstalling  D:\DELTA
+because the uninstaller you ran is part of this installation.
+The installation at 'C:\DELTA' is a different one and is not touched.
+Pass -InstallRoot to name a different one.
+```
+
+If your installer directory is somewhere neutral — extracted into
+`Downloads`, say — neither rule 2 path is inside an installation and nothing
+changes: the default applies as it always has.
+
+Rule 4 covers the case where nothing is registered at `C:\DELTA` at all. Rather
+than reporting the default as though it were a survey of the machine, the
+uninstaller reads the installation root out of the scheduled tasks DELTA
+registered — the one record it writes outside the installation root that names
+where the installation is — and tells you what it found.
+
+```powershell
+.\uninstall.ps1
+# There is no DELTA installation at the default 'C:\DELTA'.
+# This machine's scheduled task 'DELTA (Docker) - delta - Startup' points at:
+#     D:\DELTA
+# Using that. Pass -InstallRoot to name a different one.
+```
+
+A root you supply yourself is never overridden. If this machine has more than
+one installation, both are listed and neither is removed — choosing which
+installation to delete is not a decision an uninstaller makes for you:
+
+```powershell
+.\uninstall.ps1 -InstallRoot D:\DELTA
+```
+
+A discovered root is not trusted any further than a typed one. It goes through
+the same `.delta-install.json` ownership check and the same typed `DELETE`
+confirmation as any other.
 
 ### Docker has to be running
 
@@ -2430,6 +2515,40 @@ typed and nothing on this host changes:
 
 ```powershell
 .\tools\Test-AdministratorPasswordChoice.ps1
+```
+
+`tools\Test-Uninstall.ps1` covers the uninstall transaction end to end: backup,
+verify, destroy, and prove nothing is left. It asserts the safety gate
+structurally as well as behaviourally — that a failed database dump or a failed
+archive verification leaves the containers, the volume, the data and the
+installation root exactly as they were, and that `Remove-DeltaInstallation`
+cannot be called at all without the typed token only a successful backup mints.
+It then asserts the promise on the other side: a custom installation root is
+resolved and deleted wherever it is, the root **itself** is gone rather than
+emptied — including when the uninstaller runs from inside it, which is proven
+in a second real process whose working directory and libraries are both inside
+the tree it deletes — no container, volume or network still carries this
+project's Compose label, the scheduled tasks and the logon continuation are
+gone, and a run that finds any residue is reported `PARTIAL` rather than as a
+success. Unrelated Docker resources are created alongside — another Compose
+project, a similarly named volume, an unlabelled `delta_pgdata`, another
+product's scheduled task — and every one of them is asserted to survive
+untouched. A **stopped** installation gets its own case, and it is the one the
+observed failure needed: the database stand-in reproduces the real precheck
+that refuses a stopped container, so the case can only pass if the uninstaller
+really does start PostgreSQL itself — and it asserts that exactly one service
+was started, that it was the database, and that the DELTA application and NGINX
+were never started at all. Another case takes an independent `Get-ChildItem
+-Recurse` of the installation root before the backup and requires every one of
+those files to be in the ZIP, with a directory no version of the installer has
+ever heard of planted underneath the root to prove it is carried too. Paths
+that must never be deleted are refused whatever a state file
+found inside them claims. Docker, Task Scheduler, the firewall and the registry
+are all stand-ins; the filesystem is real, under one temporary work root, and no
+installation anywhere else on the machine is read, written or removed:
+
+```powershell
+.\tools\Test-Uninstall.ps1
 ```
 
 ### Validating the restart by hand

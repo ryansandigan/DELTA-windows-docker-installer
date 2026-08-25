@@ -8,24 +8,34 @@
     order is the whole design:
 
         1. Prove this is a DELTA installation this installer created.
-        2. Take a fresh database backup with the installer's own verified
+        2. Make the database reachable. An installation that is stopped is
+           still installed, so a stopped database container is started - only
+           the database container, never the DELTA application and never NGINX -
+           and waited on until PostgreSQL accepts connections.
+        3. Take a fresh database backup with the installer's own verified
            pg_dump implementation.
-        3. Stop the containers so the files being archived are not changing.
-        4. Archive the entire installation root - including that fresh dump -
-           to C:\DELTA-backups\DELTA-<timestamp>.zip.
-        5. Verify that archive by opening it and confirming what must be in it
-           actually is, down to reading the database dump's first bytes back
+        4. Stop the containers so the files being archived are not changing.
+        5. Archive the entire installation root, recursively and with no
+           allow-list of known directories - including that fresh dump - to
+           C:\DELTA-backups\DELTA-<timestamp>.zip.
+        6. Verify that archive against the inventory the walk in step 5
+           produced: every file it saw, at the size it saw, plus the entries
+           that must exist, plus reading the database dump's first bytes back
            out of it.
-        6. Only then remove the containers, the network, the database volume,
-           the scheduled tasks, the firewall rules and the installation
-           directory.
+        7. Only then remove the containers, the network, the database volume,
+           the scheduled tasks, the armed logon continuation, the firewall
+           rules and the installation directory.
+        8. Ask the machine what is left, and report anything that is. A run
+           that finds residue is PARTIAL, never "removed".
 
-    If step 2, 4 or 5 fails, the run stops and nothing is removed. That is not
-    a policy this script checks - it is the shape of the code. The backup
+    If step 2, 3, 5 or 6 fails, the run stops and nothing is removed. That is
+    not a policy this script checks - it is the shape of the code. The backup
     function throws rather than returning a status, and the removal function
     cannot be called without the [Delta.VerifiedArchive] object that only a
     successful backup produces. There is no "continue anyway", and no switch
-    that skips the backup.
+    that skips the backup. A database that was started for step 2 and then
+    could not be dumped is stopped again, so an aborted run leaves the
+    installation exactly as it found it.
 
     The final state after a successful run:
 
@@ -50,7 +60,10 @@
     -InstallRoot from becoming a recursive delete of somebody's documents.
 
 .PARAMETER InstallRoot
-    The installation to remove. Defaults to C:\DELTA.
+    The installation to remove. Defaults to C:\DELTA - and when that default
+    is used and nothing is registered there, this script asks the scheduled
+    tasks where DELTA actually is rather than reporting the default as a
+    survey of the machine. A root supplied explicitly is never overridden.
 
 .PARAMETER BackupRoot
     Where the archive is written. Defaults to C:\DELTA-backups, the same
@@ -180,6 +193,10 @@ function Test-DeltaUninstallDockerReady {
       plainly is better than removing the scheduled tasks and firewall rules
       of an installation that then cannot be finished.
 
+      Note what this does NOT require: that DELTA is running. A stopped
+      installation is uninstalled by this script in one invocation - it starts
+      the database itself. Only the engine has to be up.
+
       Nothing is changed on this path.
     #>
     Write-Step 'Checking Docker'
@@ -200,6 +217,141 @@ function Test-DeltaUninstallDockerReady {
     Write-Detail ''
     Write-Detail 'Nothing was changed. DELTA is exactly as it was.'
     return $false
+}
+
+function Resolve-DeltaUninstallRoot {
+    <#
+      Decides which installation this run is about, and says how it decided.
+
+      -InstallRoot defaults to C:\DELTA, and the installer has never required
+      that root. Two separate failures came out of treating that default as an
+      answer, and this function exists to stop both.
+
+      The first: an operator who installed to D:\DELTA and ran a bare
+      `.\uninstall.ps1` was told "No DELTA Docker installation was found",
+      which is true of C:\DELTA and reads as true of the machine - and the run
+      exited 0 having done nothing, with the installation still there.
+
+      The second, found by real destructive integration testing and much worse:
+      when C:\DELTA *does* exist, a bare `.\uninstall.ps1` run from inside a
+      DIFFERENT installation targeted C:\DELTA. It surveyed the wrong
+      installation, listed the wrong containers, and asked for the typed DELETE
+      over the wrong data volume, while the operator was standing in - and had
+      just launched the uninstaller of - the installation they meant. It was
+      one running database away from destroying the wrong installation.
+
+      So the order below is precedence, most specific evidence first, and a
+      parameter default is the weakest evidence there is:
+
+        1. An explicitly supplied -InstallRoot. Somebody who named a directory
+           gets an answer about that directory, and it is never overridden.
+        2. The installation this run is happening INSIDE - the uninstaller's
+           own directory first, then the working directory. Running
+           <root>\uninstall.ps1, or running it while standing in <root>, is a
+           statement about which installation is meant, and no default outranks
+           it. In the normal distribution shape - an installer directory in
+           Downloads, an installation root in C:\DELTA - neither is inside an
+           installation and this rule simply does not fire.
+        3. The default, if something is registered there.
+        4. The scheduled tasks, which are the one record DELTA writes outside
+           the installation root that names the installation root. Exactly one
+           candidate is adopted and announced; more than one is reported and
+           none chosen, because picking one installation out of several to
+           delete is not a decision an uninstaller may make on somebody's
+           behalf.
+
+      Nothing here is trusted any further than a typed root: every candidate
+      goes through the same Get-DeltaUninstallTarget ownership check and the
+      same typed DELETE confirmation as any other.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][bool]$WasSupplied,
+        [string]$ScriptRoot,
+        [string]$WorkingDirectory
+    )
+
+    $result = [PSCustomObject]@{
+        InstallRoot = $InstallRoot
+        Target      = (Get-DeltaUninstallTarget -InstallRoot $InstallRoot)
+        Discovered  = $false
+        Candidates  = @()
+        Source      = $(if ($WasSupplied) { 'supplied' } else { 'default' })
+    }
+
+    # Rule 2. Only when the root was not named: an operator who passed
+    # -InstallRoot has already answered this question.
+    if (-not $WasSupplied) {
+        foreach ($context in @(
+            @{ Path = $ScriptRoot;       Label = 'the uninstaller you ran is part of this installation' }
+            @{ Path = $WorkingDirectory; Label = 'you are running this from inside this installation' }
+        )) {
+            if (-not $context.Path) { continue }
+            $containing = Get-DeltaContainingInstallation -Path $context.Path
+            if (-not $containing) { continue }
+            if ($containing.InstallRoot -ieq $result.Target.InstallRoot) { break }
+
+            Write-Host ''
+            Write-Detail "Uninstalling  $($containing.InstallRoot)"
+            Write-Detail "because $($context.Label)."
+            if ($result.Target.Registered) {
+                # The near-miss, said out loud: there IS an installation at the
+                # default, and it is not the one being removed.
+                Write-Detail "The installation at '$($result.Target.InstallRoot)' is a different one and is not touched."
+            }
+            Write-Detail 'Pass -InstallRoot to name a different one.'
+
+            $result.InstallRoot = $containing.InstallRoot
+            $result.Target      = $containing
+            $result.Source      = 'context'
+            return $result
+        }
+    }
+
+    if ($result.Target.Registered) { return $result }
+
+    $candidates = @(Get-DeltaInstalledRootCandidate | Where-Object {
+        $_.Exists -and -not (Test-DeltaPathContains -Parent $InstallRoot -Child $_.InstallRoot)
+    })
+    $result.Candidates = $candidates
+
+    if ($candidates.Count -eq 0) { return $result }
+
+    Write-Host ''
+    if ($WasSupplied) {
+        Write-DeltaWarning "There is no registered DELTA installation at '$InstallRoot', but this machine has one registered elsewhere:"
+        foreach ($candidate in $candidates) {
+            Write-Detail "    $($candidate.InstallRoot)   (Compose project '$($candidate.ProjectName)', from the task '$($candidate.TaskName)')"
+        }
+        Write-Detail 'Nothing was changed. Re-run with -InstallRoot naming the one you mean.'
+        return $result
+    }
+
+    if ($candidates.Count -gt 1) {
+        Write-DeltaWarning "This machine has more than one registered DELTA installation, and none is at the default '$InstallRoot':"
+        foreach ($candidate in $candidates) {
+            Write-Detail "    $($candidate.InstallRoot)   (Compose project '$($candidate.ProjectName)')"
+        }
+        Write-Detail 'Nothing was changed. Re-run with -InstallRoot naming the one to remove.'
+        return $result
+    }
+
+    $found = $candidates[0]
+    Write-Detail "There is no DELTA installation at the default '$InstallRoot'."
+    Write-Detail "This machine's scheduled task '$($found.TaskName)' points at:"
+    Write-Detail "    $($found.InstallRoot)"
+    Write-Detail 'Using that. Pass -InstallRoot to name a different one.'
+
+    $discoveredTarget = Get-DeltaUninstallTarget -InstallRoot $found.InstallRoot
+    if (-not $discoveredTarget.Registered) {
+        Write-DeltaWarning "It is not a registered DELTA installation either: $($discoveredTarget.Reason)"
+        return $result
+    }
+
+    $result.InstallRoot = $found.InstallRoot
+    $result.Target      = $discoveredTarget
+    $result.Discovered  = $true
+    return $result
 }
 
 function Show-DeltaUninstallNotInstalled {
@@ -235,14 +387,26 @@ $exitCode = $Script:DeltaExitSuccess
 try {
     $logPath = Start-DeltaLog -Directory $LogDirectory -Name 'uninstall'
 
-    Show-Section -Title 'DELTA Docker Uninstaller' -Subtitle $InstallRoot
+    # No subtitle: at this point the root is only the parameter default, and a
+    # banner that announces an installation this run may not be about is how an
+    # operator confirms the wrong one. The resolved root is printed by
+    # Resolve-DeltaUninstallRoot below, and again in the plan.
+    Show-Section -Title 'DELTA Docker Uninstaller'
     if ($logPath) { Write-Detail "Transcript: $logPath" }
 
     if (-not (Test-DeltaUninstallElevation)) {
         $exitCode = $Script:DeltaExitNotElevated
     }
     else {
-        $target = Get-DeltaUninstallTarget -InstallRoot $InstallRoot
+        $workingDirectory = $null
+        try { $workingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath } catch { }
+
+        $resolution = Resolve-DeltaUninstallRoot -InstallRoot $InstallRoot `
+            -WasSupplied ($PSBoundParameters.ContainsKey('InstallRoot')) `
+            -ScriptRoot $Script:DeltaScriptRoot `
+            -WorkingDirectory $workingDirectory
+        $target = $resolution.Target
+        $InstallRoot = $resolution.InstallRoot
 
         if (-not $target.Registered) {
             # Both "there is nothing here" and "there is something here that

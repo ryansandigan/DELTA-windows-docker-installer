@@ -403,13 +403,12 @@ function Show-DeltaRuntimeOutcome {
     }
 }
 
-# Where the one-time logon continuation lives. RunOnce, not Run: Windows
-# deletes a RunOnce value BEFORE executing it, so the entry is spent by the
-# time setup.ps1 starts and a failed or cancelled continuation cannot fire
-# again at the next logon. HKCU, so it belongs to - and fires for - the account
-# that ran the installer, and needs no machine-wide write.
-$Script:DeltaRunOnceKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-$Script:DeltaRunOnceName = 'DELTASetupContinue'
+# $Script:DeltaRunOnceKey / $Script:DeltaRunOnceName - where the one-time logon
+# continuation lives - are defined in lib\Delta.Common.ps1, which is loaded
+# above. They are not repeated here: this is the only DELTA state that lives
+# outside the installation root, so uninstall.ps1 needs the same two values to
+# remove what this file arms, and a second copy of them here would be free to
+# drift from the one the uninstaller reads.
 
 function Unregister-DeltaLogonContinuation {
     <#

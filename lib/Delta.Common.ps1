@@ -51,6 +51,23 @@ $Script:DeltaExitSecurityBootstrapFailed = 9
 # Compose passes the first key through with the BOM glued to its name.
 $Script:DeltaUtf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+# Where the one-time logon continuation lives. RunOnce, not Run: Windows
+# deletes a RunOnce value BEFORE executing it, so the entry is spent by the
+# time setup.ps1 starts and a failed or cancelled continuation cannot fire
+# again at the next logon. HKCU, so it belongs to - and fires for - the account
+# that ran the installer, and needs no machine-wide write.
+#
+# It is defined HERE, in the file both entry points load, rather than in
+# setup.ps1 where it is armed. This is the only piece of DELTA state that
+# lives outside the installation root, so setup.ps1 arms it and uninstall.ps1
+# has to disarm it - and two files holding their own copy of a registry path
+# is precisely the shape of the defect this project has already paid for once
+# (see the release-artifact name in CHANGELOG.md): every copy agreed with
+# every other copy, and nothing pinned them to the truth. One definition, two
+# consumers, no drift.
+$Script:DeltaRunOnceKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+$Script:DeltaRunOnceName = 'DELTASetupContinue'
+
 # ---------------------------------------------------------------------------
 # Secret redaction (A§24)
 #
