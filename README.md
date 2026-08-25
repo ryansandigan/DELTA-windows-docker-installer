@@ -14,43 +14,39 @@ Docker's own and which the installer never touches.
 
 ## Quick installation guide
 
-Follow these steps for a standard DELTA installation. Each step is explained in
-more detail later in this document.
+The shortest safe path to a working DELTA installation. Every step here is
+covered in full detail under [Installing](#installing).
 
 > **Before you begin, the machine needs:**
 >
 > - **Windows 11, or Windows Server 2022 / 2025** — 64-bit.
 > - **About 20 GB free** on the system volume.
 > - **Internet access to `ghcr.io` and `docker.io`** for the first run.
+> - **Hardware virtualization** — step 3 covers how to enable it.
 >
-> Hardware virtualization is also required; step 4 covers how to check and
-> enable it. Everything else the installer needs, it installs or checks itself.
+> Everything else the installer needs, it checks or installs itself.
 >
 > On Windows Server, note that Docker Desktop is not officially supported there
 > by Docker. DELTA has been tested successfully with it on Windows Server 2022
 > and 2025, and the installer states this and asks before installing anything.
 
-1. **Download** the installer ZIP, `DELTA-windows-docker-installer-X.Y.Z.zip`.
-   These examples assume it landed in your **Downloads** folder, which is where
-   Windows browsers normally put it. If yours is set to save somewhere else,
-   use that path instead — nothing below depends on the location.
+1. **Download `DELTA-windows-docker-installer-X.Y.Z.zip` from the
+   [GitHub Releases page](https://github.com/ryansandigan/DELTA-windows-docker-installer/releases),
+   then unblock it *before* extracting.** Right-click the ZIP →
+   **Properties** → tick **Unblock** if it is shown → **Apply**. Clearing the
+   mark on the ZIP saves clearing it on every file inside it afterwards.
 
-2. **Unblock it *before* extracting.** Right-click the ZIP → **Properties** →
-   tick **Unblock** if it is shown → **Apply**. Windows marks files that came
-   from the internet; clearing the mark on the ZIP saves clearing it on every
-   file inside it afterwards.
-
-3. **Extract it** — right-click → **Extract All…** is enough. Extracting it
-   where it is gives you:
+2. **Extract it** — right-click → **Extract All…** is enough. Extracting it
+   where it landed gives you:
 
    ```text
    $HOME\Downloads\DELTA-windows-docker-installer-X.Y.Z\
    ```
 
    containing `setup.ps1`, `uninstall.ps1`, `bin\`, `lib\` and `templates\`.
-   That is the **installer directory**, and it is an example location, not a
-   requirement: any local directory works. A local disk, though — not a network
-   share and not a cloud-synced folder.
+   That is the **installer directory** — an example location, not a
+   requirement: any local directory works, on a local disk rather than a
+   network share or a cloud-synced folder.
 
    > **Keep this directory after the install.** `setup.ps1` is also the
    > management utility you will use afterwards, and the scheduled tasks the
@@ -62,35 +58,32 @@ more detail later in this document.
    > `docker-compose.yml`, `certs\`, `uploads\`, `backups\` and the rest — see
    > [Where things are](#where-things-are).
 
-4. **Make sure hardware virtualization is available to Windows.** Docker
-   Desktop's WSL2 backend runs the Docker engine in a WSL2 utility VM, which
-   cannot start without it. The installer checks this and stops with an
-   explanation if it is unavailable.
+3. **Make sure hardware virtualization is available to Windows.** Docker
+   Desktop's WSL2 backend cannot start without it, and the installer stops with
+   an explanation if it is unavailable.
 
    - **On a physical machine:** enable virtualization in BIOS/UEFI — Intel VT-x
      or AMD-V, usually listed as *Intel Virtualization Technology*, *SVM Mode*
      or similar.
    - **If Windows is itself running in a VM:** enable nested virtualization on
      the parent hypervisor, so the virtualization extensions are exposed to the
-     Windows guest.
+     Windows guest. On **Hyper-V**, run this on the Hyper-V host — not inside
+     the DELTA VM — with the VM shut down, replacing `<VMName>` with the actual
+     VM name:
 
-   On **Hyper-V**, run this on the Hyper-V host — not inside the DELTA VM — with
-   the VM shut down, replacing `<VMName>` with the actual VM name:
+     ```powershell
+     Set-VMProcessor -VMName "<VMName>" `
+         -ExposeVirtualizationExtensions $true
+     ```
 
-   ```powershell
-   Set-VMProcessor -VMName "<VMName>" `
-       -ExposeVirtualizationExtensions $true
-   ```
+     On VMware, VirtualBox, Proxmox, a cloud VM or any other platform, enable
+     that platform's equivalent **nested virtualization** setting.
 
-   On VMware, VirtualBox, Proxmox, a cloud VM or any other platform, enable that
-   platform's equivalent **nested virtualization** / **expose hardware
-   virtualization to the guest** setting.
-
-5. **Open Windows PowerShell as Administrator.** Start → type
+4. **Open Windows PowerShell as Administrator.** Start → type
    `Windows PowerShell` → right-click it → **Run as administrator**. Elevation
    is required; the installer checks and stops if it is missing.
 
-6. **Run these three lines**, with the installer directory from step 3 in the
+5. **Run these three lines**, with the installer directory from step 2 in the
    first one and the real version in place of `X.Y.Z`:
 
    ```powershell
@@ -100,78 +93,42 @@ more detail later in this document.
    ```
 
    `$HOME` is PowerShell's own variable for your user profile directory, so
-   that first line works as written for any account — there is no username to
-   substitute. If you extracted somewhere else, `cd` there instead.
-
-   The middle line is not optional housekeeping — without it, most Windows
-   machines answer `.\setup.ps1` with **"running scripts is disabled on this
-   system"**, because blocking `.ps1` files is the default. It is also the
-   smallest possible concession:
-
-   - `-Scope Process` applies to **that one PowerShell window**. Close the
-     window and it is gone.
-   - It does **not** change the execution policy for your account
-     (`CurrentUser`) or for the machine (`LocalMachine`). Check with
-     `Get-ExecutionPolicy -List` before and after if you want to see that for
-     yourself.
-   - The installer never writes an execution-policy change of its own, at any
-     scope, at any point.
+   that first line works as written for any account. The middle line is
+   required because Windows blocks `.ps1` files by default — without it you get
+   **"running scripts is disabled on this system"**. `-Scope Process` applies
+   to **that one PowerShell window** and disappears when you close it; it
+   changes nothing for your account or for the machine.
 
    > If your organisation enforces the execution policy by **Group Policy**,
-   > this will not help and nothing else in this installer can override it —
-   > `MachinePolicy` and `UserPolicy` outrank the process scope by design. Ask
+   > this will not help and nothing else in this installer can override it. Ask
    > whoever administers that policy.
 
-   **A short pause before the first message is normal.** On some machines there
-   is a gap of a few seconds between opening PowerShell — or pressing Enter on
-   `.\setup.ps1` — and DELTA's banner appearing. That gap is PowerShell itself
-   starting up and loading the installer's modules, before any of DELTA's code
-   is running, so the installer cannot draw anything during it. Once the banner
-   is up, every operation that takes noticeable time shows a spinner and an
-   elapsed counter:
+   A short pause before DELTA's banner appears is normal — that is PowerShell
+   starting up. After the banner, every operation that takes noticeable time
+   shows a spinner and an elapsed counter.
 
-   ```text
-       \ Pulling container images (1m 14s)
-   ```
-
-   so from that point on you can always tell the difference between working and
-   stuck. If nothing at all appears after a minute or so, something is wrong —
-   see [When something goes wrong](#when-something-goes-wrong).
-
-7. **Answer the prompts** — hostname, database password, administrator
-   password, HTTPS, and one SMTP question at the end. Enter takes a sensible
+6. **Answer the five questions**, all asked at the start: the **installation
+   directory**, the **hostname or domain**, the **database password**, the
+   **DELTA administrator password**, and **HTTPS**. Enter takes a sensible
    default for every one of them.
 
    If Docker Desktop is not already on the machine, you are shown Docker's
-   licensing terms and asked before anything is installed; accept, and the
-   installer installs it for you. If Docker Desktop is already there, the
-   installer uses it and asks nothing about it.
+   licensing terms and asked before anything is installed. SMTP is not asked
+   here — it is offered once at the end, after DELTA is up, and can be declined
+   and done later.
 
-8. **If it asks to restart Windows, let it.** Docker Desktop and the WSL2
-   platform need a restart before the installation can go on. A
-   **DELTA Setup - Windows Restart Required** dialog appears and explains what
-   will happen; read it, save your work, and click **OK**. Then:
-
-   - sign back in using the **same** Windows account;
-   - wait — the continuation is not instant, and can take up to a minute or so
-     while Windows finishes starting. Do not run `setup.ps1` yourself in the
-     meantime;
-   - approve the Windows administrator permission (UAC) prompt if one appears;
-   - the installer resumes in a PowerShell window.
-
-   Leave that PowerShell window open while setup continues. If the resume does
-   not happen, finish it by hand — both paths are set out in
+7. **If Windows needs to restart, allow it.** Sign back in with the same
+   Windows account, then **wait for the PowerShell window to appear and DELTA
+   setup to continue automatically**. This may take several minutes depending
+   on how quickly Windows finishes starting, so **do not run `setup.ps1` again
+   while waiting**. Approve the UAC prompt if Windows shows one. If automatic
+   continuation does not happen, see
    [The restart part-way through](#the-restart-part-way-through).
 
-9. **Wait for it to finish.** The first run takes a few minutes, most of it
-   pulling images. It verifies the database, the administrator credential and
-   the published URL as it goes, and stops rather than reporting success it
-   cannot back up.
-
-10. **Record the DELTA administrator password** in the closing summary. It is
-    shown once, stored nowhere, and cannot be recovered.
-
-11. **Open the DELTA URL** the installer prints.
+8. **Wait for it to finish**, then record the **DELTA administrator password**
+   from the closing summary if you had one generated — it is shown once, stored
+   nowhere, and cannot be recovered — and open the DELTA URL the installer
+   prints.
 
 Afterwards, running `.\setup.ps1` again opens the
 [management utility](#running-setupps1-again--the-management-utility) — update,
@@ -428,10 +385,11 @@ account and fires for nobody else.
 
 1. A console window appears saying **"DELTA setup is continuing after the
    restart."**
-2. It waits for the desktop to finish signing in. **This is not instant** —
-   give it up to about a minute. A screen that looks idle is the normal case
-   here, not a failure. **Do not start `setup.ps1` yourself while that window
-   is open**: the continuation is still coming.
+2. It waits for the desktop to finish signing in. **This is not instant** — it
+   may take several minutes, depending on how quickly Windows finishes
+   starting. A screen that looks idle is the normal case here, not a failure.
+   **Do not start `setup.ps1` yourself while that window is open**: the
+   continuation is still coming.
 3. **Windows shows a UAC elevation prompt.** You must approve it. The installer
    cannot continue without administrator rights, and the window in front of you
    does not have them. This is Windows' own prompt, and it is the only
