@@ -2328,6 +2328,40 @@ material. That needs a working Linux engine and the database image already
 present locally; it pulls nothing and starts only `--rm --network none`
 containers.
 
+`tools\Test-UploadsDirectoryPermissions.ps1` covers the host ACL on
+`<InstallRoot>\uploads` and the bind mount the DELTA container reaches it
+through. It pins the ACL the installer applies — Administrators and SYSTEM full
+control, the installing account **Modify**, nothing else, inheritance off — and
+that no broad principal survives, not `BUILTIN\Users`, `Everyone`,
+`Authenticated Users` or `CREATOR OWNER`. Every entry must be inheritable, and
+files and subdirectories created later are checked to still carry the account
+entry, because a fix that repairs the parent and leaves new uploads
+inaccessible is not a fix. Applying it twice must produce the same three
+entries, a rerun must repair an ACL broken underneath live data without
+deleting or changing that data, the backup walk must still see it, and with no
+account to grant the directory must be left exactly as it was — because
+Administrators + SYSTEM is the one ACL measured to break the mount outright.
+Nothing is written outside a temporary directory of its own:
+
+```powershell
+.\tools\Test-UploadsDirectoryPermissions.ps1
+```
+
+Add `-Live` to additionally run the real DELTA image against a real bind mount:
+create, write, read back, append, overwrite, rename, rename across directories,
+delete, subdirectory create/read/write, directory rename and recursive delete —
+the operations DELTA's own bundle performs with `fs.renameSync`,
+`fs.unlinkSync` and `fs.rmSync(recursive)` — followed by a check that what the
+container wrote is on the Windows host and is still writable and deletable from
+a second, freshly created container. It also runs the three ACLs that do *not*
+work, modelled as a UAC-filtered administrator token evaluates them, so a
+passing suite is evidence rather than coincidence: Administrators + SYSTEM is
+refused at `docker: Error response from daemon: Access is denied`, the
+certificate staging directory's `(RX,W)` grant fails rename and recursive
+delete, and a `Program Files` style root cannot create a file at all. It needs
+a working Linux engine and the DELTA image already present locally; it pulls
+nothing and never touches a real installation.
+
 `tools\Test-UnattendedStartup.ps1` covers automatic startup after a Windows
 restart and the `Restart` status row. It asserts that a mechanism which cannot
 start the engine — `com.docker.service` — never satisfies the measurement and

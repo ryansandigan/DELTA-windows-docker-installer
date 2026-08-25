@@ -70,7 +70,7 @@ function New-DeltaInstallDirectories {
         Write-Detail ''
         Write-Detail 'This installer will not adopt a directory it did not create. Choose an empty'
         Write-Detail 'or new directory, for example:  .\setup.ps1 -InstallRoot C:\DELTA-docker'
-        return [PSCustomObject]@{ Succeeded = $false; Reason = $ownership.Reason; Created = @() }
+        return [PSCustomObject]@{ Succeeded = $false; Reason = $ownership.Reason; Created = @(); UploadsAcl = $null }
     }
 
     $created = New-Object 'System.Collections.Generic.List[string]'
@@ -88,7 +88,7 @@ function New-DeltaInstallDirectories {
         }
     }
     catch {
-        return [PSCustomObject]@{ Succeeded = $false; Reason = "Could not create the installation directories under '$InstallRoot': $($_.Exception.Message)"; Created = $created.ToArray() }
+        return [PSCustomObject]@{ Succeeded = $false; Reason = "Could not create the installation directories under '$InstallRoot': $($_.Exception.Message)"; Created = $created.ToArray(); UploadsAcl = $null }
     }
 
     if ($created.Count -gt 0) {
@@ -98,7 +98,24 @@ function New-DeltaInstallDirectories {
         Write-Detail "$InstallRoot already has the expected layout; nothing was created."
     }
 
-    return [PSCustomObject]@{ Succeeded = $true; Reason = $null; Created = $created.ToArray() }
+    # uploads\ is the one directory here a container both reads and writes, and
+    # the only one holding data an operator would mind other local accounts
+    # reading. Left to inherit, its ACL is whatever the chosen root happens to
+    # carry - which on the root of a drive is readable by every local user, and
+    # elsewhere may not permit a container to create a file at all. Applied on
+    # every run, after creation, on the existing directory: nothing is deleted
+    # or recreated, so uploads already on disk are untouched. See
+    # Protect-DeltaUploadsDirectory for the measurements.
+    $uploads = Join-Path -Path $InstallRoot -ChildPath 'uploads'
+    $uploadsAcl = Protect-DeltaUploadsDirectory -Path $uploads
+    if ($uploadsAcl.Applied) {
+        Write-Detail 'uploads: restricted to Administrators, SYSTEM and this account (Modify)'
+    }
+    elseif ($uploadsAcl.Reason) {
+        Write-Detail "uploads: permissions left as inherited - $($uploadsAcl.Reason)"
+    }
+
+    return [PSCustomObject]@{ Succeeded = $true; Reason = $null; Created = $created.ToArray(); UploadsAcl = $uploadsAcl }
 }
 
 # ---------------------------------------------------------------------------

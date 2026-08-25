@@ -536,6 +536,128 @@ function Protect-DeltaSecretDirectory {
     }
 }
 
+function Protect-DeltaUploadsDirectory {
+    <#
+      The ACL for uploads\ - persistent application data that one container
+      writes and nothing else on the host has any business reading.
+
+      This is the third ACL in this file and it is deliberately not either of
+      the other two. Protect-DeltaSecretFile locks a file down to
+      Administrators + SYSTEM; Protect-DeltaSecretDirectory adds (RX,W) for a
+      throwaway staging directory. Measured against the real engine, the real
+      DELTA image and the real ./uploads bind mount, on DACLs written as a
+      UAC-filtered administrator token evaluates them (Administrators is
+      deny-only in such a token, so it is simply absent):
+
+          Administrators + SYSTEM only  -> docker: Error response from daemon:
+                                           Access is denied   (the mount fails)
+          <user>:(RX,W)                 -> mv and rm -rf refused; rename,
+                                           rename across directories, directory
+                                           rename and recursive delete all FAIL
+          <user>:(M)                    -> every operation succeeds
+
+      So Modify is not convenience here, it is the measured minimum. DELTA's
+      own bundle is what sets the floor: it moves each upload out of
+      uploads/<tenant>/temp with fs.renameSync, removes files with
+      fs.unlinkSync, and drops a whole tenant tree with
+      fs.rmSync(recursive: true). Rename and delete need DELETE, and Windows
+      `W` does not carry it. Full Control is more: it adds WRITE_DAC and
+      WRITE_OWNER, and nothing in the application changes an ACL or an owner.
+
+      What is removed matters as much as what is granted. Left to inherit from
+      the root of C:, uploads\ carries BUILTIN\Users:(OI)(CI)(RX) plus
+      (CI)(AD) and (CI)(WD) - measured on a real installation - so every local
+      interactive account can read every uploaded document and plant files and
+      subdirectories in the tree. Those are the drive-root defaults, not a
+      decision anyone made about this data.
+
+      And the inherited ACL is not even stable. Measured: a file the DELTA
+      container creates through this mount lands owned by BUILTIN\Administrators
+      with SYSTEM:(F), Administrators:(F), Users:(RX) and no entry at all for
+      the account Docker Desktop runs as - because CREATOR OWNER materialises
+      from whatever token wrote it. That file stays writable only while that
+      account's token carries BUILTIN\Administrators ENABLED. Under a filtered
+      token it does not, and the same file measures foreign_write=FAIL,
+      foreign_delete=FAIL. Granting the account itself an inheritable Modify
+      makes every file DELTA writes usable by DELTA afterwards, on both hosts,
+      which is the property the inherited ACL does not have.
+
+      Administrators and SYSTEM keep Full Control: the uninstall backup walks
+      uploads\ elevated, and an operator has to be able to repair this by hand.
+
+      Order is grant-then-strip, the reverse of Protect-DeltaSecretDirectory.
+      That function builds a directory it created a moment earlier and can
+      afford an empty DACL in between; this one is applied to live data, so a
+      failure half way through must leave uploads\ more permissive than
+      intended rather than unusable.
+
+      $null from Get-DeltaDockerFileReadSid means this is running as SYSTEM,
+      and there is no user account to grant. Nothing is changed in that case:
+      what would be left - Administrators + SYSTEM - is the one ACL measured to
+      break the bind mount outright.
+
+      Non-fatal, like the other two: an installation with a slightly broad
+      uploads ACL works, and trading a working deployment for an ACL nicety is
+      not the bargain to make. Re-run safe - /grant:r replaces each entry
+      rather than adding a second one, so a rerun repairs rather than
+      accumulates, and no file is created, moved or removed.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $result = [PSCustomObject]@{ Applied = $false; Reason = $null; DockerSid = $null }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        $result.Reason = "'$Path' is not a directory."
+        return $result
+    }
+
+    $dockerSid = Get-DeltaDockerFileReadSid
+    if (-not $dockerSid) {
+        $result.Reason = 'No user account could be identified for Docker Desktop, so the inherited permissions on uploads are left alone.'
+        return $result
+    }
+    $result.DockerSid = $dockerSid
+
+    try {
+        foreach ($grant in @(
+            'BUILTIN\Administrators:(OI)(CI)(F)',
+            'NT AUTHORITY\SYSTEM:(OI)(CI)(F)',
+            "${dockerSid}:(OI)(CI)(M)")) {
+            $output = & icacls.exe $Path /grant:r $grant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant:r $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        # /inheritance:r on its own is not enough, and the regression suite is
+        # what caught that: it drops INHERITED entries, and a broad principal
+        # granted EXPLICITLY - by an operator, or by a repair someone made by
+        # hand - survives it untouched. Both have to go for a rerun to be a
+        # repair rather than a gesture. Absent principals make /remove:g a
+        # no-op, so this stays idempotent.
+        foreach ($principal in @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users', 'CREATOR OWNER')) {
+            $null = & icacls.exe $Path /remove:g $principal /C 2>&1
+        }
+
+        # Only now: the three entries above already stand on their own, so what
+        # this drops is the broad inherited ones the parent happened to carry.
+        # Existing uploads keep their content and re-inherit the new set,
+        # because their own inheritance is untouched.
+        $output = & icacls.exe $Path /inheritance:r /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls /inheritance:r failed: $(($output | Out-String).Trim())"
+        }
+    }
+    catch {
+        $result.Reason = $_.Exception.Message
+        Write-DeltaWarning "Could not restrict permissions on '$Path': $($result.Reason)"
+        return $result
+    }
+
+    $result.Applied = $true
+    return $result
+}
+
 function Protect-DeltaSecretFile {
     <#
       Restricts $Path to Administrators + SYSTEM with inheritance disabled
