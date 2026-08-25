@@ -1,4 +1,4 @@
-# DELTA for Windows — Docker installer
+# DELTA Windows Docker Installer
 
 Installs DELTA on a Windows machine as three containers: NGINX in front, the
 DELTA application, and PostgreSQL 17 with PostGIS. You run one script; it

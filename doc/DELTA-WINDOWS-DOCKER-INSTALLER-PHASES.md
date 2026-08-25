@@ -26,7 +26,7 @@ It does not restate the architecture, re-derive verified facts, or redraw the as
 |---|---|
 | `doc\DELTA-WINDOWS-DOCKER-INSTALLER-ASSESSMENT.md` | **Authoritative.** Architecture, verified facts, flows, acceptance criteria. Cited throughout as *A§n*. |
 | `C:\Workspace\DELTA-windows-installer` | Reference implementation. Consult for the functions named in each phase's *Existing Code to Reuse*. Never modified. |
-| `C:\Workspace\DELTA-windows-installer-docker` | Target project. *(As written in 2026-08-19 this held only `doc\` and `docs\archived\`, with no code and no git repository. It is now the implemented installer — see the layout below.)* |
+| `C:\Workspace\DELTA-windows-docker-installer` | Target project. *(As written in 2026-08-19 this held only `doc\` and `docs\archived\`, with no code and no git repository. It is now the implemented installer — see the layout below.)* |
 | ~~`docs\archived\*`~~ | Superseded prior planning. **No longer present in the repository**; the directory was not carried forward. The design lesson drawn from it survives as principle 7 in §3. |
 
 ### Verified baseline the phases must preserve
@@ -57,7 +57,7 @@ Carried forward from the assessment without change:
 This was written as an *indicative* structure to be populated by the phases. It is reproduced below as the layout that actually resulted, with the differences noted — the split of configuration management into its own file, the two standalone scripts the scheduled tasks run, and the Phase 12 uninstaller.
 
 ```text
-C:\Workspace\DELTA-windows-installer-docker\
+C:\Workspace\DELTA-windows-docker-installer\
 ├── setup.ps1                        single operator entry point (install + management)
 ├── uninstall.ps1                    archive-then-remove uninstall (Phase 12)
 ├── start-delta.ps1                  run by the Phase 6 startup task; starts Docker, prechecks, brings the stack up
