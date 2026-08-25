@@ -70,7 +70,7 @@ function New-DeltaInstallDirectories {
         Write-Detail ''
         Write-Detail 'This installer will not adopt a directory it did not create. Choose an empty'
         Write-Detail 'or new directory, for example:  .\setup.ps1 -InstallRoot C:\DELTA-docker'
-        return [PSCustomObject]@{ Succeeded = $false; Reason = $ownership.Reason; Created = @(); UploadsAcl = $null }
+        return [PSCustomObject]@{ Succeeded = $false; Reason = $ownership.Reason; Created = @(); UploadsAcl = $null; LogAcls = $null }
     }
 
     $created = New-Object 'System.Collections.Generic.List[string]'
@@ -88,7 +88,7 @@ function New-DeltaInstallDirectories {
         }
     }
     catch {
-        return [PSCustomObject]@{ Succeeded = $false; Reason = "Could not create the installation directories under '$InstallRoot': $($_.Exception.Message)"; Created = $created.ToArray(); UploadsAcl = $null }
+        return [PSCustomObject]@{ Succeeded = $false; Reason = "Could not create the installation directories under '$InstallRoot': $($_.Exception.Message)"; Created = $created.ToArray(); UploadsAcl = $null; LogAcls = $null }
     }
 
     if ($created.Count -gt 0) {
@@ -115,7 +115,24 @@ function New-DeltaInstallDirectories {
         Write-Detail "uploads: permissions left as inherited - $($uploadsAcl.Reason)"
     }
 
-    return [PSCustomObject]@{ Succeeded = $true; Reason = $null; Created = $created.ToArray(); UploadsAcl = $uploadsAcl }
+    # The two log directories a container writes into. logs\installer is not
+    # one of them - nothing is mounted there and only the installer's own
+    # scheduled tasks write to it - so it is left with the inherited ACL rather
+    # than given a policy it has no container to satisfy.
+    $logAcls = [ordered]@{}
+    foreach ($relative in @('logs\delta', 'logs\nginx')) {
+        $logPath = Join-Path -Path $InstallRoot -ChildPath $relative
+        $logAcl = Protect-DeltaLogDirectory -Path $logPath
+        $logAcls[$relative] = $logAcl
+        if ($logAcl.Applied) {
+            Write-Detail "$relative`: restricted to Administrators, SYSTEM and this account (Modify)"
+        }
+        elseif ($logAcl.Reason) {
+            Write-Detail "$relative`: permissions left as inherited - $($logAcl.Reason)"
+        }
+    }
+
+    return [PSCustomObject]@{ Succeeded = $true; Reason = $null; Created = $created.ToArray(); UploadsAcl = $uploadsAcl; LogAcls = $logAcls }
 }
 
 # ---------------------------------------------------------------------------

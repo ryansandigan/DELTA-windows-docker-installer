@@ -2362,6 +2362,41 @@ delete, and a `Program Files` style root cannot create a file at all. It needs
 a working Linux engine and the DELTA image already present locally; it pulls
 nothing and never touches a real installation.
 
+`tools\Test-LogDirectoryPermissions.ps1` covers the host ACLs on
+`<InstallRoot>\logs\delta` and `<InstallRoot>\logs\nginx` — the two log
+directories a container writes into — and the complete NGINX rotation cycle
+that runs over one of them. It pins the same three entries the uploads
+directory gets (Administrators and SYSTEM full control, the installing account
+**Modify**, inheritance off) on each directory separately, that no broad
+principal survives explicitly or by inheritance, that log files written
+afterwards inherit the account entry, that a restrictive parent cannot decide
+the result, and that **ownership is deliberately not changed** — the entries are
+explicit and inheritable, so effective access does not depend on who owns the
+directory. Existing logs must survive the repair with their content byte-intact
+and become usable again through re-inheritance, the repair must be idempotent,
+and `logs\installer` — which nothing mounts — must be left alone:
+
+```powershell
+.\tools\Test-LogDirectoryPermissions.ps1
+```
+
+Add `-Live` to run the real images. `logs\delta` is driven through the DELTA
+image's **own** `winston` + `winston-daily-rotate-file` transport, built with
+the options the application builds — `zippedArchive`, `maxSize`, `maxFiles` —
+so rotation, the audit file and retention are the real ones. `logs\nginx` is
+driven through the real `Invoke-DeltaNginxLogRotation` against a real NGINX
+container: start, error log, access log, requests, four rotations retaining
+two, `nginx -s reopen`, the replacement file, retention deletion, and logging
+again afterwards. It also runs the ACLs that do *not* work, modelled as a
+UAC-filtered administrator token evaluates them: Administrators + SYSTEM
+refuses the mount and the container, a `Program Files` style root kills the
+Node logger with an unhandled `EACCES` and stops NGINX at `could not open error
+log file`, and `(RX,W)` lets both log happily while silently breaking retention
+for DELTA and every rotation for NGINX (`mv: can't rename
+'/var/log/nginx/access.log': Permission denied`). Throwaway Compose projects in
+a temporary directory; no real installation is touched and no log content is
+printed.
+
 `tools\Test-UnattendedStartup.ps1` covers automatic startup after a Windows
 restart and the `Restart` status row. It asserts that a mechanism which cannot
 start the engine — `com.docker.service` — never satisfies the measurement and

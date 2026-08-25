@@ -658,6 +658,148 @@ function Protect-DeltaUploadsDirectory {
     return $result
 }
 
+function Protect-DeltaLogDirectory {
+    <#
+      The ACL for the two bind-mounted log directories, logs\delta and
+      logs\nginx. Applied to each of them by name, not to logs\ as a whole:
+      these two are the ones a container writes into, and the policy is theirs.
+
+      It lands on the same rights Protect-DeltaUploadsDirectory arrives at, and
+      that is a measured result rather than a shared assumption. Both were run
+      against the real engine, the real images and real bind mounts, on DACLs
+      written as a UAC-filtered administrator token evaluates them
+      (Administrators is deny-only in such a token, so it is absent):
+
+        logs\delta, through the image's own winston + winston-daily-rotate-file
+        transport, with the options the application builds:
+
+          Administrators + SYSTEM only -> docker: Error response from daemon:
+                                          Access is denied  (mount refused)
+          Users:(RX) only              -> Error: EACCES: permission denied,
+                                          open '/delta/logs/dts-<date>.log'
+                                          - an UNHANDLED 'error' event, so the
+                                          Node process exits
+          <user>:(RX,W)                -> logging works, but rename=FAIL and
+                                          delete=FAIL: 26 rotated files and the
+                                          audit file left behind, retention
+                                          silently dead
+          <user>:(M)                   -> every operation, nothing left behind
+
+        logs\nginx, through the real Invoke-DeltaNginxLogRotation against a
+        real NGINX container, four rotations retaining two:
+
+          Administrators + SYSTEM only -> the container cannot be created
+          Users:(RX) only              -> nginx: [alert] could not open error
+                                          log file: open()
+                                          "/var/log/nginx/error.log" failed
+                                          (13: Permission denied) - NGINX does
+                                          not start at all
+          <user>:(RX,W)                -> NGINX starts and logs, and then every
+                                          rotation fails: mv: can't rename
+                                          '/var/log/nginx/access.log':
+                                          Permission denied
+          <user>:(M)                   -> rotate, reopen, fresh access.log,
+                                          retention delete - all four cycles
+
+      So (RX,W) is not enough for either, and it fails them differently. DELTA's
+      logger rotates by size and prunes by age - fs.rename and fs.unlink - so
+      what breaks is retention, and a log directory whose retention has stopped
+      is the disk-fill this installation already has a scheduled task to
+      prevent. NGINX never renames anything itself; the rename is the
+      installer's own rotation, issued INSIDE the container
+      (`compose exec nginx mv ...`) precisely so the file NGINX holds open is
+      moved with POSIX semantics - which means it crosses the 9p link as the
+      Docker Desktop account and needs DELETE on the Windows side. Windows `W`
+      does not carry DELETE. Modify does, and nothing here needs more: no
+      container changes an ACL or an owner, so WRITE_DAC and WRITE_OWNER are
+      exactly what Full Control would add for nothing.
+
+      The host-side half of rotation needs no separate principal. The retention
+      delete always runs on Windows, and the rename does too when NGINX is
+      stopped - both from the daily task, which is registered S4U as the
+      installing account at RunLevel Highest. That is this same account, twice
+      covered: by its own Modify entry and by Administrators.
+
+      Administrators and SYSTEM keep inheritable Full Control - the uninstall
+      archive walks logs\ elevated, and an operator must be able to read and
+      clear these by hand.
+
+      Nothing broad survives. Measured on a real installation, every log file
+      here carries BUILTIN\Users:(RX) inherited from the root of C: - so any
+      local account could read the NGINX access log, which is a record of who
+      requested what, and DELTA's application log with it. And, exactly as with
+      uploads, a container-created log file carries NO entry for the account
+      Docker Desktop runs as: CREATOR OWNER materialises from whichever token
+      wrote it, measured as BUILTIN\Administrators. Whether rotation works then
+      depends on that token still carrying Administrators enabled.
+
+      Ownership is deliberately left alone. The directories and the files the
+      containers create are owned by BUILTIN\Administrators on this host and by
+      the user account on a filtered-token host, and under this ACL neither
+      matters: all three entries are explicit and inheritable, so effective
+      access is the same either way. Taking ownership would change a displayed
+      value and no behaviour, and it is not something this installer should do
+      to files an operator may have put here.
+
+      Grant-then-strip, same as uploads and for the same reason: this runs on
+      live data, so a failure half way through must leave the directory more
+      permissive rather than unusable. Idempotent, and no file is created,
+      moved, truncated or removed - existing logs keep their content and
+      re-inherit the new entries.
+
+      $null from Get-DeltaDockerFileReadSid means this is running as SYSTEM and
+      there is no user account to grant; nothing is changed, because what would
+      be left is the Administrators + SYSTEM ACL measured above to refuse the
+      mount outright. Non-fatal for the same reason the other three are.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $result = [PSCustomObject]@{ Applied = $false; Reason = $null; DockerSid = $null }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        $result.Reason = "'$Path' is not a directory."
+        return $result
+    }
+
+    $dockerSid = Get-DeltaDockerFileReadSid
+    if (-not $dockerSid) {
+        $result.Reason = 'No user account could be identified for Docker Desktop, so the inherited permissions on the log directory are left alone.'
+        return $result
+    }
+    $result.DockerSid = $dockerSid
+
+    try {
+        foreach ($grant in @(
+            'BUILTIN\Administrators:(OI)(CI)(F)',
+            'NT AUTHORITY\SYSTEM:(OI)(CI)(F)',
+            "${dockerSid}:(OI)(CI)(M)")) {
+            $output = & icacls.exe $Path /grant:r $grant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant:r $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        # Explicit broad entries first - /inheritance:r below removes only the
+        # inherited ones, and a principal granted by hand would survive it.
+        foreach ($principal in @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users', 'CREATOR OWNER')) {
+            $null = & icacls.exe $Path /remove:g $principal /C 2>&1
+        }
+
+        $output = & icacls.exe $Path /inheritance:r /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls /inheritance:r failed: $(($output | Out-String).Trim())"
+        }
+    }
+    catch {
+        $result.Reason = $_.Exception.Message
+        Write-DeltaWarning "Could not restrict permissions on '$Path': $($result.Reason)"
+        return $result
+    }
+
+    $result.Applied = $true
+    return $result
+}
+
 function Protect-DeltaSecretFile {
     <#
       Restricts $Path to Administrators + SYSTEM with inheritance disabled
